@@ -526,7 +526,9 @@ mod tests {
         let toml = r#"
             target_client_ip = "10.8.0.5"
             target_server_ip = "192.168.1.50"
-            cert_path = "/x" key_path = "/y" box_ip = "192.168.1.10"
+            cert_path = "/x"
+            key_path = "/y"
+            box_ip = "192.168.1.10"
         "#;
         let s = Settings::from_toml_str(toml).unwrap();
         let c = s.to_bpf_config();
@@ -1068,9 +1070,14 @@ mod tests {
         std::process::Command::new("ip").args(["link","set","mmeth0","up"]).status().unwrap();
 
         let s = Settings::from_toml_str(r#"
-            target_client_ip="10.8.0.5" target_server_ip="192.168.1.50"
-            cert_path="/x" key_path="/y" box_ip="192.168.1.10"
-            tun_iface="mmtun0" egress_iface="mmeth0""#).unwrap();
+            target_client_ip = "10.8.0.5"
+            target_server_ip = "192.168.1.50"
+            cert_path = "/x"
+            key_path = "/y"
+            box_ip = "192.168.1.10"
+            tun_iface = "mmtun0"
+            egress_iface = "mmeth0"
+        "#).unwrap();
         {
             let plane = BpfPlane::load_and_attach(&s).expect("attach");
             // filters present
@@ -1212,8 +1219,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("c.pem"), cert.serialize_pem().unwrap()).unwrap();
         std::fs::write(dir.path().join("k.pem"), cert.serialize_private_key_pem()).unwrap();
+        // valid cert+key loads
         let cfg = load_server_tls(&dir.path().join("c.pem"), &dir.path().join("k.pem")).unwrap();
-        assert!(cfg.cert_resolver.is_some() || true); // smoke: it built
+        let _acceptor = tokio_rustls::TlsAcceptor::from(cfg); // usable as an acceptor
+        // missing key file is an error
+        assert!(load_server_tls(&dir.path().join("c.pem"), &dir.path().join("missing.pem")).is_err());
     }
 }
 ```
