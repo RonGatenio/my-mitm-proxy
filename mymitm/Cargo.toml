@@ -5,4 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-mymitm-common = { path = "../mymitm-common" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+mymitm-common = { path = "../mymitm-common", features = ["user"] }
