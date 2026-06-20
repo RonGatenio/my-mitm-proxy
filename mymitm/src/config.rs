@@ -19,6 +19,9 @@ struct FileCfg {
     #[serde(default = "d_dump")] dump_path: PathBuf,
     #[serde(default = "d_obj")] bpf_obj_name: String,
     #[serde(default = "d_log")] log_level: String,
+    /// Optional SNI hostname to send in the upstream ClientHello. Userspace-only;
+    /// not part of `to_bpf_config`. If absent, the server IP is used as the SNI.
+    #[serde(default)] server_name: Option<String>,
 }
 fn d_port() -> u16 { 443 }
 fn d_tun() -> String { "tun0".into() }
@@ -44,6 +47,8 @@ struct Cli {
     #[arg(long)] tun: Option<String>,
     /// Override egress interface
     #[arg(long)] egress: Option<String>,
+    /// Override upstream SNI hostname
+    #[arg(long = "server-name")] server_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +67,7 @@ pub struct Settings {
     pub bpf_obj_name: String,
     pub box_ip: Ipv4Addr,
     pub log_level: String,
+    pub server_name: Option<String>,
 }
 
 impl Settings {
@@ -82,6 +88,7 @@ impl Settings {
             bpf_obj_name: f.bpf_obj_name,
             box_ip: f.box_ip,
             log_level: f.log_level,
+            server_name: f.server_name,
         })
     }
 
@@ -93,6 +100,7 @@ impl Settings {
         if let Some(v) = cli.server { s.server_ip = v; }
         if let Some(v) = cli.tun { s.tun_iface = v; }
         if let Some(v) = cli.egress { s.egress_iface = v; }
+        if let Some(v) = cli.server_name { s.server_name = Some(v); }
         Ok(s)
     }
 
@@ -143,6 +151,31 @@ mod tests {
         let c = s.to_bpf_config();
         assert_eq!(c.server_port, 443u16.to_be());
         assert_eq!(c.client_ip, u32::from(Ipv4Addr::new(10,8,0,5)).to_be());
+    }
+
+    #[test]
+    fn server_name_optional_defaults_none_and_parses() {
+        let none = r#"
+            target_client_ip = "10.8.0.5"
+            target_server_ip = "192.168.1.50"
+            cert_path = "/x"
+            key_path = "/y"
+            box_ip = "192.168.1.10"
+        "#;
+        assert_eq!(Settings::from_toml_str(none).unwrap().server_name, None);
+
+        let some = r#"
+            target_client_ip = "10.8.0.5"
+            target_server_ip = "192.168.1.50"
+            cert_path = "/x"
+            key_path = "/y"
+            box_ip = "192.168.1.10"
+            server_name = "real.example.com"
+        "#;
+        assert_eq!(
+            Settings::from_toml_str(some).unwrap().server_name.as_deref(),
+            Some("real.example.com")
+        );
     }
 
     #[test]
