@@ -1,0 +1,27 @@
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+
+[dependencies]
+aya = "0.13.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "rt"] }
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+
+[build-dependencies]
+aya-build = "0.1"
+anyhow = "1"
+
+# The eBPF crate is built by build.rs via aya-build; it is NOT a normal dependency.
+[workspace]
+members = ["spike-ebpf"]
+
+[profile.release]
+debug = false
+strip = "symbols"
