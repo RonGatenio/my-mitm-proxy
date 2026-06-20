@@ -53,6 +53,12 @@ pub fn classify_tun(m: &PktMeta, cfg: &Config, egress: bool) -> Rewrite {
     Rewrite::None
 }
 
+/// v1 single-client invariant: the ingress un-SNAT branch matches purely on
+/// `(src == server:port, dst == client_ip)` with no per-flow conntrack. This is
+/// correct in v1 because the only traffic that can match that shape is our own
+/// upstream's replies — there is a single target client, and the box does not
+/// otherwise originate connections to `server:port` on behalf of `client_ip`.
+/// (Multi-client / general conntrack is an accepted post-v1 follow-up.)
 pub fn classify_eth(m: &PktMeta, cfg: &Config, egress: bool) -> Rewrite {
     if egress {
         if m.mark == cfg.fwmark && m.dst_ip == cfg.server_ip && m.dst_port == cfg.server_port {

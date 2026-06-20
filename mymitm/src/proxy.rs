@@ -206,7 +206,15 @@ pub async fn run(s: Arc<Settings>, dumper: Arc<Dumper>) -> anyhow::Result<()> {
     tracing::info!("proxy listening on {}:{}", s.local_ip, s.local_port);
 
     loop {
-        let (inbound, peer) = listener.accept().await?;
+        // A single transient accept() error (e.g. EMFILE, a reset between
+        // accept and return) must not tear down the whole proxy: log and retry.
+        let (inbound, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!("accept error (continuing): {e}");
+                continue;
+            }
+        };
         let acceptor = acceptor.clone();
         let connector = connector.clone();
         let s = s.clone();
@@ -240,9 +248,9 @@ async fn handle_conn(
     // 3. Pump bytes both ways, dumping decrypted plaintext per direction.
     //
     // Both directions write into the single `ConnDump`, so we drive them from
-    // one `select!` loop (rather than two concurrently-borrowing tasks) — the
-    // dump writes are non-blocking file appends, so this does not stall the
-    // network path in practice.
+    // one `select!` loop (rather than two concurrently-borrowing tasks). Note
+    // the dump writes are synchronous, best-effort `std::fs` writes on the async
+    // path — making them truly async is a tracked follow-up, out of scope here.
     let mut conn = dumper.open_conn(peer, server_addr);
     let (mut cr, mut cw) = tokio::io::split(client_tls);
     let (mut sr, mut sw) = tokio::io::split(server_tls);

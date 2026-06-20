@@ -20,10 +20,10 @@
 //! * Attachment is verified via `SchedClassifier::query_tcx(iface, dir)`, NOT
 //!   `tc filter show` / `bpftool` (both show nothing for TCX on this kernel).
 
-use aya::maps::{Array, HashMap, MapData};
+use aya::maps::{Array, MapData};
 use aya::programs::{SchedClassifier, TcAttachType};
 use aya::{Ebpf, EbpfLoader};
-use mymitm_common::{Config, UpstreamKey, UpstreamVal};
+use mymitm_common::Config;
 
 use crate::config::Settings;
 
@@ -45,6 +45,9 @@ const PROGRAMS: [(&str, Side, TcAttachType); 4] = [
 /// Owns the loaded eBPF object (and thus the live TCX links). Dropping it
 /// detaches every program automatically.
 pub struct BpfPlane {
+    // Held for the process lifetime purely as an RAII guard: dropping it releases
+    // the TCX links and auto-detaches the programs (see Drop). Not read directly.
+    #[allow(dead_code)]
     ebpf: Ebpf,
     #[allow(dead_code)]
     tun: String,
@@ -98,18 +101,6 @@ impl BpfPlane {
             tun: s.tun_iface.clone(),
             egress: s.egress_iface.clone(),
         })
-    }
-
-    /// Hand out the `UPSTREAM` map (the reverse-NAT table) so the proxy can read
-    /// it. Borrows `self` mutably for the lifetime of the returned handle.
-    pub fn upstream_map(
-        &mut self,
-    ) -> anyhow::Result<HashMap<&mut MapData, UpstreamKey, UpstreamVal>> {
-        let map = self
-            .ebpf
-            .map_mut("UPSTREAM")
-            .ok_or_else(|| anyhow::anyhow!("UPSTREAM map not found in eBPF object"))?;
-        Ok(HashMap::try_from(map)?)
     }
 }
 

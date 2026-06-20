@@ -24,7 +24,7 @@
 use aya_ebpf::{
     bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK},
     macros::{classifier, map},
-    maps::{Array, HashMap as BpfHashMap},
+    maps::{Array, LruHashMap},
     programs::TcContext,
 };
 use mymitm_common::{classify_eth, classify_tun, Config, PktMeta, Rewrite, UpstreamKey, UpstreamVal};
@@ -37,10 +37,14 @@ static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 /// Reverse-mapping table for the server-side SNAT: keyed by the (server, client,
 /// server_port, client_port) tuple recorded on egress, valued by the box's
 /// original (ip, port) so ingress replies can be un-SNATted back to the box.
-/// Populated by `cls_eth_egress`, consumed by `cls_eth_ingress` (and readable by
-/// userspace via the same `UPSTREAM` name).
+/// Populated by `cls_eth_egress`, consumed by `cls_eth_ingress`.
+///
+/// This is a BPF_MAP_TYPE_LRU_HASH (not a plain HashMap): on a v1 single-client
+/// data path the map should never approach capacity, but making it self-evicting
+/// guarantees it can never fill permanently (the least-recently-used entry is
+/// reclaimed on insert), so a leaked/never-reaped mapping cannot wedge the path.
 #[map]
-static UPSTREAM: BpfHashMap<UpstreamKey, UpstreamVal> = BpfHashMap::with_max_entries(1024, 0);
+static UPSTREAM: LruHashMap<UpstreamKey, UpstreamVal> = LruHashMap::with_max_entries(1024, 0);
 
 const ETH_LEN: usize = EthHdr::LEN; // 14
 const IP_MIN_LEN: usize = Ipv4Hdr::LEN; // 20
