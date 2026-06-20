@@ -72,18 +72,21 @@ fn cfg() -> Option<Config> {
 /// in Task 7). Returns `(meta, l3_off, l4_off)`.
 #[inline(always)]
 fn meta(ctx: &TcContext) -> Option<(PktMeta, usize, usize)> {
-    // Detect L2 by the IP-version nibble of the first byte.
+    // Detect L2 reliably. We MUST NOT key off the first byte's high nibble:
+    // an Ethernet destination MAC can legitimately begin with 0x4_ (e.g. veth
+    // pairs get MACs like 4e:83:..), which would be misread as an IPv4 version
+    // nibble and treat the frame as raw L3. Instead probe the EtherType field
+    // that only exists in an L2 frame: if bytes [12..14] equal the IPv4
+    // EtherType (0x0800), this is Ethernet; otherwise assume raw L3 (tun) and
+    // re-validate the IPv4 version nibble at offset 0 below.
+    let eth_proto: u16 = ctx.load(ETH_LEN - 2).ok()?; // bytes [12..14], NBO
     let first: u8 = ctx.load(0).ok()?;
-    let l3 = if (first >> 4) == 4 {
+    let l3 = if eth_proto == 0x0800u16.to_be() {
+        ETH_LEN
+    } else if (first >> 4) == 4 {
         0
     } else {
-        // Ethernet: confirm it carries IPv4 before trusting the offset.
-        let eth_proto: u16 = ctx.load(ETH_LEN - 2).ok()?; // ether_type, NBO
-        // network-types EtherType::Ipv4 == 0x0800u16.to_be(); compare in NBO.
-        if eth_proto != 0x0800u16.to_be() {
-            return None;
-        }
-        ETH_LEN
+        return None;
     };
 
     // Explicit bounds guard (belt-and-suspenders; load helpers also bound-check).
