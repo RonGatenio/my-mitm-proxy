@@ -24,15 +24,23 @@
 use aya_ebpf::{
     bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK},
     macros::{classifier, map},
-    maps::Array,
+    maps::{Array, HashMap as BpfHashMap},
     programs::TcContext,
 };
-use mymitm_common::{classify_tun, Config, PktMeta, Rewrite};
+use mymitm_common::{classify_eth, classify_tun, Config, PktMeta, Rewrite, UpstreamKey, UpstreamVal};
 use network_types::{eth::EthHdr, ip::Ipv4Hdr, tcp::TcpHdr};
 
 /// Single-entry config map (index 0 -> Config), populated by userspace.
 #[map]
 static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
+
+/// Reverse-mapping table for the server-side SNAT: keyed by the (server, client,
+/// server_port, client_port) tuple recorded on egress, valued by the box's
+/// original (ip, port) so ingress replies can be un-SNATted back to the box.
+/// Populated by `cls_eth_egress`, consumed by `cls_eth_ingress` (and readable by
+/// userspace via the same `UPSTREAM` name).
+#[map]
+static UPSTREAM: BpfHashMap<UpstreamKey, UpstreamVal> = BpfHashMap::with_max_entries(1024, 0);
 
 const ETH_LEN: usize = EthHdr::LEN; // 14
 const IP_MIN_LEN: usize = Ipv4Hdr::LEN; // 20
@@ -202,15 +210,58 @@ fn run_tun(ctx: &mut TcContext, egress: bool) -> i32 {
     TC_ACT_OK
 }
 
-// Placeholder eth classifiers (real DNAT/SNAT logic lands in Task 7). Kept so
-// the object exports all four program names the userspace loader expects.
+// eth0 (L2) classifiers: server-side SNAT of our marked upstream flow to the
+// client IP (egress) and the reverse un-SNAT of replies back to the box
+// (ingress). The decision is delegated to `mymitm_common::classify_eth`; the
+// reverse mapping lives in `UPSTREAM`.
+
 #[classifier]
-pub fn cls_eth_ingress(_ctx: TcContext) -> i32 {
+pub fn cls_eth_egress(mut ctx: TcContext) -> i32 {
+    let (Some((m, l3, l4)), Some(c)) = (meta(&ctx), cfg()) else {
+        return TC_ACT_OK;
+    };
+    if classify_eth(&m, &c, true) == Rewrite::SnatToClient {
+        // Record the reverse mapping BEFORE rewriting. `m.src_port` is the box's
+        // chosen ephemeral upstream port; the SNAT keeps the source port intact,
+        // so on the wire the client-side port equals this value — which is what
+        // ingress later keys on via the reply's `dst_port`.
+        let key = UpstreamKey {
+            server_ip: c.server_ip,
+            client_ip: c.client_ip,
+            server_port: c.server_port,
+            client_port: m.src_port,
+        };
+        let val = UpstreamVal {
+            box_ip: c.box_ip,
+            box_port: m.src_port,
+        };
+        let _ = UPSTREAM.insert(&key, &val, 0);
+        // SNAT: source IP -> client IP, source port unchanged.
+        let _ = set_src(&mut ctx, l3, l4, c.client_ip, m.src_port);
+    }
     TC_ACT_OK
 }
 
 #[classifier]
-pub fn cls_eth_egress(_ctx: TcContext) -> i32 {
+pub fn cls_eth_ingress(mut ctx: TcContext) -> i32 {
+    let (Some((m, l3, l4)), Some(c)) = (meta(&ctx), cfg()) else {
+        return TC_ACT_OK;
+    };
+    if classify_eth(&m, &c, false) == Rewrite::UnSnatToBox {
+        // Reply from server to the SNATted client; key on the same tuple. The
+        // reply's `dst_port` is the on-wire client-side port == the box's
+        // ephemeral port recorded on egress.
+        let key = UpstreamKey {
+            server_ip: c.server_ip,
+            client_ip: c.client_ip,
+            server_port: c.server_port,
+            client_port: m.dst_port,
+        };
+        if let Some(v) = unsafe { UPSTREAM.get(&key) } {
+            // Un-SNAT: destination IP:port -> the box's original endpoint.
+            let _ = set_dst(&mut ctx, l3, l4, v.box_ip, v.box_port);
+        }
+    }
     TC_ACT_OK
 }
 
