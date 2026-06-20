@@ -1,0 +1,39 @@
+# Sample mymitm.toml — fill in real IPs and cert/key paths before use.
+# This file contains NO secrets; cert_path/key_path point to placeholder paths.
+
+# The single target client IP (e.g. the VPN client we are intercepting).
+target_client_ip = "10.8.0.5"
+
+# The real server IP:port we proxy to.
+target_server_ip = "192.168.1.50"
+# target_server_port = 443  # default
+
+# The box IP on the egress interface (used for SNAT source-IP preservation).
+box_ip = "192.168.1.10"
+
+# Paths to the REAL leaf certificate and private key (PEM).
+# Generate a throwaway pair for testing:
+#   openssl req -x509 -newkey ed25519 -keyout k.pem -out c.pem -days 1 -nodes -subj /CN=test
+cert_path = "/etc/mymitm/leaf.pem"
+key_path  = "/etc/mymitm/leaf.key"
+
+# Network interfaces
+tun_iface    = "tun0"    # TUN device (client-side)
+egress_iface = "eth0"    # Egress NIC (server-side)
+
+# Local listener the eBPF DNAT redirects client traffic to.
+local_addr = "127.0.0.1"
+local_port = 8443
+
+# SO_MARK value set on upstream sockets to bypass eBPF re-interception.
+fwmark = 0x1337
+
+# Where decrypted payload dumps are written (JSONL index + .c2s/.s2c blobs).
+dump_path = "/var/tmp/mitm-dumps"
+
+# Tracing log level (RUST_LOG syntax, e.g. "info", "debug", "mymitm=trace").
+log_level = "info"
+
+# Optional: SNI hostname to send in the upstream TLS ClientHello.
+# If unset, the server IP string is used (works if the server accepts IP SNI).
+# server_name = "real.example.com"
