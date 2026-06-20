@@ -48,8 +48,13 @@ impl ConnDump {
             "conn_id": self.id, "client": self.client.to_string(),
             "server": self.server.to_string(), "start_ts": self.start, "end_ts": now_iso(),
         });
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(dir.join("index.jsonl")) {
-            let _ = writeln!(f, "{rec}");
+        match OpenOptions::new().create(true).append(true).open(dir.join("index.jsonl")) {
+            Err(e) => tracing::warn!("dump index open failed: {e}"),
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{rec}") {
+                    tracing::warn!("dump index write failed: {e}");
+                }
+            }
         }
     }
 }
@@ -85,6 +90,8 @@ mod tests {
 
         let c2s = std::fs::read(dir.path().join(format!("{id}.c2s"))).unwrap();
         assert_eq!(c2s, b"GET / HTTP/1.1\r\n");
+        let s2c = std::fs::read(dir.path().join(format!("{id}.s2c"))).unwrap();
+        assert_eq!(s2c, b"HTTP/1.1 200 OK\r\n");
         let idx = std::fs::read_to_string(dir.path().join("index.jsonl")).unwrap();
         assert!(idx.contains("10.8.0.5:43012"));
         assert!(idx.contains("192.168.1.50:443"));
