@@ -1,13 +1,15 @@
 [package]
-name = "spike-ebpf"
+name = "mymitm-ebpf"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 aya-ebpf = "0.1.1"
+mymitm-common = { path = "../mymitm-common", default-features = false }
+network-types = "0.2.0"
 
 [[bin]]
-name = "spike"
+name = "mymitm"
 path = "src/main.rs"
 
 [profile.dev]

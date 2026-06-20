@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["mymitm", "mymitm-common"]
+# mymitm-ebpf is built out-of-tree by mymitm/build.rs (different target), not a workspace member.
+
+[workspace.package]
+edition = "2021"
+license = "proprietary"

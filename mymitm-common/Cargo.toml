@@ -1,0 +1,9 @@
+[package]
+name = "mymitm-common"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+user = []          # gates aya::Pod impls (added in Task 3)
+
+[dependencies]
