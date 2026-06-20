@@ -3,6 +3,9 @@ name = "mymitm-ebpf"
 version = "0.1.0"
 edition = "2021"
 
+# Built out-of-tree (bpfel-unknown-none target); kept out of the root workspace.
+[workspace]
+
 [dependencies]
 aya-ebpf = "0.1.1"
 mymitm-common = { path = "../mymitm-common", default-features = false }
