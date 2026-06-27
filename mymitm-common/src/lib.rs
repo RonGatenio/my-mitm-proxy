@@ -44,27 +44,29 @@ pub struct PktMeta {
 
 pub fn classify_tun(m: &PktMeta, cfg: &Config, egress: bool) -> Rewrite {
     if !egress {
-        if m.src_ip == cfg.client_ip && m.dst_ip == cfg.server_ip && m.dst_port == cfg.server_port {
+        // Ingress: any client (or the restricted one) -> target server gets DNAT'd.
+        let client_ok = cfg.client_ip == 0 || m.src_ip == cfg.client_ip;
+        if client_ok && m.dst_ip == cfg.server_ip && m.dst_port == cfg.server_port {
             return Rewrite::DnatToLocal;
         }
-    } else if m.src_ip == cfg.local_ip && m.src_port == cfg.local_port && m.dst_ip == cfg.client_ip {
+    } else if m.src_ip == cfg.local_ip && m.src_port == cfg.local_port {
+        // Egress: any reply from our listener is ours -> un-DNAT back to server.
         return Rewrite::UnDnatFromLocal;
     }
     Rewrite::None
 }
 
-/// v1 single-client invariant: the ingress un-SNAT branch matches purely on
-/// `(src == server:port, dst == client_ip)` with no per-flow conntrack. This is
-/// correct in v1 because the only traffic that can match that shape is our own
-/// upstream's replies — there is a single target client, and the box does not
-/// otherwise originate connections to `server:port` on behalf of `client_ip`.
-/// (Multi-client / general conntrack is an accepted post-v1 follow-up.)
+/// v2: client IP is dynamic. The egress branch signals SnatToClient; the SNAT
+/// target IP is resolved by the eBPF program from the EGRESS map (box ephemeral
+/// port -> client IP). The ingress branch matches purely on (src==server:port);
+/// the UPSTREAM map lookup (keyed on the packet's own dst==client) decides whether
+/// the reply is one of ours, so no client_ip condition is needed here.
 pub fn classify_eth(m: &PktMeta, cfg: &Config, egress: bool) -> Rewrite {
     if egress {
         if m.mark == cfg.fwmark && m.dst_ip == cfg.server_ip && m.dst_port == cfg.server_port {
             return Rewrite::SnatToClient;
         }
-    } else if m.src_ip == cfg.server_ip && m.src_port == cfg.server_port && m.dst_ip == cfg.client_ip {
+    } else if m.src_ip == cfg.server_ip && m.src_port == cfg.server_port {
         return Rewrite::UnSnatToBox;
     }
     Rewrite::None
@@ -130,5 +132,47 @@ mod tests {
     fn eth_ingress_reply_to_client_is_unsnatted() {
         let r = classify_eth(&meta(("192.168.1.50",443),("10.8.0.5",51000),0), &cfg(), false);
         assert_eq!(r, Rewrite::UnSnatToBox);
+    }
+
+    // client_ip == 0 means "any client" -> wildcard DNAT on tun ingress.
+    fn cfg_wild() -> Config {
+        let mut c = cfg();
+        c.client_ip = 0; // 0.0.0.0 wildcard
+        c
+    }
+
+    #[test]
+    fn tun_ingress_wildcard_dnats_any_client() {
+        let c = cfg_wild();
+        // two different clients, both hitting the target server -> both DNAT
+        assert_eq!(classify_tun(&meta(("10.8.0.5",40000),("192.168.1.50",443),0), &c, false), Rewrite::DnatToLocal);
+        assert_eq!(classify_tun(&meta(("10.8.0.99",40001),("192.168.1.50",443),0), &c, false), Rewrite::DnatToLocal);
+    }
+
+    #[test]
+    fn tun_ingress_wildcard_ignores_other_server() {
+        let c = cfg_wild();
+        assert_eq!(classify_tun(&meta(("10.8.0.5",40000),("192.168.1.77",443),0), &c, false), Rewrite::None);
+    }
+
+    #[test]
+    fn tun_ingress_restrict_mode_still_filters_client() {
+        // client_ip set -> only that client is intercepted
+        assert_eq!(classify_tun(&meta(("10.8.0.9",40000),("192.168.1.50",443),0), &cfg(), false), Rewrite::None);
+        assert_eq!(classify_tun(&meta(("10.8.0.5",40000),("192.168.1.50",443),0), &cfg(), false), Rewrite::DnatToLocal);
+    }
+
+    #[test]
+    fn tun_egress_undnats_reply_to_any_client() {
+        // reply from our listener to ANY client dst -> un-DNAT (no dst==client check)
+        let c = cfg_wild();
+        assert_eq!(classify_tun(&meta(("127.0.0.1",8443),("10.8.0.99",40001),0), &c, true), Rewrite::UnDnatFromLocal);
+    }
+
+    #[test]
+    fn eth_ingress_unsnats_reply_to_any_client() {
+        // server reply to ANY client -> un-SNAT (no dst==client check)
+        let c = cfg_wild();
+        assert_eq!(classify_eth(&meta(("192.168.1.50",443),("10.8.0.99",51000),0), &c, false), Rewrite::UnSnatToBox);
     }
 }
