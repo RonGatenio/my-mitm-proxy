@@ -46,6 +46,13 @@ static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 #[map]
 static UPSTREAM: LruHashMap<UpstreamKey, UpstreamVal> = LruHashMap::with_max_entries(1024, 0);
 
+/// Dynamic per-connection SNAT target, populated by userspace BEFORE it issues
+/// the upstream connect(): key = the box's ephemeral source port (NBO), value =
+/// the client IP (NBO) to SNAT that flow's source to. Read by `cls_eth_egress`.
+/// LRU so a missed userspace delete can never wedge the map.
+#[map]
+static EGRESS: LruHashMap<u16, u32> = LruHashMap::with_max_entries(1024, 0);
+
 const ETH_LEN: usize = EthHdr::LEN; // 14
 const IP_MIN_LEN: usize = Ipv4Hdr::LEN; // 20
 const TCP_MIN_LEN: usize = TcpHdr::LEN; // 20
@@ -228,23 +235,23 @@ pub fn cls_eth_egress(mut ctx: TcContext) -> i32 {
         return TC_ACT_OK;
     };
     if classify_eth(&m, &c, true) == Rewrite::SnatToClient {
-        // Record the reverse mapping BEFORE rewriting. `m.src_port` is the box's
-        // chosen ephemeral upstream port; the SNAT keeps the source port intact,
-        // so on the wire the client-side port equals this value — which is what
-        // ingress later keys on via the reply's `dst_port`.
+        // Resolve the SNAT target client IP from the EGRESS map, keyed by our
+        // own ephemeral source port (userspace inserted it before connect()).
+        // If absent, leave the packet untouched (visible failure, never wrong IP).
+        let client_ip = match unsafe { EGRESS.get(&m.src_port) } {
+            Some(ip) => *ip,
+            None => return TC_ACT_OK,
+        };
+        // Record the reverse mapping BEFORE rewriting so ingress replies un-SNAT.
         let key = UpstreamKey {
             server_ip: c.server_ip,
-            client_ip: c.client_ip,
+            client_ip,
             server_port: c.server_port,
             client_port: m.src_port,
         };
-        let val = UpstreamVal {
-            box_ip: c.box_ip,
-            box_port: m.src_port,
-        };
+        let val = UpstreamVal { box_ip: c.box_ip, box_port: m.src_port };
         let _ = UPSTREAM.insert(&key, &val, 0);
-        // SNAT: source IP -> client IP, source port unchanged.
-        let _ = set_src(&mut ctx, l3, l4, c.client_ip, m.src_port);
+        let _ = set_src(&mut ctx, l3, l4, client_ip, m.src_port);
     }
     TC_ACT_OK
 }
