@@ -4,31 +4,46 @@
 //! (`EbpfLoader` default → relocates against `/sys/kernel/btf/vmlinux`),
 //! populates the single-entry `CONFIG` map, and attaches all four classifiers.
 //!
-//! ## TCX, not clsact (kernel 6.6)
-//! This kernel is >= 6.6, where aya 0.13's `SchedClassifier::attach()` uses the
-//! modern **TCX link** interface, NOT the legacy clsact-filter path (proven in
-//! the Task 1 spike). Consequences for this module:
+//! ## Attach mode: TCX vs legacy clsact+tc (`Settings.attach_mode`)
+//! Attachment honors `attach_mode` so the same binary works from kernel 4.15
+//! (no TCX) through 6.6+ (TCX):
 //!
-//! * We do **not** create a clsact qdisc and do **not** shell out to `tc`.
-//! * `prog.attach(iface, dir)` returns a `SchedClassifierLinkId`; the live link
-//!   is owned by the `Ebpf` object. We hold the `Ebpf` inside `BpfPlane` for the
-//!   process lifetime so the links — and therefore the attachments — stay alive.
-//! * **Fail-open is automatic:** TCX links are owned by the process's fds. When
-//!   `BpfPlane` drops (normal exit, SIGTERM, even SIGKILL) the kernel releases
-//!   the links and the programs detach; traffic reverts to normal forwarding.
-//!   So `Drop` needs no explicit teardown — dropping the `Ebpf` is sufficient.
-//! * Attachment is verified via `SchedClassifier::query_tcx(iface, dir)`, NOT
-//!   `tc filter show` / `bpftool` (both show nothing for TCX on this kernel).
+//! * `Tcx` — force the modern **TCX link** interface
+//!   (`attach_with_options(.., TcxOrder(..))`). Requires kernel >= 6.6.
+//! * `Tc` — force the legacy **clsact + tc-bpf** path: ensure a `clsact` qdisc
+//!   exists on the iface (`tc::qdisc_add_clsact`), then attach the filter via
+//!   `attach_with_options(.., Netlink(..))`. Works on 4.x..6.x.
+//! * `Auto` (default) — try TCX first; on any error fall back to clsact+tc and
+//!   log the fallback.
+//!
+//! ### Teardown / fail-open semantics — differ by path
+//! * **TCX:** links are owned by the process's fds. When `BpfPlane` drops
+//!   (normal exit, SIGTERM, even SIGKILL) the kernel releases the links and the
+//!   programs detach; traffic reverts to normal forwarding. `Drop` needs no
+//!   explicit teardown — dropping the `Ebpf` is sufficient.
+//! * **Legacy tc:** netlink/tc filters do **not** auto-detach when the process
+//!   dies, and the `clsact` qdisc we added stays behind. So when the tc path was
+//!   used (`used_tc`), `Drop` must (a) detach our four filters by name via
+//!   `tc::qdisc_detach_program`, and (b) remove the `clsact` qdisc entirely so
+//!   traffic reverts to normal. aya 0.13 exposes no clsact-*removal* helper
+//!   (only `qdisc_add_clsact` and per-name `qdisc_detach_program`), so qdisc
+//!   removal shells out to `tc qdisc del dev <iface> clsact`. This is the
+//!   tc-mode teardown path only; the TCX path still never touches `tc`.
+//!
+//! Attachment is verified differently per path: TCX via
+//! `SchedClassifier::query_tcx(iface, dir)`; legacy tc via `tc filter show` /
+//! presence of the `clsact` qdisc.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Mutex;
 
 use aya::maps::{Array, HashMap as AyaHashMap, MapData};
+use aya::programs::tc::{self, NlOptions, TcAttachOptions};
 use aya::programs::{SchedClassifier, TcAttachType};
 use aya::{Ebpf, EbpfLoader};
 use mymitm_common::Config;
 
-use crate::config::Settings;
+use crate::config::{AttachMode, Settings};
 use crate::dataplane::DataPlane;
 
 /// The four classifier program names, in (program, iface-selector, direction)
@@ -46,17 +61,19 @@ const PROGRAMS: [(&str, Side, TcAttachType); 4] = [
     ("cls_eth_egress", Side::Eth, TcAttachType::Egress),
 ];
 
-/// Owns the loaded eBPF object (and thus the live TCX links). Dropping it
-/// detaches every program automatically.
+/// Owns the loaded eBPF object (and thus the live links). On the TCX path,
+/// dropping it detaches every program automatically. On the legacy tc path,
+/// `Drop` additionally removes the clsact qdisc/filters (see `used_tc`).
 pub struct BpfPlane {
     // Held for the process lifetime purely as an RAII guard: dropping it releases
     // the TCX links and auto-detaches the programs (see Drop). Not read directly.
     #[allow(dead_code)]
     ebpf: Ebpf,
-    #[allow(dead_code)]
     tun: String,
-    #[allow(dead_code)]
     egress_iface: String,
+    /// True iff at least one classifier was attached via the legacy clsact+tc
+    /// path (forced `Tc`, or `Auto` falling back). Drives tc teardown in `Drop`.
+    used_tc: bool,
     box_ip: Ipv4Addr,
     fwmark: u32,
     /// EGRESS map: box ephemeral src port (NBO) -> client IP (NBO). Written per
@@ -93,9 +110,10 @@ impl BpfPlane {
                 .ok_or_else(|| anyhow::anyhow!("EGRESS map not found in eBPF object"))?,
         )?;
 
-        // Load + attach the four classifiers. On 6.6 aya uses TCX automatically;
-        // the returned link id is retained by the owning `SchedClassifier`, which
-        // lives inside `ebpf`, so the attachment persists as long as we hold it.
+        // Load + attach the four classifiers honoring `attach_mode`. Track
+        // whether any attach used the legacy tc path so Drop knows to tear down
+        // the clsact qdisc (the TCX path auto-detaches and needs no teardown).
+        let mut used_tc = false;
         for (name, side, dir) in PROGRAMS {
             let iface = match side {
                 Side::Tun => &s.tun_iface,
@@ -107,14 +125,15 @@ impl BpfPlane {
                 .try_into()?;
             prog.load()
                 .map_err(|e| anyhow::anyhow!("load {name}: {e}"))?;
-            prog.attach(iface, dir)
-                .map_err(|e| anyhow::anyhow!("attach {name} to {iface} {dir:?}: {e}"))?;
+            used_tc |= attach_one(prog, iface, dir, s.attach_mode)
+                .map_err(|e| anyhow::anyhow!("attach {name}: {e}"))?;
         }
 
         Ok(BpfPlane {
             ebpf,
             tun: s.tun_iface.clone(),
             egress_iface: s.egress_iface.clone(),
+            used_tc,
             box_ip: s.box_ip,
             fwmark: s.fwmark,
             egress_map: Mutex::new(egress_map),
@@ -122,15 +141,135 @@ impl BpfPlane {
     }
 }
 
+/// Attach one classifier honoring the requested mode. Returns `true` if it was
+/// attached via the legacy clsact/tc path (so `Drop` knows to remove the qdisc).
+///
+/// * `Tcx` — force the TCX link interface (kernel >= 6.6). Fails on old kernels,
+///   which is intended.
+/// * `Tc` — ensure the clsact qdisc exists, then attach via legacy netlink/tc.
+/// * `Auto` — try TCX first; on error fall back to clsact+tc (logged).
+fn attach_one(
+    prog: &mut SchedClassifier,
+    iface: &str,
+    dir: TcAttachType,
+    mode: AttachMode,
+) -> anyhow::Result<bool> {
+    match mode {
+        AttachMode::Tcx => {
+            prog.attach_with_options(iface, dir, TcAttachOptions::TcxOrder(Default::default()))
+                .map_err(|e| anyhow::anyhow!("tcx attach {iface} {dir:?}: {e}"))?;
+            Ok(false)
+        }
+        AttachMode::Tc => {
+            attach_tc(prog, iface, dir)?;
+            Ok(true)
+        }
+        AttachMode::Auto => {
+            match prog.attach_with_options(iface, dir, TcAttachOptions::TcxOrder(Default::default()))
+            {
+                Ok(_) => Ok(false),
+                Err(e) => {
+                    tracing::warn!(
+                        "TCX attach failed ({e}); falling back to clsact+tc on {iface} {dir:?}"
+                    );
+                    attach_tc(prog, iface, dir)?;
+                    Ok(true)
+                }
+            }
+        }
+    }
+}
+
+/// Ensure a clsact qdisc exists on `iface`, then attach `prog` via legacy
+/// netlink/tc. The `qdisc_add_clsact` is idempotent in effect — an existing
+/// clsact yields `EEXIST`, which we deliberately ignore.
+fn attach_tc(prog: &mut SchedClassifier, iface: &str, dir: TcAttachType) -> anyhow::Result<()> {
+    // Best-effort: ignore "exists". A real failure surfaces at attach time.
+    let _ = tc::qdisc_add_clsact(iface);
+    prog.attach_with_options(iface, dir, TcAttachOptions::Netlink(NlOptions::default()))
+        .map_err(|e| anyhow::anyhow!("tc attach {iface} {dir:?}: {e}"))?;
+    Ok(())
+}
+
+/// Names of our four classifiers, used for by-name tc filter detach.
+const PROGRAM_NAMES: [&str; 4] = [
+    "cls_tun_ingress",
+    "cls_tun_egress",
+    "cls_eth_ingress",
+    "cls_eth_egress",
+];
+
+/// Remove the clsact qdisc (and thus all its filters) from `iface` on the legacy
+/// tc path. First detaches our four filters by name via aya (best-effort), then
+/// removes the clsact qdisc entirely. aya 0.13 has no clsact-removal helper, so
+/// the qdisc deletion shells out to `tc qdisc del dev <iface> clsact`. Errors are
+/// logged, not propagated: teardown is always best-effort (fail-open).
+fn teardown_tc(iface: &str) {
+    use std::process::Command;
+
+    // Detach our filters by name on both directions (best-effort). NotFound just
+    // means it was never attached / already gone.
+    for dir in [TcAttachType::Ingress, TcAttachType::Egress] {
+        for name in PROGRAM_NAMES {
+            match tc::qdisc_detach_program(iface, dir, name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("detach {name} on {iface} {dir:?} failed: {e}"),
+            }
+        }
+    }
+
+    // Remove the clsact qdisc entirely so traffic reverts to normal forwarding.
+    // No aya API exists for this; shell out for the removal only.
+    match Command::new("tc")
+        .args(["qdisc", "del", "dev", iface, "clsact"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            // "RTNETLINK answers: No such file or directory" => no clsact to
+            // remove, which is the desired end state; log others at debug.
+            tracing::debug!(
+                "tc qdisc del clsact on {iface}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => tracing::warn!("failed to run `tc qdisc del dev {iface} clsact`: {e}"),
+    }
+}
+
+/// Best-effort removal of any clsact qdisc/filters this tool may have left on the
+/// given interfaces after an unclean exit. Safe to call when nothing is attached
+/// (used by the `--cleanup` flow). The TCX path leaves nothing behind, so this is
+/// a no-op there; it only matters on hosts that used the legacy tc path.
+pub fn cleanup_tc(tun: &str, egress: &str) {
+    for iface in [tun, egress] {
+        teardown_tc(iface);
+    }
+}
+
 impl Drop for BpfPlane {
     fn drop(&mut self) {
-        // Nothing to do: dropping `self.ebpf` releases the TCX links, which the
-        // kernel uses to detach the programs (fail-open). We do NOT touch `tc`.
-        tracing::debug!(
-            tun = %self.tun,
-            egress = %self.egress_iface,
-            "BpfPlane dropping; TCX links released, programs auto-detach"
-        );
+        if self.used_tc {
+            // Legacy tc path: filters do NOT auto-detach and the clsact qdisc we
+            // added stays behind. Remove the clsact qdisc (and its filters) on
+            // each iface so traffic reverts to normal forwarding (fail-open).
+            teardown_tc(&self.tun);
+            teardown_tc(&self.egress_iface);
+            tracing::debug!(
+                tun = %self.tun,
+                egress = %self.egress_iface,
+                "BpfPlane (tc) dropped; clsact qdisc removed"
+            );
+        } else {
+            // TCX path: dropping `self.ebpf` releases the links, which the kernel
+            // uses to detach the programs (fail-open). We do NOT touch `tc`.
+            tracing::debug!(
+                tun = %self.tun,
+                egress = %self.egress_iface,
+                "BpfPlane (TCX) dropped; links released, programs auto-detach"
+            );
+        }
     }
 }
 
@@ -273,6 +412,67 @@ mod tests {
         println!("TCX_DETACH_VERIFIED remaining={remaining}");
 
         // Teardown temp ifaces.
+        run_ip(&["link", "del", "mmtun0"]);
+        run_ip(&["link", "del", "mmeth0"]);
+    }
+
+    // Privileged: forces the legacy clsact+tc attach path and proves the qdisc is
+    // added while attached and REMOVED on drop (tc-mode teardown / fail-open).
+    // Run: sudo -E env "PATH=$PATH" cargo test -p mymitm tc_mode -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn tc_mode_attaches_and_removes_clsact() {
+        // Clean any leftovers, then create temp ifaces.
+        run_ip(&["link", "del", "mmtun0"]);
+        run_ip(&["link", "del", "mmeth0"]);
+        run_ip(&["tuntap", "add", "dev", "mmtun0", "mode", "tun"]);
+        run_ip(&["link", "set", "mmtun0", "up"]);
+        run_ip(&["link", "add", "mmeth0", "type", "dummy"]);
+        run_ip(&["link", "set", "mmeth0", "up"]);
+
+        let s = Settings::from_toml_str(
+            r#"
+                target_server_ip = "192.168.1.50"
+                cert_path = "/x"
+                key_path = "/y"
+                box_ip = "192.168.1.10"
+                tun_iface = "mmtun0"
+                egress_iface = "mmeth0"
+                attach_mode = "tc"
+            "#,
+        )
+        .expect("settings parse");
+
+        let ifaces = ["mmtun0", "mmeth0"];
+        {
+            let _plane = BpfPlane::load_and_attach(&s).expect("tc attach");
+            // clsact qdisc must be present on both ifaces while attached.
+            for iface in ifaces {
+                let out = Command::new("tc")
+                    .args(["qdisc", "show", "dev", iface])
+                    .output()
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&out.stdout).contains("clsact"),
+                    "clsact qdisc expected on {iface} while attached"
+                );
+            }
+            println!("TC_ATTACH_OK");
+        } // _plane dropped -> tc teardown removes clsact
+
+        // After drop, the clsact qdisc must be gone on both ifaces.
+        for iface in ifaces {
+            let out = Command::new("tc")
+                .args(["qdisc", "show", "dev", iface])
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains("clsact"),
+                "clsact must be removed on drop for {iface}"
+            );
+        }
+        println!("TC_DETACH_OK");
+
         run_ip(&["link", "del", "mmtun0"]);
         run_ip(&["link", "del", "mmeth0"]);
     }
