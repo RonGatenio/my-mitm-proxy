@@ -17,6 +17,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(version = mymitm_common::VERSION, "mymitm starting");
 
+    if settings.cleanup {
+        tracing::info!("--cleanup: reversing any leftover data-plane state");
+        bpf::cleanup_tc(&settings.tun_iface, &settings.egress_iface);
+        iproute::cleanup(&settings);
+    }
+
     // Ensure the ring CryptoProvider is installed before any TLS use.
     // proxy::ensure_crypto_provider uses a Once guard, so calling it here and
     // inside proxy::run is safe — the second call is a no-op.
@@ -24,19 +30,36 @@ async fn main() -> anyhow::Result<()> {
 
     let dumper = Arc::new(dump::Dumper::new(&settings.dump_path)?);
 
-    // Load BPF plane (keeps TCX links alive via Drop).
-    // Takes &Settings so we can wrap settings in Arc afterwards.
-    let _plane = bpf::BpfPlane::load_and_attach(&settings)?;
+    // Build the chosen data plane. The concrete plane holds all kernel state
+    // (TCX/tc links, policy routes, rules) and reverses it in its Drop impl.
+    //
+    // We store it as `Arc<dyn DataPlane>` directly. The single Arc is cloned
+    // into `proxy::run`; when `main` returns after the select!, both the local
+    // `plane` and any clones inside the proxy have dropped, running the concrete
+    // Drop exactly once (the last Arc to drop). No Box<dyn Any> guard is needed:
+    // holding the local `plane` Arc to end-of-main is sufficient because there
+    // is no separate concrete Arc that could drop early.
+    use crate::dataplane::DataPlane;
+    let plane: Arc<dyn DataPlane> = match settings.data_plane {
+        config::DataPlaneKind::Ebpf => {
+            Arc::new(bpf::BpfPlane::load_and_attach(&settings)?)
+        }
+        config::DataPlaneKind::IpRoute => {
+            Arc::new(iproute::IpRoutePlane::setup(&settings)?)
+        }
+    };
 
-    tracing::info!("data plane attached; entering proxy loop");
+    tracing::info!(?settings.data_plane, "data plane active; entering proxy loop");
 
     let settings = Arc::new(settings);
     tokio::select! {
-        r = proxy::run(settings.clone(), dumper.clone()) => { r?; }
+        r = proxy::run(settings.clone(), dumper.clone(), plane.clone()) => { r?; }
         _ = shutdown_signal() => { tracing::info!("shutdown signal; detaching"); }
     }
 
-    // _plane drops here → TCX links released → programs auto-detach (fail-open)
+    // `plane` (and the clone inside proxy::run, which exits at select! end)
+    // both drop here → concrete plane Drop tears down all kernel state.
+    drop(plane);
     Ok(())
 }
 

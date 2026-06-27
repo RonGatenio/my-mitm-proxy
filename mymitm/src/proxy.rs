@@ -13,7 +13,7 @@
 //! entirely. Signature checks are still performed via the ring provider so a
 //! replayed-but-keyless cert cannot complete the handshake.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Once;
@@ -28,6 +28,7 @@ use tokio_rustls::rustls::{self, DigitallySignedStruct, SignatureScheme};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::config::Settings;
+use crate::dataplane::DataPlane;
 use crate::dump::Dumper;
 
 /// Install the ring `CryptoProvider` as the process default exactly once.
@@ -169,34 +170,9 @@ fn upstream_server_name(s: &Settings) -> anyhow::Result<ServerName<'static>> {
     }
 }
 
-/// Create a TCP socket to `server` tagged with `SO_MARK` = `fwmark` (so the
-/// eBPF eth0 classifier SNATs its source to the client IP), connect, and return
-/// a non-blocking `std::net::TcpStream` ready to wrap with tokio.
-///
-/// SO_MARK MUST be set BEFORE connect so the very first SYN carries the mark.
-pub fn upstream_socket(server: SocketAddr, fwmark: u32) -> std::io::Result<std::net::TcpStream> {
-    let domain = match server {
-        SocketAddr::V4(_) => socket2::Domain::IPV4,
-        SocketAddr::V6(_) => socket2::Domain::IPV6,
-    };
-    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    // SO_MARK must precede connect so the very first SYN carries the mark.
-    // A mark of 0 means "do not tag" — skip the setsockopt entirely, which also
-    // lets the proxy/loopback tests run without CAP_NET_ADMIN.
-    if fwmark != 0 {
-        sock.set_mark(fwmark)?;
-    }
-    // Blocking connect keeps EINPROGRESS handling simple; flip to non-blocking
-    // only after the connection is established so the tokio runtime drives
-    // reads/writes afterwards.
-    sock.connect(&server.into())?;
-    sock.set_nonblocking(true)?;
-    Ok(sock.into())
-}
-
 /// Bind `local_ip:local_port`, accept the DNAT'd client connections, and serve
 /// each one (terminate client TLS, dial upstream, pump, dump) forever.
-pub async fn run(s: Arc<Settings>, dumper: Arc<Dumper>) -> anyhow::Result<()> {
+pub async fn run(s: Arc<Settings>, dumper: Arc<Dumper>, plane: Arc<dyn DataPlane>) -> anyhow::Result<()> {
     ensure_crypto_provider();
     let server_cfg = load_server_tls(&s.cert_path, &s.key_path)?;
     let acceptor = TlsAcceptor::from(server_cfg);
@@ -219,8 +195,9 @@ pub async fn run(s: Arc<Settings>, dumper: Arc<Dumper>) -> anyhow::Result<()> {
         let connector = connector.clone();
         let s = s.clone();
         let dumper = dumper.clone();
+        let plane = plane.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(inbound, peer, acceptor, connector, s, dumper).await {
+            if let Err(e) = handle_conn(inbound, peer, acceptor, connector, s, dumper, plane).await {
                 tracing::warn!("conn {peer} ended: {e}");
             }
         });
@@ -234,13 +211,21 @@ async fn handle_conn(
     connector: TlsConnector,
     s: Arc<Settings>,
     dumper: Arc<Dumper>,
+    plane: Arc<dyn DataPlane>,
 ) -> anyhow::Result<()> {
     // 1. Terminate the client's TLS, presenting the REAL leaf cert.
     let client_tls = acceptor.accept(inbound).await?;
 
-    // 2. Dial the real server over a SO_MARK-tagged socket, then TLS upstream.
-    let server_addr = SocketAddr::from((s.server_ip, s.server_port));
-    let std_up = upstream_socket(server_addr, s.fwmark)?;
+    // 2. Dial the real server via the data plane, then TLS upstream.
+    //
+    // The accepted socket's peer IS the real client (DNAT rewrote only the dst),
+    // so its IP is what the upstream leg must carry for source-IP preservation.
+    let client_ip = match peer.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        std::net::IpAddr::V6(_) => anyhow::bail!("ipv6 client unsupported in v1"),
+    };
+    let server_addr = SocketAddrV4::new(s.server_ip, s.server_port);
+    let std_up = plane.upstream_socket(client_ip, server_addr)?;
     let up = TcpStream::from_std(std_up)?;
     let server_name = upstream_server_name(&s)?;
     let server_tls = connector.connect(server_name, up).await?;
@@ -251,7 +236,8 @@ async fn handle_conn(
     // one `select!` loop (rather than two concurrently-borrowing tasks). Note
     // the dump writes are synchronous, best-effort `std::fs` writes on the async
     // path — making them truly async is a tracked follow-up, out of scope here.
-    let mut conn = dumper.open_conn(peer, server_addr);
+    let server_sa = SocketAddr::from((s.server_ip, s.server_port));
+    let mut conn = dumper.open_conn(peer, server_sa);
     let (mut cr, mut cw) = tokio::io::split(client_tls);
     let (mut sr, mut sw) = tokio::io::split(server_tls);
 
@@ -393,9 +379,11 @@ mod tests {
         {
             let settings = settings.clone();
             let dumper = dumper.clone();
+            let plane: Arc<dyn crate::dataplane::DataPlane> =
+                Arc::new(crate::dataplane::DirectPlane);
             tokio::spawn(async move {
                 let (inbound, peer) = proxy_listener.accept().await.unwrap();
-                handle_conn(inbound, peer, acceptor, connector, settings, dumper)
+                handle_conn(inbound, peer, acceptor, connector, settings, dumper, plane)
                     .await
                     .unwrap();
             });
