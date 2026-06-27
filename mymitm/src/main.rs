@@ -2,6 +2,7 @@ mod bpf;
 mod config;
 mod dataplane;
 mod dump;
+mod iproute;
 mod proxy;
 
 use std::sync::Arc;
