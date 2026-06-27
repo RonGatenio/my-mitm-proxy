@@ -1,15 +1,29 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use serde::Deserialize;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum DataPlaneKind {
+    Ebpf,
+    #[clap(name = "iproute")]
+    IpRoute,
+}
+impl Default for DataPlaneKind { fn default() -> Self { DataPlaneKind::Ebpf } }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachMode { Auto, Tcx, Tc }
+impl Default for AttachMode { fn default() -> Self { AttachMode::Auto } }
 
 #[derive(Debug, Clone, Deserialize)]
 struct FileCfg {
-    target_client_ip: Ipv4Addr,
     target_server_ip: Ipv4Addr,
     cert_path: PathBuf,
     key_path: PathBuf,
     box_ip: Ipv4Addr,
+    #[serde(default)] target_client_ip: Option<Ipv4Addr>,
     #[serde(default = "d_port")] target_server_port: u16,
     #[serde(default = "d_tun")] tun_iface: String,
     #[serde(default = "d_eth")] egress_iface: String,
@@ -19,8 +33,8 @@ struct FileCfg {
     #[serde(default = "d_dump")] dump_path: PathBuf,
     #[serde(default = "d_obj")] bpf_obj_name: String,
     #[serde(default = "d_log")] log_level: String,
-    /// Optional SNI hostname to send in the upstream ClientHello. Userspace-only;
-    /// not part of `to_bpf_config`. If absent, the server IP is used as the SNI.
+    #[serde(default)] data_plane: DataPlaneKind,
+    #[serde(default)] attach_mode: AttachMode,
     #[serde(default)] server_name: Option<String>,
 }
 fn d_port() -> u16 { 443 }
@@ -39,7 +53,7 @@ struct Cli {
     /// Path to TOML config
     #[arg(short, long, default_value = "mymitm.toml")]
     config: PathBuf,
-    /// Override target client IP
+    /// Override target client IP (restrict to one client; omit for dynamic)
     #[arg(long)] client: Option<Ipv4Addr>,
     /// Override target server IP
     #[arg(long)] server: Option<Ipv4Addr>,
@@ -47,13 +61,20 @@ struct Cli {
     #[arg(long)] tun: Option<String>,
     /// Override egress interface
     #[arg(long)] egress: Option<String>,
+    /// Override data plane
+    #[arg(long, value_enum)] data_plane: Option<DataPlaneKind>,
+    /// Override attach mode (eBPF only)
+    #[arg(long, value_enum)] attach_mode: Option<AttachMode>,
     /// Override upstream SNI hostname
     #[arg(long = "server-name")] server_name: Option<String>,
+    /// Reverse any leftover state (stale clsact qdisc / iproute rules) from a
+    /// previous unclean exit, then continue startup.
+    #[arg(long, default_value_t = false)] cleanup: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Settings {
-    pub client_ip: Ipv4Addr,
+    pub client_ip: Option<Ipv4Addr>,
     pub server_ip: Ipv4Addr,
     pub server_port: u16,
     pub tun_iface: String,
@@ -68,6 +89,9 @@ pub struct Settings {
     pub box_ip: Ipv4Addr,
     pub log_level: String,
     pub server_name: Option<String>,
+    pub data_plane: DataPlaneKind,
+    pub attach_mode: AttachMode,
+    pub cleanup: bool,
 }
 
 impl Settings {
@@ -89,6 +113,9 @@ impl Settings {
             box_ip: f.box_ip,
             log_level: f.log_level,
             server_name: f.server_name,
+            data_plane: f.data_plane,
+            attach_mode: f.attach_mode,
+            cleanup: false,
         })
     }
 
@@ -96,17 +123,20 @@ impl Settings {
         let cli = Cli::parse();
         let text = std::fs::read_to_string(&cli.config)?;
         let mut s = Settings::from_toml_str(&text)?;
-        if let Some(v) = cli.client { s.client_ip = v; }
+        if let Some(v) = cli.client { s.client_ip = Some(v); }
         if let Some(v) = cli.server { s.server_ip = v; }
         if let Some(v) = cli.tun { s.tun_iface = v; }
         if let Some(v) = cli.egress { s.egress_iface = v; }
+        if let Some(v) = cli.data_plane { s.data_plane = v; }
+        if let Some(v) = cli.attach_mode { s.attach_mode = v; }
         if let Some(v) = cli.server_name { s.server_name = Some(v); }
+        s.cleanup = cli.cleanup;
         Ok(s)
     }
 
     pub fn to_bpf_config(&self) -> mymitm_common::Config {
         mymitm_common::Config {
-            client_ip: u32::from(self.client_ip).to_be(),
+            client_ip: self.client_ip.map(|ip| u32::from(ip).to_be()).unwrap_or(0),
             server_ip: u32::from(self.server_ip).to_be(),
             box_ip: u32::from(self.box_ip).to_be(),
             local_ip: u32::from(self.local_ip).to_be(),
@@ -120,67 +150,67 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
-    #[test]
-    fn toml_parses_with_defaults() {
-        let toml = r#"
-            target_client_ip = "10.8.0.5"
+    fn base() -> &'static str {
+        r#"
             target_server_ip = "192.168.1.50"
             cert_path = "/x/leaf.pem"
             key_path = "/x/leaf.key"
             box_ip = "192.168.1.10"
-        "#;
-        let s = Settings::from_toml_str(toml).unwrap();
-        assert_eq!(s.server_port, 443);          // default
-        assert_eq!(s.tun_iface, "tun0");         // default
-        assert_eq!(s.fwmark, 0x1337);            // default
-        assert_eq!(s.local_port, 8443);          // default
+        "#
     }
 
     #[test]
-    fn to_bpf_config_is_network_order() {
-        let toml = r#"
-            target_client_ip = "10.8.0.5"
-            target_server_ip = "192.168.1.50"
-            cert_path = "/x"
-            key_path = "/y"
-            box_ip = "192.168.1.10"
-        "#;
-        let s = Settings::from_toml_str(toml).unwrap();
-        let c = s.to_bpf_config();
-        assert_eq!(c.server_port, 443u16.to_be());
-        assert_eq!(c.client_ip, u32::from(Ipv4Addr::new(10,8,0,5)).to_be());
+    fn defaults_and_optional_client_ip() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert_eq!(s.client_ip, None);                 // omitted -> dynamic
+        assert_eq!(s.server_port, 443);
+        assert_eq!(s.tun_iface, "tun0");
+        assert_eq!(s.fwmark, 0x1337);
+        assert!(matches!(s.data_plane, DataPlaneKind::Ebpf));
+        assert!(matches!(s.attach_mode, AttachMode::Auto));
     }
 
     #[test]
-    fn server_name_optional_defaults_none_and_parses() {
-        let none = r#"
-            target_client_ip = "10.8.0.5"
-            target_server_ip = "192.168.1.50"
-            cert_path = "/x"
-            key_path = "/y"
-            box_ip = "192.168.1.10"
-        "#;
-        assert_eq!(Settings::from_toml_str(none).unwrap().server_name, None);
+    fn client_ip_restrict_mode_parses() {
+        let toml = format!("{}\ntarget_client_ip = \"10.8.0.5\"", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert_eq!(s.client_ip, Some(Ipv4Addr::new(10,8,0,5)));
+    }
 
-        let some = r#"
-            target_client_ip = "10.8.0.5"
-            target_server_ip = "192.168.1.50"
-            cert_path = "/x"
-            key_path = "/y"
-            box_ip = "192.168.1.10"
-            server_name = "real.example.com"
-        "#;
-        assert_eq!(
-            Settings::from_toml_str(some).unwrap().server_name.as_deref(),
-            Some("real.example.com")
-        );
+    #[test]
+    fn data_plane_and_attach_mode_parse() {
+        let toml = format!("{}\ndata_plane = \"iproute\"\nattach_mode = \"tc\"", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(matches!(s.data_plane, DataPlaneKind::IpRoute));
+        assert!(matches!(s.attach_mode, AttachMode::Tc));
+    }
+
+    #[test]
+    fn to_bpf_config_client_ip_zero_when_dynamic() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert_eq!(s.to_bpf_config().client_ip, 0);
+    }
+
+    #[test]
+    fn to_bpf_config_client_ip_set_is_nbo() {
+        let toml = format!("{}\ntarget_client_ip = \"10.8.0.5\"", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert_eq!(s.to_bpf_config().client_ip, u32::from(Ipv4Addr::new(10,8,0,5)).to_be());
+        assert_eq!(s.to_bpf_config().server_port, 443u16.to_be());
     }
 
     #[test]
     fn missing_required_field_errors() {
-        let toml = r#"target_client_ip = "10.8.0.5""#;
-        assert!(Settings::from_toml_str(toml).is_err());
+        assert!(Settings::from_toml_str(r#"target_server_ip = "10.0.0.1""#).is_err());
+    }
+
+    #[test]
+    fn cli_parses_value_enums() {
+        use clap::Parser;
+        let c = Cli::try_parse_from(["mymitm","--data-plane","iproute","--attach-mode","tcx","--cleanup"]).unwrap();
+        assert!(matches!(c.data_plane, Some(DataPlaneKind::IpRoute)));
+        assert!(matches!(c.attach_mode, Some(AttachMode::Tcx)));
+        assert!(c.cleanup);
     }
 }

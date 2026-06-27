@@ -323,7 +323,7 @@ mod tests {
 
     fn settings_for(cert: &Path, key: &Path, server_ip: Ipv4Addr) -> Settings {
         Settings {
-            client_ip: Ipv4Addr::new(10, 8, 0, 5),
+            client_ip: None,
             server_ip,
             server_port: 0,
             tun_iface: "tun0".into(),
@@ -338,6 +338,9 @@ mod tests {
             box_ip: Ipv4Addr::new(192, 168, 1, 10),
             log_level: "info".into(),
             server_name: None,
+            data_plane: crate::config::DataPlaneKind::Ebpf,
+            attach_mode: crate::config::AttachMode::Auto,
+            cleanup: false,
         }
     }
 
