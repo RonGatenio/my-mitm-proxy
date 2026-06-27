@@ -262,12 +262,15 @@ pub fn cls_eth_ingress(mut ctx: TcContext) -> i32 {
         return TC_ACT_OK;
     };
     if classify_eth(&m, &c, false) == Rewrite::UnSnatToBox {
-        // Reply from server to the SNATted client; key on the same tuple. The
-        // reply's `dst_port` is the on-wire client-side port == the box's
-        // ephemeral port recorded on egress.
+        // Reply from server to the SNATted client. After egress SNAT, the on-wire
+        // packet has dst_ip = client_ip (whichever client this flow belongs to).
+        // Use m.dst_ip (the packet's actual destination) as the client_ip key so
+        // the lookup works in both single-client and wildcard/dynamic mode (where
+        // c.client_ip == 0). The reply's `dst_port` == the box's ephemeral port
+        // recorded on egress by cls_eth_egress.
         let key = UpstreamKey {
             server_ip: c.server_ip,
-            client_ip: c.client_ip,
+            client_ip: m.dst_ip,
             server_port: c.server_port,
             client_port: m.dst_port,
         };

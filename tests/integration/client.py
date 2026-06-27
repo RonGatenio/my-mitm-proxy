@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """TLS client for the mymitm netns e2e test.
 
-Runs inside netns "cli" (source IP 10.8.0.5). Connects to 192.168.1.50:443.
-Because the eBPF cls_tun program DNATs the flow to the proxy's local listener,
-the TLS the client actually terminates is the proxy's REAL leaf cert. The
-client PINS/TRUSTS that genuine cert (loaded as the CA file) so assertion 1 is
-a real cryptographic trust check, not verification-disabled.
+Runs inside netns "cli" (source IP 10.8.0.5 by default). Connects to
+192.168.1.50:443. Because the eBPF cls_tun program DNATs the flow to the
+proxy's local listener, the TLS the client actually terminates is the proxy's
+REAL leaf cert. The client PINS/TRUSTS that genuine cert (loaded as the CA
+file) so assertion 1 is a real cryptographic trust check, not
+verification-disabled.
 
 Sends EXPECTED_REQUEST, reads the response, prints it, and exits 0 on success.
+
+--bind-addr lets the caller force a specific source IP (e.g. a secondary IP on
+the same interface), enabling multi-client source-IP preservation tests from a
+single netns without needing a bridge or multiple veth pairs.
 """
 import argparse
 import socket
@@ -24,6 +29,8 @@ def main():
     ap.add_argument("--host", default="192.168.1.50")
     ap.add_argument("--port", type=int, default=443)
     ap.add_argument("--server-name", default="server.test", help="SNI / cert CN to verify")
+    ap.add_argument("--bind-addr", default=None,
+                    help="source IP to bind before connect (multi-client test)")
     args = ap.parse_args()
 
     # Real cert verification: trust ONLY the genuine leaf cert.
@@ -34,10 +41,19 @@ def main():
     # against the SNI name we send (server_hostname), which the cert matches.
     ctx.check_hostname = True
 
-    raw = socket.create_connection((args.host, args.port), timeout=10)
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(10)
+    if args.bind_addr:
+        # Bind to a specific source IP so packets egress with that address.
+        raw.bind((args.bind_addr, 0))
+    raw.connect((args.host, args.port))
+
     try:
         tls = ctx.wrap_socket(raw, server_hostname=args.server_name)
     except ssl.SSLError as e:
+        print(f"HANDSHAKE_FAILED: {e}", flush=True)
+        return 2
+    except OSError as e:
         print(f"HANDSHAKE_FAILED: {e}", flush=True)
         return 2
 

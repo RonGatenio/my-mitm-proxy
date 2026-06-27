@@ -11,9 +11,17 @@
 //! 2. **`ip rule fwmark → table`** — marked packets look up the custom table.
 //! 3. **`ip route local 0.0.0.0/0 dev lo table N`** — so marked replies to spoofed
 //!    client IPs are delivered locally (not dropped).
+//! 4. **iptables mangle MARK** — mark incoming server-reply packets with fwmark so
+//!    the policy-routing rule (2) applies to them and delivers them locally via (3).
+//!    Without this, the upstream socket's outgoing SYN (src=client_ip) would reach
+//!    the server, but the reply (dst=client_ip) has no mark and is dropped by the
+//!    kernel (client_ip is not a local address in the main table).
 //!
-//! `upstream_socket()` opens a TCP connection with `IP_TRANSPARENT` + `SO_MARK` +
+//! `upstream_socket()` opens a TCP connection with `IP_TRANSPARENT` +
 //! bind-to-client-IP so packets egress with the client's source address.
+//! `SO_MARK` is deliberately NOT set on the outgoing socket — the upstream SYN
+//! must follow the normal routing table (main) to reach the server; only incoming
+//! reply packets need to be marked (done by the mangle rule).
 
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::process::Command;
@@ -131,6 +139,50 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
                 tbl.clone(),
             ],
         ),
+        // 4. Mark incoming server-reply packets so the policy rule (2) routes them
+        //    to the local table (3) where they are delivered to the IP_TRANSPARENT
+        //    upstream socket (bound to client_ip). Without this marking, the reply
+        //    packets have no fwmark and the kernel drops them — client_ip is not a
+        //    locally assigned address in the main routing table.
+        (
+            "iptables",
+            vec![
+                s("-t"),
+                s("mangle"),
+                s("-A"),
+                s("PREROUTING"),
+                s("-i"),
+                cfg.egress_iface.clone(),
+                s("-s"),
+                server.clone(),
+                s("-p"),
+                s("tcp"),
+                s("--sport"),
+                port.clone(),
+                s("-j"),
+                s("MARK"),
+                s("--set-mark"),
+                mark.clone(),
+            ],
+            vec![
+                s("-t"),
+                s("mangle"),
+                s("-D"),
+                s("PREROUTING"),
+                s("-i"),
+                cfg.egress_iface.clone(),
+                s("-s"),
+                server.clone(),
+                s("-p"),
+                s("tcp"),
+                s("--sport"),
+                port.clone(),
+                s("-j"),
+                s("MARK"),
+                s("--set-mark"),
+                mark.clone(),
+            ],
+        ),
     ];
     RuleSet { table, items }
 }
@@ -177,7 +229,6 @@ fn write_sysctl(key: &str, val: &str) -> std::io::Result<()> {
 
 pub struct IpRoutePlane {
     rules: RuleSet,
-    fwmark: u32,
     saved: Vec<SavedSysctl>,
 }
 
@@ -234,19 +285,19 @@ impl IpRoutePlane {
         }
 
         tracing::info!("iproute data plane installed (table {})", rules.table);
-        Ok(IpRoutePlane {
-            rules,
-            fwmark: s.fwmark,
-            saved,
-        })
+        Ok(IpRoutePlane { rules, saved })
     }
 }
 
 impl DataPlane for IpRoutePlane {
     /// Open a TCP connection to `server` bound to `client_ip:0` with
-    /// `IP_TRANSPARENT` (allows binding a non-local address) and `SO_MARK`
-    /// (routes replies via the custom table back to us). Returns a nonblocking
-    /// `TcpStream` consistent with the eBPF plane.
+    /// `IP_TRANSPARENT` (allows binding a non-local address). Returns a
+    /// nonblocking `TcpStream` consistent with the eBPF plane.
+    ///
+    /// SO_MARK is deliberately NOT set: the upstream SYN must follow the main
+    /// routing table to reach the server. Only the server's reply packets need
+    /// the fwmark, and those are marked by the mangle PREROUTING rule installed
+    /// in `setup()` (item 4).
     ///
     /// Note: socket2 0.6.4 names this `set_ip_transparent_v4` (not
     /// `set_ip_transparent`). We use the v4-specific variant since this plane is
@@ -260,11 +311,8 @@ impl DataPlane for IpRoutePlane {
         // IP_TRANSPARENT: allows binding to a non-local (client) source address.
         sock.set_ip_transparent_v4(true)?;
         sock.set_reuse_address(true)?;
-        if self.fwmark != 0 {
-            sock.set_mark(self.fwmark)?;
-        }
         // Bind to dynamic client IP (ephemeral port 0) so packets egress with
-        // src = client_ip; the fwmark rule routes replies back to us.
+        // src = client_ip; the mangle rule marks replies back to us.
         sock.bind(&SocketAddrV4::new(client_ip, 0).into())?;
         sock.connect(&server.into())?;
         sock.set_nonblocking(true)?;
@@ -351,10 +399,10 @@ mod tests {
     }
 
     #[test]
-    fn ruleset_has_exactly_three_items() {
+    fn ruleset_has_exactly_four_items() {
         let rs = build_ruleset(&settings());
-        // 1 iptables DNAT + 1 ip rule + 1 ip route
-        assert_eq!(rs.items.len(), 3);
+        // 1 iptables DNAT + 1 ip rule + 1 ip route + 1 iptables mangle MARK
+        assert_eq!(rs.items.len(), 4);
     }
 
     #[test]
@@ -389,6 +437,19 @@ mod tests {
         assert_eq!(rs.items[0].0, "iptables");
         assert_eq!(rs.items[1].0, "ip");
         assert_eq!(rs.items[2].0, "ip");
+        assert_eq!(rs.items[3].0, "iptables");
+    }
+
+    /// Smoke-test: the mangle MARK rule targets the egress interface and server IP.
+    #[test]
+    fn ruleset_mangle_mark_targets_egress_and_server() {
+        let rs = build_ruleset(&settings());
+        let (_p, add_mangle, _del) = &rs.items[3];
+        assert!(add_mangle.contains(&"-t".to_string()));
+        assert!(add_mangle.contains(&"mangle".to_string()));
+        assert!(add_mangle.contains(&"MARK".to_string()));
+        assert!(add_mangle.contains(&"eth0".to_string())); // egress_iface
+        assert!(add_mangle.contains(&"192.168.1.50".to_string())); // server_ip
     }
 
     /// Privileged smoke test: setup() applies, drop reverses. Run with sudo.
@@ -460,6 +521,18 @@ mod tests {
                 "local route missing while plane is active:\n{routes}"
             );
             println!("IPROUTE_OK: local route present");
+
+            // Verify mangle MARK rule exists.
+            let out = C::new("iptables")
+                .args(["-t", "mangle", "-S", "PREROUTING"])
+                .output()
+                .expect("iptables -t mangle -S");
+            let mangle = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                mangle.contains("MARK") && mangle.contains("192.168.1.50"),
+                "mangle MARK rule missing while plane is active:\n{mangle}"
+            );
+            println!("MANGLE_OK: MARK rule present");
         } // _plane dropped -> rules/routes reversed
 
         // After drop, DNAT rule must be gone.
@@ -494,6 +567,18 @@ mod tests {
             "local route still present after drop:\n{routes_after}"
         );
         println!("IPROUTE_GONE_OK");
+
+        // After drop, mangle MARK rule must be gone.
+        let out = C::new("iptables")
+            .args(["-t", "mangle", "-S", "PREROUTING"])
+            .output()
+            .expect("iptables -t mangle -S after drop");
+        let mangle_after = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !mangle_after.contains("192.168.1.50") || !mangle_after.contains("MARK"),
+            "mangle MARK rule still present after drop:\n{mangle_after}"
+        );
+        println!("MANGLE_GONE_OK");
 
         // Tear down mmtun0.
         let _ = C::new("ip").args(["link", "del", "mmtun0"]).status();
