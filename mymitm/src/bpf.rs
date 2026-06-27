@@ -20,12 +20,16 @@
 //! * Attachment is verified via `SchedClassifier::query_tcx(iface, dir)`, NOT
 //!   `tc filter show` / `bpftool` (both show nothing for TCX on this kernel).
 
-use aya::maps::{Array, MapData};
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Mutex;
+
+use aya::maps::{Array, HashMap as AyaHashMap, MapData};
 use aya::programs::{SchedClassifier, TcAttachType};
 use aya::{Ebpf, EbpfLoader};
 use mymitm_common::Config;
 
 use crate::config::Settings;
+use crate::dataplane::DataPlane;
 
 /// The four classifier program names, in (program, iface-selector, direction)
 /// form. The iface selector picks `tun_iface` vs `egress_iface` from `Settings`
@@ -52,7 +56,12 @@ pub struct BpfPlane {
     #[allow(dead_code)]
     tun: String,
     #[allow(dead_code)]
-    egress: String,
+    egress_iface: String,
+    box_ip: Ipv4Addr,
+    fwmark: u32,
+    /// EGRESS map: box ephemeral src port (NBO) -> client IP (NBO). Written per
+    /// connection just before connect() so cls_eth_egress can SNAT correctly.
+    egress_map: Mutex<AyaHashMap<MapData, u16, u32>>,
 }
 
 impl BpfPlane {
@@ -78,6 +87,12 @@ impl BpfPlane {
             cfgmap.set(0, s.to_bpf_config(), 0)?;
         }
 
+        // Take ownership of the EGRESS map so userspace can write it per-conn.
+        let egress_map: AyaHashMap<MapData, u16, u32> = AyaHashMap::try_from(
+            ebpf.take_map("EGRESS")
+                .ok_or_else(|| anyhow::anyhow!("EGRESS map not found in eBPF object"))?,
+        )?;
+
         // Load + attach the four classifiers. On 6.6 aya uses TCX automatically;
         // the returned link id is retained by the owning `SchedClassifier`, which
         // lives inside `ebpf`, so the attachment persists as long as we hold it.
@@ -99,7 +114,10 @@ impl BpfPlane {
         Ok(BpfPlane {
             ebpf,
             tun: s.tun_iface.clone(),
-            egress: s.egress_iface.clone(),
+            egress_iface: s.egress_iface.clone(),
+            box_ip: s.box_ip,
+            fwmark: s.fwmark,
+            egress_map: Mutex::new(egress_map),
         })
     }
 }
@@ -110,9 +128,51 @@ impl Drop for BpfPlane {
         // kernel uses to detach the programs (fail-open). We do NOT touch `tc`.
         tracing::debug!(
             tun = %self.tun,
-            egress = %self.egress,
+            egress = %self.egress_iface,
             "BpfPlane dropping; TCX links released, programs auto-detach"
         );
+    }
+}
+
+impl DataPlane for BpfPlane {
+    fn upstream_socket(
+        &self,
+        client_ip: Ipv4Addr,
+        server: SocketAddrV4,
+    ) -> std::io::Result<std::net::TcpStream> {
+        let sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        if self.fwmark != 0 {
+            sock.set_mark(self.fwmark)?;
+        }
+        // Bind box_ip:0 so the kernel assigns the ephemeral port NOW; we must
+        // know it (and publish EGRESS) BEFORE connect() so the very first SYN is
+        // SNAT'd. (port 0 -> kernel picks one; getsockname reads it back.)
+        sock.bind(&SocketAddrV4::new(self.box_ip, 0).into())?;
+        let local = sock.local_addr()?;
+        let box_port = local
+            .as_socket_ipv4()
+            .map(|a| a.port())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no ipv4 local addr"))?;
+
+        // Publish EGRESS[box_port] = client_ip (both NBO) before connect().
+        {
+            let mut map = self
+                .egress_map
+                .lock()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "egress map poisoned"))?;
+            if let Err(e) = map.insert(box_port.to_be(), u32::from(client_ip).to_be(), 0) {
+                // Log and proceed: the flow just won't be SNAT'd (visible failure).
+                tracing::warn!("EGRESS insert failed for box_port={box_port}: {e}");
+            }
+        }
+
+        sock.connect(&server.into())?;
+        sock.set_nonblocking(true)?;
+        Ok(sock.into())
     }
 }
 

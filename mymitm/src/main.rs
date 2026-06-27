@@ -1,5 +1,6 @@
 mod bpf;
 mod config;
+mod dataplane;
 mod dump;
 mod proxy;
 
