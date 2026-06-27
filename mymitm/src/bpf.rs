@@ -199,6 +199,8 @@ const PROGRAM_NAMES: [&str; 4] = [
     "cls_eth_egress",
 ];
 
+const _: () = assert!(PROGRAM_NAMES.len() == PROGRAMS.len());
+
 /// Remove the clsact qdisc (and thus all its filters) from `iface` on the legacy
 /// tc path. First detaches our four filters by name via aya (best-effort), then
 /// removes the clsact qdisc entirely. aya 0.13 has no clsact-removal helper, so
@@ -207,6 +209,8 @@ const PROGRAM_NAMES: [&str; 4] = [
 fn teardown_tc(iface: &str) {
     use std::process::Command;
 
+    // Safe to call even for an interface attached via TCX (no tc filters ever added):
+    // all NotFound errors and the "No such file" tc qdisc del failure are swallowed silently.
     // Detach our filters by name on both directions (best-effort). NotFound just
     // means it was never attached / already gone.
     for dir in [TcAttachType::Ingress, TcAttachType::Egress] {
