@@ -5,8 +5,9 @@ Runs inside netns "srv" bound to 192.168.1.50:443. For each accepted
 connection it RECORDS the peer source IP it observes (this is the core
 source-IP-preservation proof) and serves a fixed response body.
 
-The peer IP of the first connection is written to --peerfile so the driver
-can assert it equals 10.8.0.5 (the client) and NOT 192.168.1.10 (the box).
+Every accepted connection's peer IP is APPENDED (one per line) to --peerfile
+so the driver can assert that both expected client IPs appear (e.g. 10.8.0.5
+and 10.8.0.9) and that the box IP (192.168.1.10) does NOT appear.
 """
 import argparse
 import socket
@@ -44,8 +45,9 @@ def main():
         raw, peer = srv.accept()
         peer_ip = peer[0]
         print(f"[fake_server] connection from peer={peer_ip}", flush=True)
-        # Record the peer IP as seen on the raw TCP socket (authoritative).
-        with open(args.peerfile, "w") as f:
+        # Append the peer IP (one per line) so the driver can assert all
+        # expected client IPs appear across multi-client runs.
+        with open(args.peerfile, "a") as f:
             f.write(peer_ip + "\n")
         try:
             tls = ctx.wrap_socket(raw, server_side=True)
@@ -65,7 +67,7 @@ def main():
             except OSError:
                 pass
             tls.close()
-        # One connection is enough for the test; keep serving in case of retries.
+        # Keep serving — the multi-client test sends two connections.
 
 
 if __name__ == "__main__":

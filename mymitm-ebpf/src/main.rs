@@ -46,6 +46,30 @@ static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 #[map]
 static UPSTREAM: LruHashMap<UpstreamKey, UpstreamVal> = LruHashMap::with_max_entries(1024, 0);
 
+/// Dynamic per-connection SNAT target, populated by userspace BEFORE it issues
+/// the upstream connect(): key = the box's ephemeral source port (NBO), value =
+/// the client IP (NBO) to SNAT that flow's source to. Read by `cls_eth_egress`.
+///
+/// **Lifecycle**: userspace INSERTS into this map before every connect() and does
+/// NOT delete on connection close. Correctness relies on two properties:
+///
+/// 1. Insert-before-connect: the entry is always written before the first SYN
+///    exits, so `cls_eth_egress` sees the correct client IP for that port.
+/// 2. Port-reuse safety: when the OS reuses an ephemeral port for a new
+///    connection, userspace inserts the new client IP before the new connect(),
+///    overwriting any stale entry from the previous flow at that port before
+///    the new flow's first SYN is ever sent.
+/// 3. LRU bound: the 1024-entry LRU map self-evicts the oldest entry on insert
+///    once full, so the map can never fill permanently and block new inserts.
+///
+/// **Known caveat**: if the EGRESS insert itself fails (userspace logs `warn`),
+/// the new flow proceeds without SNAT (visible failure). In that case a reused
+/// ephemeral port could briefly be SNATted to the *previous* connection's client
+/// IP until the next successful overwrite. Delete-on-close would convert that
+/// race from "wrong SNAT IP" to "no SNAT" instead — recorded as a follow-up.
+#[map]
+static EGRESS: LruHashMap<u16, u32> = LruHashMap::with_max_entries(1024, 0);
+
 const ETH_LEN: usize = EthHdr::LEN; // 14
 const IP_MIN_LEN: usize = Ipv4Hdr::LEN; // 20
 const TCP_MIN_LEN: usize = TcpHdr::LEN; // 20
@@ -228,23 +252,23 @@ pub fn cls_eth_egress(mut ctx: TcContext) -> i32 {
         return TC_ACT_OK;
     };
     if classify_eth(&m, &c, true) == Rewrite::SnatToClient {
-        // Record the reverse mapping BEFORE rewriting. `m.src_port` is the box's
-        // chosen ephemeral upstream port; the SNAT keeps the source port intact,
-        // so on the wire the client-side port equals this value — which is what
-        // ingress later keys on via the reply's `dst_port`.
+        // Resolve the SNAT target client IP from the EGRESS map, keyed by our
+        // own ephemeral source port (userspace inserted it before connect()).
+        // If absent, leave the packet untouched (visible failure, never wrong IP).
+        let client_ip = match unsafe { EGRESS.get(&m.src_port) } {
+            Some(ip) => *ip,
+            None => return TC_ACT_OK,
+        };
+        // Record the reverse mapping BEFORE rewriting so ingress replies un-SNAT.
         let key = UpstreamKey {
             server_ip: c.server_ip,
-            client_ip: c.client_ip,
+            client_ip,
             server_port: c.server_port,
             client_port: m.src_port,
         };
-        let val = UpstreamVal {
-            box_ip: c.box_ip,
-            box_port: m.src_port,
-        };
+        let val = UpstreamVal { box_ip: c.box_ip, box_port: m.src_port, _pad: 0 };
         let _ = UPSTREAM.insert(&key, &val, 0);
-        // SNAT: source IP -> client IP, source port unchanged.
-        let _ = set_src(&mut ctx, l3, l4, c.client_ip, m.src_port);
+        let _ = set_src(&mut ctx, l3, l4, client_ip, m.src_port);
     }
     TC_ACT_OK
 }
@@ -255,12 +279,15 @@ pub fn cls_eth_ingress(mut ctx: TcContext) -> i32 {
         return TC_ACT_OK;
     };
     if classify_eth(&m, &c, false) == Rewrite::UnSnatToBox {
-        // Reply from server to the SNATted client; key on the same tuple. The
-        // reply's `dst_port` is the on-wire client-side port == the box's
-        // ephemeral port recorded on egress.
+        // Reply from server to the SNATted client. After egress SNAT, the on-wire
+        // packet has dst_ip = client_ip (whichever client this flow belongs to).
+        // Use m.dst_ip (the packet's actual destination) as the client_ip key so
+        // the lookup works in both single-client and wildcard/dynamic mode (where
+        // c.client_ip == 0). The reply's `dst_port` == the box's ephemeral port
+        // recorded on egress by cls_eth_egress.
         let key = UpstreamKey {
             server_ip: c.server_ip,
-            client_ip: c.client_ip,
+            client_ip: m.dst_ip,
             server_port: c.server_port,
             client_port: m.dst_port,
         };

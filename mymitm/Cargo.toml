@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 mymitm-common = { path = "../mymitm-common", features = ["user"] }
@@ -15,6 +15,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aya = "0.13.1"
 aya-log = "0.2"
+object = { version = "0.36", features = ["read"] }
 tokio = { version = "1", features = ["rt-multi-thread","net","io-util","macros","signal","time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring","tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring","std"] }

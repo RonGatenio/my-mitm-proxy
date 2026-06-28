@@ -2,3 +2,7 @@ target/
 .superpowers/
 .sdd/
 *.log
+lvh-modules/
+mymitm-lvh.toml
+c.pem
+k.pem
