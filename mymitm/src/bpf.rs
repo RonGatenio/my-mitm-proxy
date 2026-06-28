@@ -217,16 +217,6 @@ fn attach_tc(prog: &mut SchedClassifier, iface: &str, dir: TcAttachType) -> anyh
     Ok(())
 }
 
-/// Names of our four classifiers, used for by-name tc filter detach.
-const PROGRAM_NAMES: [&str; 4] = [
-    "cls_tun_ingress",
-    "cls_tun_egress",
-    "cls_eth_ingress",
-    "cls_eth_egress",
-];
-
-const _: () = assert!(PROGRAM_NAMES.len() == PROGRAMS.len());
-
 /// Remove the clsact qdisc (and thus all its filters) from `iface` on the legacy
 /// tc path. First detaches our four filters by name via aya (best-effort), then
 /// removes the clsact qdisc entirely. aya 0.13 has no clsact-removal helper, so
@@ -240,7 +230,7 @@ fn teardown_tc(iface: &str) {
     // Detach our filters by name on both directions (best-effort). NotFound just
     // means it was never attached / already gone.
     for dir in [TcAttachType::Ingress, TcAttachType::Egress] {
-        for name in PROGRAM_NAMES {
+        for (name, _, _) in PROGRAMS {
             match tc::qdisc_detach_program(iface, dir, name) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

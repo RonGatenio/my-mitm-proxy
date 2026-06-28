@@ -20,8 +20,8 @@ impl Default for AttachMode { fn default() -> Self { AttachMode::Auto } }
 #[derive(Debug, Clone, Deserialize)]
 struct FileCfg {
     target_server_ip: Ipv4Addr,
-    cert_path: PathBuf,
-    key_path: PathBuf,
+    #[serde(default = "d_cert")] cert_path: PathBuf,
+    #[serde(default = "d_key")] key_path: PathBuf,
     box_ip: Ipv4Addr,
     #[serde(default)] target_client_ip: Option<Ipv4Addr>,
     #[serde(default = "d_port")] target_server_port: u16,
@@ -46,27 +46,35 @@ fn d_mark() -> u32 { 0x1337 }
 fn d_dump() -> PathBuf { "/var/tmp/mitm-dumps/".into() }
 fn d_obj() -> String { "mymitm".into() }
 fn d_log() -> String { "info".into() }
+fn d_cert() -> PathBuf { "/etc/mymitm/leaf.pem".into() }
+fn d_key() -> PathBuf { "/etc/mymitm/leaf.key".into() }
 
 #[derive(Parser, Debug)]
 #[command(version, about = "transparent TLS MITM with source-IP preservation")]
 struct Cli {
     /// Path to TOML config
-    #[arg(short, long, default_value = "mymitm.toml")]
+    #[arg(short, long, env = "MYMITM_CONFIG", default_value = "mymitm.toml")]
     config: PathBuf,
     /// Override target client IP (restrict to one client; omit for dynamic)
-    #[arg(long)] client: Option<Ipv4Addr>,
+    #[arg(long, env = "MYMITM_CLIENT")] client: Option<Ipv4Addr>,
     /// Override target server IP
-    #[arg(long)] server: Option<Ipv4Addr>,
+    #[arg(long, env = "MYMITM_SERVER")] server: Option<Ipv4Addr>,
+    /// Override path to the real leaf certificate (PEM)
+    #[arg(long, env = "MYMITM_CERT")] cert: Option<PathBuf>,
+    /// Override path to the real leaf private key (PEM)
+    #[arg(long, env = "MYMITM_KEY")] key: Option<PathBuf>,
+    /// Override the decrypted-traffic dump directory
+    #[arg(long = "dump-path", env = "MYMITM_DUMP")] dump_path: Option<PathBuf>,
     /// Override tun interface
-    #[arg(long)] tun: Option<String>,
+    #[arg(long, env = "MYMITM_TUN")] tun: Option<String>,
     /// Override egress interface
-    #[arg(long)] egress: Option<String>,
+    #[arg(long, env = "MYMITM_EGRESS")] egress: Option<String>,
     /// Override data plane
-    #[arg(long, value_enum)] data_plane: Option<DataPlaneKind>,
+    #[arg(long, value_enum, env = "MYMITM_DATA_PLANE")] data_plane: Option<DataPlaneKind>,
     /// Override attach mode (eBPF only)
-    #[arg(long, value_enum)] attach_mode: Option<AttachMode>,
+    #[arg(long, value_enum, env = "MYMITM_ATTACH_MODE")] attach_mode: Option<AttachMode>,
     /// Override upstream SNI hostname
-    #[arg(long = "server-name")] server_name: Option<String>,
+    #[arg(long = "server-name", env = "MYMITM_SERVER_NAME")] server_name: Option<String>,
     /// Reverse any leftover state (stale clsact qdisc / iproute rules) from a
     /// previous unclean exit, then continue startup.
     #[arg(long, default_value_t = false)] cleanup: bool,
@@ -125,6 +133,9 @@ impl Settings {
         let mut s = Settings::from_toml_str(&text)?;
         if let Some(v) = cli.client { s.client_ip = Some(v); }
         if let Some(v) = cli.server { s.server_ip = v; }
+        if let Some(v) = cli.cert { s.cert_path = v; }
+        if let Some(v) = cli.key { s.key_path = v; }
+        if let Some(v) = cli.dump_path { s.dump_path = v; }
         if let Some(v) = cli.tun { s.tun_iface = v; }
         if let Some(v) = cli.egress { s.egress_iface = v; }
         if let Some(v) = cli.data_plane { s.data_plane = v; }
@@ -201,8 +212,36 @@ mod tests {
     }
 
     #[test]
+    fn paths_default_when_omitted() {
+        // cert/key/dump are now optional config fields with default values.
+        let toml = r#"
+            target_server_ip = "192.168.1.50"
+            box_ip = "192.168.1.10"
+        "#;
+        let s = Settings::from_toml_str(toml).unwrap();
+        assert_eq!(s.cert_path, PathBuf::from("/etc/mymitm/leaf.pem"));
+        assert_eq!(s.key_path, PathBuf::from("/etc/mymitm/leaf.key"));
+        assert_eq!(s.dump_path, PathBuf::from("/var/tmp/mitm-dumps/"));
+    }
+
+    #[test]
     fn missing_required_field_errors() {
+        // box_ip is still required, so target_server_ip alone errors.
         assert!(Settings::from_toml_str(r#"target_server_ip = "10.0.0.1""#).is_err());
+    }
+
+    #[test]
+    fn cli_parses_path_overrides() {
+        use clap::Parser;
+        let c = Cli::try_parse_from([
+            "mymitm",
+            "--cert", "/tmp/c.pem",
+            "--key", "/tmp/k.pem",
+            "--dump-path", "/tmp/dumps",
+        ]).unwrap();
+        assert_eq!(c.cert.as_deref(), Some(std::path::Path::new("/tmp/c.pem")));
+        assert_eq!(c.key.as_deref(), Some(std::path::Path::new("/tmp/k.pem")));
+        assert_eq!(c.dump_path.as_deref(), Some(std::path::Path::new("/tmp/dumps")));
     }
 
     #[test]
