@@ -63,7 +63,6 @@ BOX_IP=192.168.1.10
 
 SERVER_PID=""
 PROXY_PID=""
-ORIG_ALL_ROUTE_LOCALNET=""
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -81,9 +80,6 @@ teardown() {
   ip netns del "$NS_SRV"  2>/dev/null
   ip link del "$VROOT" 2>/dev/null
   ip link del "$VETH0" 2>/dev/null
-  # restore the global route_localnet sysctl
-  [ -n "$ORIG_ALL_ROUTE_LOCALNET" ] && \
-    sysctl -wq net.ipv4.conf.all.route_localnet="$ORIG_ALL_ROUTE_LOCALNET" 2>/dev/null
   # confirm clean
   if ip netns list 2>/dev/null | grep -qE "^($NS_CLI|$NS_SRV)\b"; then
     red "WARNING: leftover netns remain"; ip netns list
@@ -133,12 +129,12 @@ ip link add "$VROOT" type veth peer name "$VCLI"
 ip link set "$VCLI" netns "$NS_CLI"
 ip addr add 10.8.0.1/24 dev "$VROOT"
 ip link set "$VROOT" up
-# The eBPF DNATs the client flow's destination to 127.0.0.1:8443. A packet that
-# ARRIVES on a real interface destined for a loopback address is dropped as a
-# "martian" unless route_localnet is enabled for that interface.
-ORIG_ALL_ROUTE_LOCALNET="$(cat /proc/sys/net/ipv4/conf/all/route_localnet 2>/dev/null)"
+# The eBPF DNATs the client flow's destination to the local listener address.
+# A packet that ARRIVES on a real interface destined for a loopback/non-local
+# address is dropped as a "martian" unless route_localnet is enabled for that
+# interface. Set it only for VROOT (the tun_iface) here; the iproute data plane
+# additionally needs it on the egress interface, which it sets itself via sysctl.
 sysctl -wq net.ipv4.conf."$VROOT".route_localnet=1
-sysctl -wq net.ipv4.conf.all.route_localnet=1
 ip netns exec "$NS_CLI" ip addr add "$CLIENT_IP/24" dev "$VCLI"
 ip netns exec "$NS_CLI" ip link set "$VCLI" up
 ip netns exec "$NS_CLI" ip link set lo up

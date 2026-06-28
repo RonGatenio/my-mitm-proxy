@@ -205,3 +205,25 @@ guards. Required kernel features all predate 4.15: `clsact` qdisc (4.5),
 - `--cleanup` semantics: how stale state is tagged so it can be reversed safely
   without touching unrelated rules (e.g. a dedicated chain / a reserved fwmark +
   rule priority).
+
+## Known limitations / follow-ups
+
+### EGRESS delete-on-close not implemented (LRU-reliant)
+
+`EGRESS[box_port]` is inserted by userspace before every upstream `connect()` and
+is **never deleted on connection close**. The current implementation relies on:
+
+1. **Insert-before-connect ordering** — the entry is always written before the
+   first SYN, so `cls_eth_egress` reads the correct client IP for that ephemeral
+   port on that flow.
+2. **Port-reuse overwrite** — when the OS reuses an ephemeral port for a new
+   connection, the new insert overwrites the stale entry before the new SYN is
+   sent, so no stale state is ever acted on under normal operation.
+3. **LRU self-eviction** — the 1024-entry LRU map cannot fill permanently; the
+   least-recently-used entry is reclaimed on every insert once the map is full.
+
+**Insert-failure caveat**: if the EGRESS insert fails (userspace logs `warn`), a
+stale entry for a reused ephemeral port could cause the new flow to be SNATted to
+the *previous* connection's client IP instead of the current one. Delete-on-close
+would convert that race from "wrong SNAT IP" to "no SNAT" — a less silent failure.
+Implementing delete-on-close is deferred as a follow-up task.

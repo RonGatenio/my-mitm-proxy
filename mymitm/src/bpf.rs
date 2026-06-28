@@ -328,6 +328,19 @@ impl DataPlane for BpfPlane {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no ipv4 local addr"))?;
 
         // Publish EGRESS[box_port] = client_ip (both NBO) before connect().
+        //
+        // Lifecycle note: we INSERT here and do NOT delete on connection close.
+        // Correctness relies on:
+        //   (1) this insert happening before connect(), so cls_eth_egress sees the
+        //       correct client IP for the very first SYN on this ephemeral port;
+        //   (2) port-reuse: when the OS reuses a port for a new connection, this
+        //       insert overwrites the stale entry before the new SYN is sent;
+        //   (3) the 1024-entry LRU bounding the map (self-eviction on insert).
+        //
+        // Caveat: if this insert FAILS (logged warn below), a stale entry for a
+        // reused box_port could cause that new flow to be SNATted to the previous
+        // client's IP. Delete-on-close would convert that from "wrong SNAT IP" to
+        // "no SNAT" instead — recorded as a known follow-up (see spec).
         {
             let mut map = self
                 .egress_map

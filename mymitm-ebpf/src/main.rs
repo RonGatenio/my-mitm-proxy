@@ -49,7 +49,24 @@ static UPSTREAM: LruHashMap<UpstreamKey, UpstreamVal> = LruHashMap::with_max_ent
 /// Dynamic per-connection SNAT target, populated by userspace BEFORE it issues
 /// the upstream connect(): key = the box's ephemeral source port (NBO), value =
 /// the client IP (NBO) to SNAT that flow's source to. Read by `cls_eth_egress`.
-/// LRU so a missed userspace delete can never wedge the map.
+///
+/// **Lifecycle**: userspace INSERTS into this map before every connect() and does
+/// NOT delete on connection close. Correctness relies on two properties:
+///
+/// 1. Insert-before-connect: the entry is always written before the first SYN
+///    exits, so `cls_eth_egress` sees the correct client IP for that port.
+/// 2. Port-reuse safety: when the OS reuses an ephemeral port for a new
+///    connection, userspace inserts the new client IP before the new connect(),
+///    overwriting any stale entry from the previous flow at that port before
+///    the new flow's first SYN is ever sent.
+/// 3. LRU bound: the 1024-entry LRU map self-evicts the oldest entry on insert
+///    once full, so the map can never fill permanently and block new inserts.
+///
+/// **Known caveat**: if the EGRESS insert itself fails (userspace logs `warn`),
+/// the new flow proceeds without SNAT (visible failure). In that case a reused
+/// ephemeral port could briefly be SNATted to the *previous* connection's client
+/// IP until the next successful overwrite. Delete-on-close would convert that
+/// race from "wrong SNAT IP" to "no SNAT" instead — recorded as a follow-up.
 #[map]
 static EGRESS: LruHashMap<u16, u32> = LruHashMap::with_max_entries(1024, 0);
 

@@ -54,6 +54,14 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
     let local = format!("{}:{}", cfg.local_ip, cfg.local_port);
     let mark = cfg.fwmark.to_string();
     let tbl = table.to_string();
+    // Pin a stable priority derived from the table id so `ip rule del` targets
+    // exactly our rule. Without an explicit priority, a duplicate fwmark rule
+    // added by another process (or a prior unclean exit) could cause `del` to
+    // remove the wrong rule. We use priority = 30000 + table, which is:
+    //   - well below the kernel-reserved 32766/32767 (default/main lookups),
+    //   - deterministic and unique per (fwmark, table) pair,
+    //   - high enough to not conflict with typical user policy rules (< 1000).
+    let prio = (30000u32 + table).to_string();
     let items = vec![
         // 1. Intercept: DNAT client→server to the local listener on the tun iface.
         (
@@ -95,12 +103,14 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
                 local.clone(),
             ],
         ),
-        // 2. Reply capture: fwmark → custom routing table.
+        // 2. Reply capture: fwmark → custom routing table (pinned priority).
         (
             "ip",
             vec![
                 s("rule"),
                 s("add"),
+                s("priority"),
+                prio.clone(),
                 s("fwmark"),
                 mark.clone(),
                 s("lookup"),
@@ -109,6 +119,8 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
             vec![
                 s("rule"),
                 s("del"),
+                s("priority"),
+                prio.clone(),
                 s("fwmark"),
                 mark.clone(),
                 s("lookup"),
@@ -240,6 +252,17 @@ impl IpRoutePlane {
         let mut saved = Vec::new();
 
         // Required sysctls.
+        //
+        // route_localnet is needed on BOTH the tun iface and the egress iface:
+        //   - tun iface: the eBPF/DNAT rewrites the client→server dst to the
+        //     local listener (127.0.0.1); a packet arriving on a real interface
+        //     destined for a loopback address is dropped as a martian unless
+        //     route_localnet=1 is set for that interface.
+        //   - egress iface: the ip-rule/local-route delivers marked reply packets
+        //     (dst=client_ip, which is not a locally assigned address) to `lo`
+        //     via `local 0.0.0.0/0 dev lo table N`. That delivery requires
+        //     route_localnet=1 on the EGRESS interface — the interface where those
+        //     packets arrive — not just on the tun iface.
         let sysctl_wants: Vec<(String, &str)> = vec![
             ("net.ipv4.ip_forward".to_string(), "1"),
             (
@@ -248,6 +271,10 @@ impl IpRoutePlane {
             ),
             (
                 format!("net.ipv4.conf.{}.route_localnet", s.tun_iface),
+                "1",
+            ),
+            (
+                format!("net.ipv4.conf.{}.route_localnet", s.egress_iface),
                 "1",
             ),
         ];
@@ -427,6 +454,39 @@ mod tests {
         assert!(
             add_rule.contains(&mark) || add_rule.contains(&mark_dec),
             "fwmark not found in ip rule: {add_rule:?}"
+        );
+    }
+
+    /// The ip rule add/del must carry a pinned priority so that cleanup deletes
+    /// exactly our rule and not a duplicate left by another process.
+    /// priority = 30000 + table = 30000 + 155 = 30155 for fwmark 0x1337.
+    #[test]
+    fn ruleset_ip_rule_has_pinned_priority() {
+        let rs = build_ruleset(&settings());
+        // table = 100 + (0x1337 & 0xff) = 155 → prio = 30155
+        let expected_prio = (30000u32 + rs.table).to_string();
+        let (_p, add_rule, del_rule) = &rs.items[1];
+        assert!(
+            add_rule.contains(&"priority".to_string()),
+            "ip rule add must include 'priority': {add_rule:?}"
+        );
+        assert!(
+            add_rule.contains(&expected_prio),
+            "ip rule add must carry prio {expected_prio}: {add_rule:?}"
+        );
+        assert!(
+            del_rule.contains(&"priority".to_string()),
+            "ip rule del must include 'priority': {del_rule:?}"
+        );
+        assert!(
+            del_rule.contains(&expected_prio),
+            "ip rule del must carry prio {expected_prio}: {del_rule:?}"
+        );
+        // add and del must still be length-equal (this is the structural invariant).
+        assert_eq!(
+            add_rule.len(),
+            del_rule.len(),
+            "add/del arg vectors must have equal length"
         );
     }
 
