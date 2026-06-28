@@ -27,7 +27,10 @@ use aya_ebpf::{
     maps::{Array, LruHashMap},
     programs::TcContext,
 };
-use mymitm_common::{classify_eth, classify_tun, Config, PktMeta, Rewrite, UpstreamKey, UpstreamVal};
+use mymitm_common::{
+    classify_eth, classify_tun, Config, PktMeta, Rewrite, UpstreamKey, UpstreamVal,
+    EGRESS_MAP_CAPACITY, UPSTREAM_MAP_CAPACITY,
+};
 use network_types::{eth::EthHdr, ip::Ipv4Hdr, tcp::TcpHdr};
 
 /// Single-entry config map (index 0 -> Config), populated by userspace.
@@ -44,7 +47,8 @@ static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 /// guarantees it can never fill permanently (the least-recently-used entry is
 /// reclaimed on insert), so a leaked/never-reaped mapping cannot wedge the path.
 #[map]
-static UPSTREAM: LruHashMap<UpstreamKey, UpstreamVal> = LruHashMap::with_max_entries(1024, 0);
+static UPSTREAM: LruHashMap<UpstreamKey, UpstreamVal> =
+    LruHashMap::with_max_entries(UPSTREAM_MAP_CAPACITY, 0);
 
 /// Dynamic per-connection SNAT target, populated by userspace BEFORE it issues
 /// the upstream connect(): key = the box's ephemeral source port (NBO), value =
@@ -68,7 +72,7 @@ static UPSTREAM: LruHashMap<UpstreamKey, UpstreamVal> = LruHashMap::with_max_ent
 /// IP until the next successful overwrite. Delete-on-close would convert that
 /// race from "wrong SNAT IP" to "no SNAT" instead — recorded as a follow-up.
 #[map]
-static EGRESS: LruHashMap<u16, u32> = LruHashMap::with_max_entries(1024, 0);
+static EGRESS: LruHashMap<u16, u32> = LruHashMap::with_max_entries(EGRESS_MAP_CAPACITY, 0);
 
 const ETH_LEN: usize = EthHdr::LEN; // 14
 const IP_MIN_LEN: usize = Ipv4Hdr::LEN; // 20
@@ -154,62 +158,51 @@ fn meta(ctx: &TcContext) -> Option<(PktMeta, usize, usize)> {
     Some((m, l3, l4))
 }
 
-/// DNAT: rewrite the destination IP:port and fix the IPv4 + TCP checksums.
-/// `new_ip`/`new_port` are in network byte order.
+/// Rewrite an IP:port pair at `(l3 + ip_off, l4 + port_off)` and fix the IPv4 +
+/// TCP checksums. `new_ip`/`new_port` are in network byte order. `set_dst` and
+/// `set_src` are thin wrappers passing the dst/src offsets respectively, so the
+/// checksum/store logic lives in exactly one place.
 #[inline(always)]
-fn set_dst(
+fn rewrite_addr_port(
     ctx: &mut TcContext,
     l3: usize,
     l4: usize,
+    ip_off: usize,
+    port_off: usize,
     new_ip: u32,
     new_port: u16,
 ) -> Result<(), i64> {
-    let old_ip: u32 = ctx.load(l3 + IP_OFF_DST)?;
-    let old_port: u16 = ctx.load(l4 + TCP_OFF_DST)?;
+    let old_ip: u32 = ctx.load(l3 + ip_off)?;
+    let old_port: u16 = ctx.load(l4 + port_off)?;
 
-    // L3 checksum: IP address change only affects the IPv4 header checksum.
+    // L3 checksum: the IP address change only affects the IPv4 header checksum.
     ctx.l3_csum_replace(l3 + IP_OFF_CHECK, old_ip as u64, new_ip as u64, 4)?;
-    // L4 checksum: the destination IP is part of the TCP pseudo-header.
+    // L4 checksum: the IP is part of the TCP pseudo-header.
     ctx.l4_csum_replace(
         l4 + TCP_OFF_CHECK,
         old_ip as u64,
         new_ip as u64,
         (BPF_F_PSEUDO_HDR | 4) as u64,
     )?;
-    // L4 checksum: the destination port lives in the TCP header itself.
+    // L4 checksum: the port lives in the TCP header itself.
     ctx.l4_csum_replace(l4 + TCP_OFF_CHECK, old_port as u64, new_port as u64, 2)?;
 
     // Write the new values (no flags; csum already adjusted above).
-    ctx.store(l3 + IP_OFF_DST, &new_ip, 0)?;
-    ctx.store(l4 + TCP_OFF_DST, &new_port, 0)?;
+    ctx.store(l3 + ip_off, &new_ip, 0)?;
+    ctx.store(l4 + port_off, &new_port, 0)?;
     Ok(())
 }
 
-/// Un-DNAT / SNAT: rewrite the source IP:port and fix the checksums.
-/// `new_ip`/`new_port` are in network byte order.
+/// DNAT: rewrite the destination IP:port and fix checksums (NBO args).
 #[inline(always)]
-fn set_src(
-    ctx: &mut TcContext,
-    l3: usize,
-    l4: usize,
-    new_ip: u32,
-    new_port: u16,
-) -> Result<(), i64> {
-    let old_ip: u32 = ctx.load(l3 + IP_OFF_SRC)?;
-    let old_port: u16 = ctx.load(l4 + TCP_OFF_SRC)?;
+fn set_dst(ctx: &mut TcContext, l3: usize, l4: usize, new_ip: u32, new_port: u16) -> Result<(), i64> {
+    rewrite_addr_port(ctx, l3, l4, IP_OFF_DST, TCP_OFF_DST, new_ip, new_port)
+}
 
-    ctx.l3_csum_replace(l3 + IP_OFF_CHECK, old_ip as u64, new_ip as u64, 4)?;
-    ctx.l4_csum_replace(
-        l4 + TCP_OFF_CHECK,
-        old_ip as u64,
-        new_ip as u64,
-        (BPF_F_PSEUDO_HDR | 4) as u64,
-    )?;
-    ctx.l4_csum_replace(l4 + TCP_OFF_CHECK, old_port as u64, new_port as u64, 2)?;
-
-    ctx.store(l3 + IP_OFF_SRC, &new_ip, 0)?;
-    ctx.store(l4 + TCP_OFF_SRC, &new_port, 0)?;
-    Ok(())
+/// Un-DNAT / SNAT: rewrite the source IP:port and fix checksums (NBO args).
+#[inline(always)]
+fn set_src(ctx: &mut TcContext, l3: usize, l4: usize, new_ip: u32, new_port: u16) -> Result<(), i64> {
+    rewrite_addr_port(ctx, l3, l4, IP_OFF_SRC, TCP_OFF_SRC, new_ip, new_port)
 }
 
 #[classifier]

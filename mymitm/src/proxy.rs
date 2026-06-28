@@ -308,26 +308,14 @@ mod tests {
     }
 
     fn settings_for(cert: &Path, key: &Path, server_ip: Ipv4Addr) -> Settings {
-        Settings {
-            client_ip: None,
-            server_ip,
-            server_port: 0,
-            tun_iface: "tun0".into(),
-            egress_iface: "eth0".into(),
-            local_ip: Ipv4Addr::LOCALHOST,
-            local_port: 0,
-            fwmark: 0,
-            cert_path: cert.to_path_buf(),
-            key_path: key.to_path_buf(),
-            dump_path: PathBuf::from("/tmp"),
-            bpf_obj_name: "mymitm".into(),
-            box_ip: Ipv4Addr::new(192, 168, 1, 10),
-            log_level: "info".into(),
-            server_name: None,
-            data_plane: crate::config::DataPlaneKind::Ebpf,
-            attach_mode: crate::config::AttachMode::Auto,
-            cleanup: false,
-        }
+        let mut s = Settings::test_default();
+        s.server_ip = server_ip;
+        s.server_port = 0; // overridden per-test to the fake server's port
+        s.local_port = 0; // unused by the loopback test (binds its own listener)
+        s.fwmark = 0; // DirectPlane ignores it; no CAP_NET_ADMIN needed
+        s.cert_path = cert.to_path_buf();
+        s.key_path = key.to_path_buf();
+        s
     }
 
     /// Full loopback round-trip with NO eBPF:

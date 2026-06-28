@@ -49,6 +49,7 @@ use crate::dataplane::DataPlane;
 /// The four classifier program names, in (program, iface-selector, direction)
 /// form. The iface selector picks `tun_iface` vs `egress_iface` from `Settings`
 /// at attach time.
+#[derive(Copy, Clone)]
 enum Side {
     Tun,
     Eth,
@@ -384,13 +385,11 @@ mod tests {
     use crate::config::Settings;
     use std::process::Command;
 
-    /// Names of our four classifiers as the kernel reports them via TCX.
-    const OUR_PROGS: [&str; 4] = [
-        "cls_tun_ingress",
-        "cls_tun_egress",
-        "cls_eth_ingress",
-        "cls_eth_egress",
-    ];
+    /// Names of our four classifiers as the kernel reports them via TCX, derived
+    /// from the single `PROGRAMS` source of truth (no duplicate list).
+    fn our_prog_names() -> [&'static str; 4] {
+        PROGRAMS.map(|(name, _, _)| name)
+    }
 
     fn run_ip(args: &[&str]) {
         let _ = Command::new("ip").args(args).status();
@@ -404,7 +403,7 @@ mod tests {
         infos
             .iter()
             .filter_map(|p| p.name_as_str().map(|s| s.to_string()))
-            .filter(|n| OUR_PROGS.contains(&n.as_str()))
+            .filter(|n| our_prog_names().contains(&n.as_str()))
             .collect()
     }
 

@@ -2,6 +2,16 @@
 
 pub const VERSION: u32 = 1;
 
+/// Default firewall mark stamped on the proxy's upstream sockets (and matched by
+/// the eBPF egress classifier / iproute fwmark rule). Must be non-zero.
+pub const DEFAULT_FWMARK: u32 = 0x1337;
+
+/// Capacity of the self-evicting LRU maps. `UPSTREAM` holds reverse SNAT
+/// mappings; `EGRESS` holds box-ephemeral-port -> client-IP. LRU so a missed
+/// userspace cleanup can never permanently wedge either map.
+pub const UPSTREAM_MAP_CAPACITY: u32 = 1024;
+pub const EGRESS_MAP_CAPACITY: u32 = 1024;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Config {

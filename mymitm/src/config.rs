@@ -42,7 +42,7 @@ fn d_tun() -> String { "tun0".into() }
 fn d_eth() -> String { "eth0".into() }
 fn d_local_ip() -> Ipv4Addr { Ipv4Addr::new(127,0,0,1) }
 fn d_local_port() -> u16 { 8443 }
-fn d_mark() -> u32 { 0x1337 }
+fn d_mark() -> u32 { mymitm_common::DEFAULT_FWMARK }
 fn d_dump() -> PathBuf { "/var/tmp/mitm-dumps/".into() }
 fn d_obj() -> String { "mymitm".into() }
 fn d_log() -> String { "info".into() }
@@ -105,6 +105,13 @@ pub struct Settings {
 impl Settings {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Settings> {
         let f: FileCfg = toml::from_str(s)?;
+        if f.fwmark == 0 {
+            anyhow::bail!(
+                "fwmark must be non-zero: 0 collapses the eBPF egress match \
+                 (`mark == fwmark` would be true for all traffic) and is invalid \
+                 for the iproute fwmark rule"
+            );
+        }
         Ok(Settings {
             client_ip: f.target_client_ip,
             server_ip: f.target_server_ip,
@@ -154,6 +161,35 @@ impl Settings {
             server_port: self.server_port.to_be(),
             local_port: self.local_port.to_be(),
             fwmark: self.fwmark,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Settings {
+    /// Fully-populated `Settings` for tests; callers mutate only the fields they
+    /// care about. Centralised so adding a `Settings` field doesn't require
+    /// touching every test module's hand-built struct.
+    pub fn test_default() -> Settings {
+        Settings {
+            client_ip: None,
+            server_ip: Ipv4Addr::new(192, 168, 1, 50),
+            server_port: 443,
+            tun_iface: "tun0".into(),
+            egress_iface: "eth0".into(),
+            local_ip: Ipv4Addr::LOCALHOST,
+            local_port: 8443,
+            fwmark: mymitm_common::DEFAULT_FWMARK,
+            cert_path: PathBuf::from("/x/leaf.pem"),
+            key_path: PathBuf::from("/x/leaf.key"),
+            dump_path: PathBuf::from("/tmp"),
+            bpf_obj_name: "mymitm".into(),
+            box_ip: Ipv4Addr::new(192, 168, 1, 10),
+            log_level: "info".into(),
+            server_name: None,
+            data_plane: DataPlaneKind::Ebpf,
+            attach_mode: AttachMode::Auto,
+            cleanup: false,
         }
     }
 }
@@ -228,6 +264,15 @@ mod tests {
     fn missing_required_field_errors() {
         // box_ip is still required, so target_server_ip alone errors.
         assert!(Settings::from_toml_str(r#"target_server_ip = "10.0.0.1""#).is_err());
+    }
+
+    #[test]
+    fn fwmark_zero_is_rejected() {
+        let toml = format!("{}\nfwmark = 0", base());
+        assert!(Settings::from_toml_str(&toml).is_err());
+        // a non-zero fwmark is fine
+        let ok = format!("{}\nfwmark = 4919", base());
+        assert_eq!(Settings::from_toml_str(&ok).unwrap().fwmark, 4919);
     }
 
     #[test]

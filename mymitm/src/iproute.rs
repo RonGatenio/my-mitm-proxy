@@ -46,9 +46,16 @@ fn s(v: &str) -> String {
     v.to_string()
 }
 
+/// Base for the derived policy-routing table id (`table = base + (fwmark & 0xff)`),
+/// kept well clear of the kernel-reserved local/main/default tables.
+const ROUTE_TABLE_BASE: u32 = 100;
+/// Base for the pinned `ip rule` priority (`prio = base + table`), below the
+/// kernel-reserved 32766/32767 and above typical user policy rules.
+const IP_RULE_PRIO_BASE: u32 = 30_000;
+
 /// Build the full rule specification for `cfg` without executing anything.
 pub fn build_ruleset(cfg: &Settings) -> RuleSet {
-    let table = 100 + (cfg.fwmark & 0xff);
+    let table = ROUTE_TABLE_BASE + (cfg.fwmark & 0xff);
     let server = cfg.server_ip.to_string();
     let port = cfg.server_port.to_string();
     let local = format!("{}:{}", cfg.local_ip, cfg.local_port);
@@ -61,7 +68,7 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
     //   - well below the kernel-reserved 32766/32767 (default/main lookups),
     //   - deterministic and unique per (fwmark, table) pair,
     //   - high enough to not conflict with typical user policy rules (< 1000).
-    let prio = (30000u32 + table).to_string();
+    let prio = (IP_RULE_PRIO_BASE + table).to_string();
     let items = vec![
         // 1. Intercept: DNAT client→server to the local listener on the tun iface.
         (
@@ -263,10 +270,21 @@ impl IpRoutePlane {
         //     via `local 0.0.0.0/0 dev lo table N`. That delivery requires
         //     route_localnet=1 on the EGRESS interface — the interface where those
         //     packets arrive — not just on the tun iface.
+        // rp_filter: Linux uses the MAX of conf.all.rp_filter and the per-iface
+        // value, so disabling it only on a single iface is insufficient on hosts
+        // where conf.all.rp_filter=1 (a common hardened default) — the spoofed
+        // client-source packets on the tun side and the marked replies on the
+        // egress side would be dropped by reverse-path filtering. Disable it on
+        // `all` and on both ifaces (each saved/restored).
         let sysctl_wants: Vec<(String, &str)> = vec![
             ("net.ipv4.ip_forward".to_string(), "1"),
+            ("net.ipv4.conf.all.rp_filter".to_string(), "0"),
             (
                 format!("net.ipv4.conf.{}.rp_filter", s.tun_iface),
+                "0",
+            ),
+            (
+                format!("net.ipv4.conf.{}.rp_filter", s.egress_iface),
                 "0",
             ),
             (
@@ -377,29 +395,11 @@ pub fn cleanup(s: &Settings) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn settings() -> Settings {
-        Settings {
-            client_ip: None,
-            server_ip: Ipv4Addr::new(192, 168, 1, 50),
-            server_port: 443,
-            tun_iface: "tun0".into(),
-            egress_iface: "eth0".into(),
-            local_ip: Ipv4Addr::LOCALHOST,
-            local_port: 8443,
-            fwmark: 0x1337,
-            cert_path: PathBuf::from("/x"),
-            key_path: PathBuf::from("/y"),
-            dump_path: PathBuf::from("/tmp"),
-            bpf_obj_name: "mymitm".into(),
-            box_ip: Ipv4Addr::new(192, 168, 1, 10),
-            log_level: "info".into(),
-            server_name: None,
-            data_plane: crate::config::DataPlaneKind::IpRoute,
-            attach_mode: crate::config::AttachMode::Auto,
-            cleanup: false,
-        }
+        let mut s = Settings::test_default();
+        s.data_plane = crate::config::DataPlaneKind::IpRoute;
+        s
     }
 
     #[test]
