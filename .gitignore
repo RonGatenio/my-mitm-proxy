@@ -6,3 +6,7 @@ lvh-modules/
 mymitm-lvh.toml
 c.pem
 k.pem
+
+# private / local-only (never commit; purged from history)
+oldchat.txt
+docs/superpowers/
