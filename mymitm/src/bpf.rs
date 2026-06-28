@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use aya::maps::{Array, HashMap as AyaHashMap, MapData};
 use aya::programs::tc::{self, NlOptions, TcAttachOptions};
 use aya::programs::{SchedClassifier, TcAttachType};
-use aya::{Ebpf, EbpfLoader};
+use aya::{Ebpf, EbpfLoader, VerifierLogLevel};
 use mymitm_common::Config;
 
 use crate::config::{AttachMode, Settings};
@@ -85,11 +85,37 @@ impl BpfPlane {
     /// Load the embedded object with CO-RE, populate `CONFIG`, init aya-log
     /// (best-effort), and attach all four classifiers via TCX.
     pub fn load_and_attach(s: &Settings) -> anyhow::Result<BpfPlane> {
-        // EbpfLoader default does CO-RE BTF relocation against the running kernel.
-        let mut ebpf = EbpfLoader::new().load(aya::include_bytes_aligned!(concat!(
-            env!("OUT_DIR"),
-            "/mymitm"
-        )))?;
+        // Detect whether the running kernel supports BTF function annotations
+        // (btf_func, added in kernel 4.18). On kernels 4.14–4.17, `is_btf_supported()`
+        // returns true (basic BTF works) but `btf_func` is false. Aya then:
+        //   (a) sanitises the object's BTF (FUNC→TYPEDEF, FUNC_PROTO→ENUM),
+        //   (b) uploads that sanitised BTF to the kernel (succeeds),
+        //   (c) sets prog_btf_fd + func_info in BPF_PROG_LOAD.
+        // The kernel rejects BPF_PROG_LOAD because func_info type_ids now resolve to
+        // TYPEDEF (not FUNC), returning EINVAL with an empty verifier log.
+        //
+        // Fix: when btf_func is not supported, zero out the .BTF and .BTF.ext sections
+        // from the in-memory ELF bytes before handing them to EbpfLoader. This prevents
+        // aya from ever finding func_info. Our object has NO CO-RE relocations, so
+        // stripping BTF is safe — the programs load and run identically without it.
+        let btf_func_ok = aya::features().btf().map(|f| f.btf_func()).unwrap_or(false);
+
+        const EBPF_OBJ: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/mymitm"));
+        let obj_bytes: std::borrow::Cow<'static, [u8]> = if !btf_func_ok {
+            tracing::info!(
+                "kernel does not support btf_func; stripping .BTF/.BTF.ext from eBPF object \
+                 (safe: no CO-RE in our object)"
+            );
+            std::borrow::Cow::Owned(strip_btf_sections(EBPF_OBJ))
+        } else {
+            std::borrow::Cow::Borrowed(EBPF_OBJ)
+        };
+
+        // VerifierLogLevel::VERBOSE gives us the full verifier log on load failures
+        // (important for old kernels where the error message may otherwise be empty).
+        let mut ebpf = EbpfLoader::new()
+            .verifier_log_level(VerifierLogLevel::VERBOSE)
+            .load(&obj_bytes)?;
 
         // aya-log is best-effort: if the eBPF side emits no log map, init returns
         // an error we deliberately ignore so it never fails startup.
@@ -317,6 +343,36 @@ impl DataPlane for BpfPlane {
         sock.set_nonblocking(true)?;
         Ok(sock.into())
     }
+}
+
+/// Return a copy of the ELF bytes with the `.BTF` and `.BTF.ext` sections
+/// zeroed out. Used on kernels where basic BTF is available but `btf_func` is
+/// not (e.g. 4.14–4.17): aya normally sanitises the object BTF and then passes
+/// `prog_btf_fd + func_info` to BPF_PROG_LOAD, which the kernel rejects because
+/// after sanitisation `func_info` type_ids resolve to TYPEDEF (not FUNC).
+/// Zeroing these sections hides them from aya's ELF parser; aya then skips the
+/// entire BTF upload and BPF_PROG_LOAD succeeds. Since our object has no CO-RE
+/// relocations this is a no-op for correctness.
+fn strip_btf_sections(elf: &[u8]) -> Vec<u8> {
+    use object::{File, Object, ObjectSection};
+    let mut out = elf.to_vec();
+    // Best-effort: if we can't parse the ELF (shouldn't happen), return a copy
+    // and let aya error with its own message.
+    if let Ok(obj) = File::parse(elf as &[u8]) {
+        for section in obj.sections() {
+            if let Ok(name) = section.name() {
+                if name == ".BTF" || name == ".BTF.ext" {
+                    let (off, size) = (section.file_range().unwrap_or((0, 0)));
+                    let start = off as usize;
+                    let end = start + size as usize;
+                    if end <= out.len() {
+                        out[start..end].fill(0);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

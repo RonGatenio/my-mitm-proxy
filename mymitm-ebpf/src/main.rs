@@ -249,7 +249,7 @@ pub fn cls_eth_egress(mut ctx: TcContext) -> i32 {
             server_port: c.server_port,
             client_port: m.src_port,
         };
-        let val = UpstreamVal { box_ip: c.box_ip, box_port: m.src_port };
+        let val = UpstreamVal { box_ip: c.box_ip, box_port: m.src_port, _pad: 0 };
         let _ = UPSTREAM.insert(&key, &val, 0);
         let _ = set_src(&mut ctx, l3, l4, client_ip, m.src_port);
     }

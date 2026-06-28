@@ -28,6 +28,12 @@ pub struct UpstreamKey {
 pub struct UpstreamVal {
     pub box_ip: u32,
     pub box_port: u16,
+    /// Explicit padding to ensure all bytes are initialised before passing this
+    /// struct as a map value pointer. Without this, the compiler emits 2 bytes
+    /// of uninitialised tail-padding (box_ip:4 + box_port:2 + implicit pad:2 =
+    /// 8) which the 4.x BPF verifier rejects as "invalid indirect read from
+    /// stack" when the stack-local value is passed to bpf_map_update_elem.
+    pub _pad: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
