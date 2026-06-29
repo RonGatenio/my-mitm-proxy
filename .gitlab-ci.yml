@@ -1,0 +1,49 @@
+stages:
+  - test
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+  RUSTUP_HOME: "$CI_PROJECT_DIR/.rustup"
+  CARGO_TERM_COLOR: "always"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .cargo-home/bin/
+    - .cargo-home/git/
+    - .cargo-home/registry/
+    - .rustup/
+    - target/
+
+build-and-test:
+  stage: test
+  image: rust:bookworm
+  before_script:
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - apt-get update
+    - >
+      apt-get install -y --no-install-recommends
+      build-essential
+      ca-certificates
+      clang
+      cmake
+      libclang-dev
+      libelf-dev
+      linux-libc-dev
+      lld
+      llvm
+      llvm-dev
+      musl-tools
+      pkg-config
+      zlib1g-dev
+    - rustup toolchain install nightly --profile minimal --component rust-src --target x86_64-unknown-linux-musl
+    - rustup show
+    - rustup target add x86_64-unknown-linux-musl --toolchain nightly
+    - test -x "$CARGO_HOME/bin/bpf-linker" || cargo install bpf-linker --locked
+    - rustc --version
+    - cargo --version
+    - bpf-linker --version
+  script:
+    - cargo test -p mymitm-common --target x86_64-unknown-linux-gnu
+    - cargo test -p mymitm --target x86_64-unknown-linux-gnu
+    - cargo build -p mymitm --release
