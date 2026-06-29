@@ -19,7 +19,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # System deps mirror .gitlab-ci.yml (eBPF toolchain + musl).
       - name: Install system dependencies
@@ -78,7 +78,7 @@ jobs:
           sha256sum dist/mymitm-x86_64-unknown-linux-musl > dist/mymitm-x86_64-unknown-linux-musl.sha256
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: mymitm-x86_64-unknown-linux-musl
           path: dist/*
