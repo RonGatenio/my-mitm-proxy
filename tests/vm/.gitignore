@@ -1,0 +1,2 @@
+# Harness scratch: base images, generated certs/keys, overlays, seeds, logs, pids.
+.work/
