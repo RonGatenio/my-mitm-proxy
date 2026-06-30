@@ -124,8 +124,8 @@ _accel() { [ -w /dev/kvm ] && echo "-enable-kvm -cpu host" || { info "no /dev/kv
 _data_args() {  # echoes -netdev/-device pairs for a VM's data NIC(s)
   case "$1" in
     A) echo "-netdev tap,id=d0,ifname=$TAP_AL,script=no,downscript=no -device virtio-net-pci,netdev=d0,mac=$MAC_A_DATA";;
-    B) echo "-netdev tap,id=d0,ifname=$TAP_BL,script=no,downscript=no -device virtio-net-pci,netdev=d0,mac=$MAC_B_LEFT \
-             -netdev tap,id=d1,ifname=$TAP_BR,script=no,downscript=no -device virtio-net-pci,netdev=d1,mac=$MAC_B_RIGHT";;
+    B) echo "-netdev tap,id=d0,ifname=$TAP_BL,script=no,downscript=no -device virtio-net-pci,netdev=d0,mac=$MAC_B_LEFT" \
+            "-netdev tap,id=d1,ifname=$TAP_BR,script=no,downscript=no -device virtio-net-pci,netdev=d1,mac=$MAC_B_RIGHT";;
     C) echo "-netdev tap,id=d0,ifname=$TAP_CR,script=no,downscript=no -device virtio-net-pci,netdev=d0,mac=$MAC_C_DATA";;
   esac
 }
