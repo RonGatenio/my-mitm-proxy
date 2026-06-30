@@ -1,0 +1,16 @@
+version: 2
+ethernets:
+  ctrl:
+    match:
+      macaddress: "52:54:00:00:00:0c"
+    set-name: ctrl0
+    dhcp4: true
+  data:
+    match:
+      macaddress: "52:54:00:00:02:0c"
+    set-name: data0
+    dhcp4: false
+    addresses: [10.10.2.10/24]
+    routes:
+      - to: 10.10.1.0/24
+        via: 10.10.2.1

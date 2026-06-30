@@ -1,0 +1,22 @@
+#cloud-config
+hostname: ${HOSTNAME}
+ssh_pwauth: false
+users:
+  - name: ubuntu
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${SSH_PUBKEY}
+write_files:
+  - path: /etc/systemd/system/tls-server.service
+    content: |
+      [Unit]
+      Description=test TLS server
+      After=network-online.target
+      [Service]
+      ExecStart=/usr/bin/python3 /opt/tlssrv/tls_server.py --cert /opt/tlssrv/leaf.pem --key /opt/tlssrv/leaf.key --bind 0.0.0.0 --port 443 --logfile /var/log/tls_server.log
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - mkdir -p /opt/tlssrv
