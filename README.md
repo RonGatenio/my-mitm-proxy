@@ -84,7 +84,8 @@ Selectable via `data_plane` (config) or `--data-plane` (CLI):
 - **`ebpf`** (default) — tc-eBPF programs (loaded/attached via [aya](https://aya-rs.dev)) do
   the divert + source-IP rewrite in-kernel. Config-clean. Attach mode is auto-detected:
   TCX on kernel ≥ 6.6, falling back to `clsact` + classic tc-bpf on older kernels. Validated
-  down to **kernel 4.15** (no TCX, no BTF). Override with `--attach-mode {auto,tcx,tc}`.
+  end-to-end down to **kernel 4.15** (no TCX, no BTF) via the 3-VM harness in
+  [`tests/vm/`](tests/vm/README.md). Override with `--attach-mode {auto,tcx,tc}`.
 - **`iproute`** — `IP_TRANSPARENT` bind + policy routing (`ip rule` fwmark → dedicated table)
   + an `iptables` mangle `MARK` rule. Not config-clean, but uses only standard kernel features;
   useful where eBPF is unavailable. State is torn down on exit.

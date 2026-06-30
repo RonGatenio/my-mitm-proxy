@@ -100,8 +100,18 @@ fn cfg() -> Option<Config> {
 /// byte offsets so the rewrite helpers can target the right fields.
 ///
 /// Auto-detects L2: a `tun` is L3 (raw IPv4, offset 0). If the first nibble is
-/// not 4 we assume an Ethernet frame (so the same helper is reusable on `eth0`
-/// in Task 7). Returns `(meta, l3_off, l4_off)`.
+/// not 4 we assume an Ethernet frame (so the same helper is reusable on `eth0`).
+/// Returns `(meta, l3_off, l4_off)`.
+///
+/// The L2 detect lives here; the actual header parse is delegated to the
+/// const-generic `meta_at::<L3>` with `L3` resolved to a compile-time constant
+/// per branch. This matters for the **kernel-4.15 BPF verifier**: it cannot
+/// prove a *runtime-derived* L3 offset has a bounded minimum, so any
+/// `ctx.data() + l3 + ...` packet-pointer arithmetic with a runtime `l3` is
+/// rejected ("math between pkt pointer and register with unbounded min value").
+/// Monomorphizing on a literal `L3` makes that arithmetic `pkt_ptr + CONST`,
+/// which every verifier accepts. Behavior is identical on kernels that already
+/// load the runtime-offset form.
 #[inline(always)]
 fn meta(ctx: &TcContext) -> Option<(PktMeta, usize, usize)> {
     // Detect L2 reliably. We MUST NOT key off the first byte's high nibble:
@@ -110,28 +120,35 @@ fn meta(ctx: &TcContext) -> Option<(PktMeta, usize, usize)> {
     // nibble and treat the frame as raw L3. Instead probe the EtherType field
     // that only exists in an L2 frame: if bytes [12..14] equal the IPv4
     // EtherType (0x0800), this is Ethernet; otherwise assume raw L3 (tun) and
-    // re-validate the IPv4 version nibble at offset 0 below.
+    // re-validate the IPv4 version nibble at offset 0 in meta_at.
     let eth_proto: u16 = ctx.load(ETH_LEN - 2).ok()?; // bytes [12..14], NBO
     let first: u8 = ctx.load(0).ok()?;
-    let l3 = if eth_proto == 0x0800u16.to_be() {
-        ETH_LEN
+    if eth_proto == 0x0800u16.to_be() {
+        meta_at::<ETH_LEN>(ctx)
     } else if (first >> 4) == 4 {
-        0
+        meta_at::<0>(ctx)
     } else {
-        return None;
-    };
+        None
+    }
+}
 
+/// Parse IPv4 + TCP at a **compile-time-constant** L3 offset. Generic over `L3`
+/// so the bounds guard's pointer arithmetic uses a literal constant (see the
+/// `meta` doc for why the kernel-4.15 verifier requires this).
+#[inline(always)]
+fn meta_at<const L3: usize>(ctx: &TcContext) -> Option<(PktMeta, usize, usize)> {
     // Explicit bounds guard (belt-and-suspenders; load helpers also bound-check).
-    if ctx.data() + l3 + IP_MIN_LEN + TCP_MIN_LEN > ctx.data_end() {
+    // L3 is a constant here, so this is `pkt_ptr + CONST` — verifier-friendly.
+    if ctx.data() + L3 + IP_MIN_LEN + TCP_MIN_LEN > ctx.data_end() {
         return None;
     }
 
-    // IPv4: verify version again at l3 and require TCP.
-    let vihl: u8 = ctx.load(l3).ok()?;
+    // IPv4: verify version again at L3 and require TCP.
+    let vihl: u8 = ctx.load(L3).ok()?;
     if (vihl >> 4) != 4 {
         return None;
     }
-    let proto: u8 = ctx.load(l3 + IP_OFF_PROTO).ok()?;
+    let proto: u8 = ctx.load(L3 + IP_OFF_PROTO).ok()?;
     if proto != IPPROTO_TCP {
         return None;
     }
@@ -139,11 +156,11 @@ fn meta(ctx: &TcContext) -> Option<(PktMeta, usize, usize)> {
     if ihl < IP_MIN_LEN {
         return None;
     }
-    let l4 = l3 + ihl;
+    let l4 = L3 + ihl;
 
     // Addresses/ports loaded as raw u32/u16 -> stay in network byte order.
-    let src_ip: u32 = ctx.load(l3 + IP_OFF_SRC).ok()?;
-    let dst_ip: u32 = ctx.load(l3 + IP_OFF_DST).ok()?;
+    let src_ip: u32 = ctx.load(L3 + IP_OFF_SRC).ok()?;
+    let dst_ip: u32 = ctx.load(L3 + IP_OFF_DST).ok()?;
     let src_port: u16 = ctx.load(l4 + TCP_OFF_SRC).ok()?;
     let dst_port: u16 = ctx.load(l4 + TCP_OFF_DST).ok()?;
 
@@ -155,7 +172,7 @@ fn meta(ctx: &TcContext) -> Option<(PktMeta, usize, usize)> {
         // skb mark: no public getter in aya-ebpf 0.1.1, read the raw field.
         mark: unsafe { (*ctx.skb.skb).mark },
     };
-    Some((m, l3, l4))
+    Some((m, L3, l4))
 }
 
 /// Rewrite an IP:port pair at `(l3 + ip_off, l4 + port_off)` and fix the IPv4 +

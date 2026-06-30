@@ -48,18 +48,19 @@ Use `--keep` with `all` to skip the final teardown for debugging.
 
 ## Current status on kernel 4.15
 
-This harness was built to validate kernel-4.15 support, and it surfaced a real result:
+Both data planes pass all phase-1 and phase-2 assertions on kernel 4.15
+(source IP preserved at C, decrypted bytes visible on B):
 
-- **`iproute` data plane — passes** all phase-1 and phase-2 assertions on kernel 4.15
-  (source IP preserved at C, decrypted bytes visible on B). Use
-  `sudo bash tests/vm/run.sh all --data-plane iproute` for a fully green end-to-end run.
-- **`ebpf` data plane (default) — currently fails on kernel 4.15.** `mymitm` exits at
-  startup because the 4.15 BPF verifier rejects `cls_tun_ingress`
-  (`math between pkt pointer and register with unbounded min value is not allowed`,
-  from the runtime-derived L3 offset in `mymitm-ebpf/src/main.rs::meta()`). So
-  `sudo bash tests/vm/run.sh all` (default eBPF) fails at phase 2 by design — the
-  harness reports it loudly rather than hiding it. eBPF works on newer kernels; the
-  4.15 verifier is stricter.
+- **`ebpf` data plane (default) — passes.** `sudo bash tests/vm/run.sh all` ends with
+  `ALL PHASES PASS (data_plane=ebpf)`.
+- **`iproute` data plane — passes.** `sudo bash tests/vm/run.sh all --data-plane iproute`.
+
+> **History:** the eBPF plane originally failed to load on the 4.15 BPF verifier
+> (`math between pkt pointer and register with unbounded min value is not allowed`),
+> because `mymitm-ebpf/src/main.rs::meta()` derived the L3 offset at runtime and used
+> it in packet-pointer arithmetic. The fix monomorphizes the header parse on a
+> compile-time-constant L3 offset (`meta_at::<L3>`), so the verifier can bound it. This
+> harness is what surfaced that defect — the 4.19 verifier accepted the original form.
 
 ## Reading the result
 
