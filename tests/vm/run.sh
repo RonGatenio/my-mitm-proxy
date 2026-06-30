@@ -38,7 +38,7 @@ cmd_up() {
   vm_scp C "$CERT_DIR/leaf.pem" /opt/tlssrv/leaf.pem
   vm_scp C "$CERT_DIR/leaf.key" /opt/tlssrv/leaf.key
   vm_ssh C "sudo systemctl enable --now tls-server && sleep 1 && systemctl is-active tls-server" \
-    | grep -q active || fail "tls-server did not start on C"
+    | grep -qx active || fail "tls-server did not start on C"
   pass "tls-server active on C"
 
   # CA onto A for curl validation (used by phases 1 and 2).
@@ -82,9 +82,87 @@ cmd_router() {
   pass "phase1: C saw src=$A_IP (plain routing preserves client IP)"
 }
 
+MARKER_PROXY="/marker-proxy-$$"
+
+write_b_toml() {  # writes mymitm.toml onto B for the selected data plane
+  local local_addr; [ "$DATA_PLANE" = ebpf ] && local_addr="$B_LEFT_IP" || local_addr="127.0.0.1"
+  vm_ssh B "sudo tee /opt/mymitm/mymitm.toml >/dev/null" <<EOF
+target_server_ip = "$C_IP"
+target_server_port = 443
+box_ip = "$B_RIGHT_IP"
+cert_path = "/opt/mymitm/leaf.pem"
+key_path = "/opt/mymitm/leaf.key"
+tun_iface = "left0"
+egress_iface = "right0"
+local_addr = "$local_addr"
+local_port = 8443
+fwmark = 0x1337
+dump_path = "/opt/mymitm/dumps"
+log_level = "info"
+server_name = "server.test"
+data_plane = "$DATA_PLANE"
+EOF
+}
+
+cmd_proxy() {
+  info "phase2: installing proxy on B (data_plane=$DATA_PLANE)"
+  vm_ssh B "sudo mkdir -p /opt/mymitm/dumps && sudo chown -R ubuntu /opt/mymitm"
+  vm_scp B "$BIN" /opt/mymitm/mymitm
+  vm_scp B "$CERT_DIR/leaf.pem" /opt/mymitm/leaf.pem
+  vm_scp B "$CERT_DIR/leaf.key" /opt/mymitm/leaf.key
+  vm_ssh B "chmod +x /opt/mymitm/mymitm"
+  write_b_toml
+  # eBPF DNATs the client flow to a local listener address on the tun iface.
+  [ "$DATA_PLANE" = ebpf ] && vm_ssh B "sudo sysctl -wq net.ipv4.conf.left0.route_localnet=1"
+  vm_ssh C "sudo truncate -s0 /var/log/tls_server.log"
+  vm_ssh B "sudo rm -f /opt/mymitm/dumps/*"
+
+  vm_ssh B "sudo systemctl restart mymitm"
+  # wait for readiness
+  local i ok=0
+  for i in $(seq 1 50); do
+    vm_ssh B "sudo journalctl -u mymitm --no-pager -n50 2>/dev/null | grep -q 'proxy listening'" && { ok=1; break; }
+    sleep 0.4
+  done
+  [ "$ok" = 1 ] || { vm_ssh B "sudo journalctl -u mymitm --no-pager -n80"; fail "(proxy) mymitm never logged 'proxy listening'"; }
+  pass "phase2: mymitm attached + listening on B"
+
+  local out
+  out="$(vm_ssh A "curl -s -o - -w '\nHTTP:%{http_code}\n' --cacert /tmp/ca.pem https://$C_IP$MARKER_PROXY" 2>&1)" || true
+  echo "$out"
+  echo "$out" | grep -q "HTTP:200" || { vm_ssh B "sudo journalctl -u mymitm --no-pager -n80"; fail "(proxy) curl A->C did not return 200"; }
+  pass "phase2: A->C HTTPS returned 200 through the proxy"
+
+  sleep 0.5
+  # (a) decrypted visibility on B: the marker request appears in a c2s dump.
+  vm_ssh B "sudo grep -rl '$MARKER_PROXY' /opt/mymitm/dumps/" >/dev/null 2>&1 \
+    && pass "phase2: decrypted request ($MARKER_PROXY) found in B's dump" \
+    || { vm_ssh B "sudo ls -la /opt/mymitm/dumps/ && sudo cat /opt/mymitm/dumps/index.jsonl"; fail "(proxy) marker not found in any dump on B"; }
+
+  # (b) src IP still preserved at C.
+  local log; log="$(vm_ssh C "cat /var/log/tls_server.log")"
+  echo "$log"
+  echo "$log" | grep -q "^$A_IP "      || fail "(proxy) C did not log client IP $A_IP"
+  echo "$log" | grep -q "$B_RIGHT_IP " && fail "(proxy) C saw B's IP $B_RIGHT_IP (src not preserved)" || true
+  pass "phase2: C saw src=$A_IP (proxy preserved client IP, data_plane=$DATA_PLANE)"
+
+  vm_ssh B "sudo systemctl stop mymitm" || true
+}
+
+cmd_all() {
+  ensure_certs; cmd_up; cmd_router; cmd_proxy
+  green "================================================================"
+  green " ALL PHASES PASS (data_plane=$DATA_PLANE)"
+  green " phase1 router + phase2 proxy both preserved src $A_IP at C"
+  green "================================================================"
+  [ "$KEEP" = 1 ] || cmd_down
+}
+
 case "$CMD" in
   up)     ensure_certs; cmd_up;;
   down)   cmd_down;;
   router) cmd_router;;
+  proxy)  cmd_proxy;;
+  all)    cmd_all;;
   *)      red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--keep]"; exit 2;;
 esac
