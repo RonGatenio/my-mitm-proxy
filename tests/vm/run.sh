@@ -59,8 +59,32 @@ cmd_down() {
 # Generate the CA + leaf once per up-cycle if absent.
 ensure_certs() { [ -f "$CERT_DIR/leaf.pem" ] || { mkdir -p "$CERT_DIR"; bash "$HERE/certs/gen-certs.sh" "$CERT_DIR" >/dev/null; }; }
 
+MARKER_ROUTER="/marker-router-$$"
+
+cmd_router() {
+  # Phase 1: no proxy on B.
+  vm_ssh B "systemctl is-active mymitm 2>/dev/null" | grep -qx active \
+    && fail "mymitm is running on B; phase 1 must be plain-router" || true
+  vm_ssh C "sudo truncate -s0 /var/log/tls_server.log"
+
+  local out
+  out="$(vm_ssh A "curl -s -o - -w '\nHTTP:%{http_code}\n' --cacert /tmp/ca.pem https://$C_IP$MARKER_ROUTER" 2>&1)" \
+    || true
+  echo "$out"
+  echo "$out" | grep -q "HTTP:200"          || fail "(router) curl A->C did not return 200"
+  echo "$out" | grep -q "MITM-OK"            || fail "(router) unexpected body"
+  pass "phase1: A->C HTTPS returned 200"
+
+  local log; log="$(vm_ssh C "cat /var/log/tls_server.log")"
+  echo "$log"
+  echo "$log" | grep -q "^$A_IP "            || fail "(router) C did not log client IP $A_IP"
+  echo "$log" | grep -q "$B_RIGHT_IP "       && fail "(router) C saw B's IP $B_RIGHT_IP (routing rewrote src?)" || true
+  pass "phase1: C saw src=$A_IP (plain routing preserves client IP)"
+}
+
 case "$CMD" in
-  up)    ensure_certs; cmd_up;;
-  down)  cmd_down;;
-  *)     red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--keep]"; exit 2;;
+  up)     ensure_certs; cmd_up;;
+  down)   cmd_down;;
+  router) cmd_router;;
+  *)      red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--keep]"; exit 2;;
 esac
