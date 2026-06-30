@@ -174,6 +174,13 @@ peer IP (not the box IP).
 
 CI (`.gitlab-ci.yml`) runs both unit suites and the release build on `rust:bookworm`.
 
+For full end-to-end validation on a real **kernel 4.15** box across three VMs
+(client → router/proxy → server), see [`tests/vm/README.md`](tests/vm/README.md):
+
+```bash
+sudo bash tests/vm/run.sh all
+```
+
 ## License
 
 Proprietary.
