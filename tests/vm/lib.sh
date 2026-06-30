@@ -78,12 +78,22 @@ net_up() {
   _tap_add "$BR_LEFT"  "$TAP_BL"
   _tap_add "$BR_RIGHT" "$TAP_BR"
   _tap_add "$BR_RIGHT" "$TAP_CR"
+  # Allow forwarding through the test bridges.
+  # When bridge-nf-call-iptables=1 the kernel runs bridged frames through
+  # the iptables FORWARD chain with both IN and OUT set to the bridge device.
+  for br in "$BR_LEFT" "$BR_RIGHT"; do
+    iptables -C FORWARD -i "$br" -o "$br" -j ACCEPT 2>/dev/null \
+      || iptables -I FORWARD 1 -i "$br" -o "$br" -j ACCEPT
+  done
 }
 
 net_down() {
   info "removing taps + bridges"
   for t in "$TAP_AL" "$TAP_BL" "$TAP_BR" "$TAP_CR"; do ip link del "$t" 2>/dev/null || true; done
   for b in "$BR_LEFT" "$BR_RIGHT"; do ip link del "$b" 2>/dev/null || true; done
+  for br in "$BR_LEFT" "$BR_RIGHT"; do
+    iptables -D FORWARD -i "$br" -o "$br" -j ACCEPT 2>/dev/null || true
+  done
 }
 
 # --- images ----------------------------------------------------------------
@@ -133,7 +143,7 @@ _data_args() {  # echoes -netdev/-device pairs for a VM's data NIC(s)
 vm_launch() {  # vm_launch <A|B|C> <ctrl_mac> <ssh_port>
   local vm="$1" cmac="$2" port="$3"
   # shellcheck disable=SC2046
-  qemu-system-x86_64 $(_accel) -m 1024 -smp 2 -nographic -display none \
+  qemu-system-x86_64 $(_accel) -m 1024 -smp 2 -display none \
     -drive file="$WORK/$vm.overlay.qcow2",if=virtio \
     -cdrom "$WORK/$vm.seed.iso" \
     -netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:$port-:22 \
