@@ -6,9 +6,25 @@ REPO_ROOT="$(cd "$VM_DIR/../.." && pwd)"
 WORK="$VM_DIR/.work"
 IMG_DIR="$WORK/images"
 CERT_DIR="$WORK/certs"
-SSH_KEY="$WORK/ssh_key"
+
+# The SSH private key MUST be mode 0600 or OpenSSH refuses it. On a Windows drvfs
+# mount (repo under /mnt/c/... in WSL) every file is 0777 and chmod is ignored, so
+# the key cannot live under $WORK there. Keep it on a native filesystem instead.
+KEYDIR="${MYMITM_VM_KEYDIR:-/tmp/mymitm-vm}"
+SSH_KEY="$KEYDIR/ssh_key"
 
 BIN="$REPO_ROOT/target/x86_64-unknown-linux-musl/release/mymitm"
+
+# --- kernel target for B (the router/proxy) --------------------------------
+# 4.15 -> bionic cloud image's own distro kernel (default; original harness).
+# 5.10 -> jammy rootfs booted with an external vanilla 5.10 kernel from the
+#         Cilium lvh catalog, with its modules delivered to the guest over 9p.
+B_KERNEL="${B_KERNEL:-4.15}"
+LVH_DIR="$WORK/lvh"
+KVER_510="5.10.260"
+LVH_TAG_510="5.10-main"
+VMLINUZ_510="$LVH_DIR/$LVH_TAG_510/boot/vmlinuz-$KVER_510"
+MODS_PARENT_510="$LVH_DIR/$LVH_TAG_510/lib/modules"   # contains <KVER_510>/
 
 # --- topology constants ----------------------------------------------------
 BR_LEFT=br-left
@@ -47,8 +63,10 @@ ssh_port_for() { case "$1" in A) echo "$SSH_PORT_A";; B) echo "$SSH_PORT_B";; C)
 
 # --- ssh key ---------------------------------------------------------------
 ssh_keygen_once() {
-  mkdir -p "$WORK"
+  mkdir -p "$WORK" "$KEYDIR"
+  chmod 700 "$KEYDIR" 2>/dev/null || true
   [ -f "$SSH_KEY" ] || ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -q
+  chmod 600 "$SSH_KEY" 2>/dev/null || true
   export SSH_PUBKEY="$(cat "$SSH_KEY.pub")"
 }
 
@@ -110,8 +128,38 @@ _fetch_one() {
 
 img_fetch() {
   mkdir -p "$IMG_DIR"
-  _fetch_one "$URL_BIONIC" "$IMG_BIONIC"
-  _fetch_one "$URL_JAMMY"  "$IMG_JAMMY"
+  _fetch_one "$URL_JAMMY" "$IMG_JAMMY"          # A and C always; B when 5.10
+  if [ "$B_KERNEL" = 5.10 ]; then
+    kernel_fetch_510
+  else
+    _fetch_one "$URL_BIONIC" "$IMG_BIONIC"       # B's 4.15 distro kernel
+  fi
+}
+
+# Pull the vanilla 5.10 kernel + its modules from the Cilium lvh catalog (cached).
+kernel_fetch_510() {
+  if [ -f "$VMLINUZ_510" ] && [ -d "$MODS_PARENT_510/$KVER_510" ]; then
+    info "lvh 5.10 kernel cached ($KVER_510)"; return 0
+  fi
+  command -v lvh >/dev/null 2>&1 || fail "lvh not on PATH; needed to fetch the 5.10 kernel (see tests/vm/README.md)"
+  info "pulling lvh $LVH_TAG_510 kernel (vmlinuz + modules)"
+  mkdir -p "$LVH_DIR"
+  ( cd "$LVH_DIR" && lvh kernels pull "$LVH_TAG_510" --dir . ) || fail "lvh kernels pull $LVH_TAG_510 failed"
+  [ -f "$VMLINUZ_510" ] || fail "expected $VMLINUZ_510 after lvh pull"
+}
+
+# B (5.10) boots an external kernel whose modules are not in the jammy rootfs.
+# The launcher exports them over 9p (tag mmmods); copy them into place so the
+# modular clsact (sch_ingress) and iptables mangle/mark targets are loadable.
+b_install_modules_510() {
+  vm_ssh B "sudo mkdir -p /mnt/mmmods \
+    && sudo mount -t 9p -o trans=virtio,ro mmmods /mnt/mmmods \
+    && sudo cp -a /mnt/mmmods/$KVER_510 /lib/modules/ \
+    && sudo depmod $KVER_510 \
+    && sudo umount /mnt/mmmods" \
+    || fail "B: installing 5.10 modules from the 9p share failed"
+  vm_ssh B "sudo modprobe sch_ingress" \
+    || fail "B: clsact module (sch_ingress) failed to load on $KVER_510"
 }
 
 # --- per-VM seed + overlay -------------------------------------------------
@@ -142,6 +190,15 @@ _data_args() {  # echoes -netdev/-device pairs for a VM's data NIC(s)
 
 vm_launch() {  # vm_launch <A|B|C> <ctrl_mac> <ssh_port>
   local vm="$1" cmac="$2" port="$3"
+  # For B on the 5.10 target: boot jammy with the external lvh kernel (no initrd —
+  # the lvh kernel has virtio/ext4 built in) and expose its modules over 9p. An
+  # empty array otherwise, so the 4.15 path is byte-for-byte unchanged.
+  local -a kargs=()
+  if [ "$B_KERNEL" = 5.10 ] && [ "$vm" = B ]; then
+    kargs=( -kernel "$VMLINUZ_510"
+            -append "root=/dev/vda1 ro console=ttyS0"
+            -virtfs "local,path=$MODS_PARENT_510,mount_tag=mmmods,security_model=none,readonly=on" )
+  fi
   # shellcheck disable=SC2046
   qemu-system-x86_64 $(_accel) -m 1024 -smp 2 -display none \
     -drive file="$WORK/$vm.overlay.qcow2",if=virtio \
@@ -149,9 +206,10 @@ vm_launch() {  # vm_launch <A|B|C> <ctrl_mac> <ssh_port>
     -netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:$port-:22 \
     -device virtio-net-pci,netdev=mgmt,mac=$cmac \
     $(_data_args "$vm") \
+    "${kargs[@]}" \
     -serial file:"$WORK/$vm.serial.log" \
     -pidfile "$WORK/$vm.pid" -daemonize
-  info "$vm launched (ssh port $port)"
+  info "$vm launched (ssh port $port${kargs:+, kernel $KVER_510})"
 }
 
 vms_kill() {

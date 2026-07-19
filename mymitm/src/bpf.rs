@@ -86,6 +86,11 @@ impl BpfPlane {
     /// Load the embedded object with CO-RE, populate `CONFIG`, init aya-log
     /// (best-effort), and attach all four classifiers via TCX.
     pub fn load_and_attach(s: &Settings) -> anyhow::Result<BpfPlane> {
+        // Kernels < 5.11 charge BPF map/program memory against RLIMIT_MEMLOCK
+        // (5.11+ switched to memcg accounting). Raise it before creating any map,
+        // or map creation fails with EPERM on 4.15/5.10 — see raise_memlock_rlimit.
+        raise_memlock_rlimit();
+
         // Detect whether the running kernel supports BTF function annotations
         // (btf_func, added in kernel 4.18). On kernels 4.14–4.17, `is_btf_supported()`
         // returns true (basic BTF works) but `btf_func` is false. Aya then:
@@ -156,6 +161,14 @@ impl BpfPlane {
                 .map_err(|e| anyhow::anyhow!("attach {name}: {e}"))?;
         }
 
+        // One clear line about which attach path was used, instead of a per-hook
+        // warning. On kernels < 6.6 the clsact+tc path is expected, not a fault.
+        if used_tc {
+            tracing::info!("eBPF classifiers attached via clsact+tc (legacy tc path; TCX needs kernel >= 6.6)");
+        } else {
+            tracing::info!("eBPF classifiers attached via TCX");
+        }
+
         Ok(BpfPlane {
             ebpf,
             tun: s.tun_iface.clone(),
@@ -196,8 +209,12 @@ fn attach_one(
             {
                 Ok(_) => Ok(false),
                 Err(e) => {
-                    tracing::warn!(
-                        "TCX attach failed ({e}); falling back to clsact+tc on {iface} {dir:?}"
+                    // Expected on kernels < 6.6 (no TCX): quietly fall back. Logged
+                    // at DEBUG per-hook — otherwise this warns once per (iface,dir),
+                    // i.e. 4x, which reads as a failure when it is the normal path.
+                    // load_and_attach emits a single INFO summary of the path used.
+                    tracing::debug!(
+                        "TCX attach unavailable ({e}); using clsact+tc on {iface} {dir:?}"
                     );
                     attach_tc(prog, iface, dir)?;
                     Ok(true)
@@ -346,6 +363,36 @@ impl DataPlane for BpfPlane {
         sock.connect(&server.into())?;
         sock.set_nonblocking(true)?;
         Ok(sock.into())
+    }
+}
+
+/// Raise `RLIMIT_MEMLOCK` to infinity for this process.
+///
+/// On kernels **< 5.11**, BPF map and program memory is charged against
+/// `RLIMIT_MEMLOCK`; 5.11+ switched to memory-cgroup accounting. The default
+/// limit is small (a systemd unit inherits ~64 KiB, a login shell ~8 MiB), so on
+/// e.g. kernel 4.15 / 5.10 creating our maps fails with EPERM — the exact symptom
+/// `failed to create map ... Operation not permitted (os error 1)`. libbpf and
+/// older aya bumped this automatically; aya 0.13 leaves it to the caller.
+///
+/// Best-effort by design: we run as root (`CAP_SYS_RESOURCE`), so this succeeds
+/// even under a restrictive systemd `LimitMEMLOCK`; on 5.11+ it is simply a
+/// harmless no-op. A failure is logged, not fatal, since the load can still
+/// succeed on memcg-accounted kernels.
+fn raise_memlock_rlimit() {
+    let lim = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: `lim` is a fully-initialised rlimit and RLIMIT_MEMLOCK is a valid
+    // resource id; setrlimit reads the struct and does not retain the pointer.
+    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) } != 0 {
+        tracing::warn!(
+            "could not raise RLIMIT_MEMLOCK ({}); BPF map creation may fail on kernels < 5.11",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        tracing::debug!("RLIMIT_MEMLOCK raised to infinity (needed for BPF on kernels < 5.11)");
     }
 }
 

@@ -457,6 +457,7 @@ dependencies = [
  "aya-log",
  "cargo_metadata",
  "clap",
+ "libc",
  "mymitm-common",
  "object",
  "rcgen",
