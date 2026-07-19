@@ -69,6 +69,11 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
     //   - deterministic and unique per (fwmark, table) pair,
     //   - high enough to not conflict with typical user policy rules (< 1000).
     let prio = (IP_RULE_PRIO_BASE + table).to_string();
+    // The tcp match is loaded explicitly with `-m tcp` (not just implicitly via
+    // `-p tcp`) so `--dport`/`--sport` are recognized on the iptables-nft backend:
+    // iptables v1.8.7 (Ubuntu jammy) rejects `-p tcp -d X --dport Y` with
+    // "unknown option --dport" when a core match (`-d`/`-s`) sits between `-p tcp`
+    // and the extension. `-m tcp` is portable across the legacy and nft backends.
     let items = vec![
         // 1. Intercept: DNAT client→server to the local listener on the tun iface.
         (
@@ -81,6 +86,8 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
                 s("-i"),
                 cfg.tun_iface.clone(),
                 s("-p"),
+                s("tcp"),
+                s("-m"),
                 s("tcp"),
                 s("-d"),
                 server.clone(),
@@ -99,6 +106,8 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
                 s("-i"),
                 cfg.tun_iface.clone(),
                 s("-p"),
+                s("tcp"),
+                s("-m"),
                 s("tcp"),
                 s("-d"),
                 server.clone(),
@@ -176,6 +185,8 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
                 server.clone(),
                 s("-p"),
                 s("tcp"),
+                s("-m"),
+                s("tcp"),
                 s("--sport"),
                 port.clone(),
                 s("-j"),
@@ -193,6 +204,8 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
                 s("-s"),
                 server.clone(),
                 s("-p"),
+                s("tcp"),
+                s("-m"),
                 s("tcp"),
                 s("--sport"),
                 port.clone(),

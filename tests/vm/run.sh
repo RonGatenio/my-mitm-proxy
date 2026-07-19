@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # VM test harness orchestrator. Run as root (needs ip/tap + /dev/kvm).
-#   sudo bash tests/vm/run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--keep]
+#   sudo bash tests/vm/run.sh {up|router|proxy|all|down} \
+#        [--data-plane ebpf|iproute] [--kernel 4.15|5.10] [--keep]
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib.sh"
@@ -11,10 +12,12 @@ CMD="${1:-}"; shift || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --data-plane) DATA_PLANE="$2"; shift 2;;
+    --kernel) B_KERNEL="$2"; shift 2;;
     --keep) KEEP=1; shift;;
     *) red "unknown arg: $1"; exit 2;;
   esac
 done
+case "$B_KERNEL" in 4.15|5.10) ;; *) fail "unsupported --kernel '$B_KERNEL' (use 4.15 or 5.10)";; esac
 
 [ "$(id -u)" -eq 0 ] || fail "must run as root (sudo)"
 
@@ -23,14 +26,33 @@ cmd_up() {
   [ -x "$BIN" ] || { info "building release binary"; ( cd "$REPO_ROOT" && cargo build -p mymitm --release ) || fail "cargo build failed"; }
   img_fetch
   net_up
-  vm_overlay A "$IMG_JAMMY";  vm_seed A; vm_launch A "$MAC_A_CTRL" "$SSH_PORT_A"
-  vm_overlay B "$IMG_BIONIC"; vm_seed B; vm_launch B "$MAC_B_CTRL" "$SSH_PORT_B"
-  vm_overlay C "$IMG_JAMMY";  vm_seed C; vm_launch C "$MAC_C_CTRL" "$SSH_PORT_C"
+  # B's rootfs: bionic ships the 4.15 distro kernel; for 5.10 we boot jammy with
+  # an external lvh kernel (see vm_launch), so its base image is jammy too.
+  local b_img="$IMG_BIONIC"; [ "$B_KERNEL" = 5.10 ] && b_img="$IMG_JAMMY"
+  vm_overlay A "$IMG_JAMMY"; vm_seed A; vm_launch A "$MAC_A_CTRL" "$SSH_PORT_A"
+  vm_overlay B "$b_img";     vm_seed B; vm_launch B "$MAC_B_CTRL" "$SSH_PORT_B"
+  vm_overlay C "$IMG_JAMMY"; vm_seed C; vm_launch C "$MAC_C_CTRL" "$SSH_PORT_C"
   wait_ssh A; wait_ssh B; wait_ssh C
 
-  # B must be kernel 4.15.
+  # B must be on the requested kernel. For 5.10, also install the external
+  # kernel's modules (clsact/mangle) that are absent from the jammy rootfs.
   local kver; kver="$(vm_ssh B uname -r)"
-  case "$kver" in 4.15*) pass "B kernel is $kver";; *) fail "B kernel is $kver (expected 4.15.*)";; esac
+  case "$kver" in
+    "$B_KERNEL"*) pass "B kernel is $kver";;
+    *) fail "B kernel is $kver (expected $B_KERNEL.*)";;
+  esac
+  if [ "$B_KERNEL" = 5.10 ]; then
+    b_install_modules_510
+    pass "B: 5.10 modules installed (clsact/mangle loadable)"
+  fi
+
+  # B must forward between its legs for phase 1 (plain router). cloud-init writes
+  # net.ipv4.ip_forward=1 to /etc/sysctl.d and applies it with `sysctl --system`
+  # in runcmd — but that runs in the cloud-final stage, which on jammy is gated
+  # behind snapd seeding and lands well after wait_ssh (sshd comes up early). Set
+  # it explicitly here so the router phase never races cloud-init.
+  vm_ssh B "sudo sysctl -wq net.ipv4.ip_forward=1" || fail "B: could not enable ip_forward"
+  pass "B: ip_forward enabled"
 
   # Bring up the server on C: copy script + cert, then start the unit.
   vm_ssh C "sudo mkdir -p /opt/tlssrv && sudo chown ubuntu /opt/tlssrv"
@@ -106,6 +128,27 @@ EOF
 
 cmd_proxy() {
   info "phase2: installing proxy on B (data_plane=$DATA_PLANE)"
+
+  # The iproute plane uses iptables tcp matches (--dport/--sport), which need the
+  # netfilter tcp match (xt_tcpudp). The lean lvh 5.10 *test* kernel is built
+  # without NETFILTER_XT_MATCH, so the match can't load there — a limitation of
+  # the test kernel, not the proxy: the iproute plane passes on the 4.15 full
+  # distro kernel, and a real distro 5.10 kernel ships xt_tcpudp. Probe for it
+  # (add+delete a throwaway rule) and skip with a clear message rather than
+  # letting mymitm die with a cryptic "Couldn't load match tcp".
+  if [ "$DATA_PLANE" = iproute ]; then
+    local probe
+    probe="$(vm_ssh B "sudo iptables -t nat -A PREROUTING -p tcp -m tcp --dport 65531 -j ACCEPT 2>&1; \
+                       sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 65531 -j ACCEPT 2>/dev/null")"
+    if echo "$probe" | grep -qiE "load match|unknown option"; then
+      info "SKIP (proxy, iproute): kernel $(vm_ssh B uname -r) lacks the netfilter tcp"
+      info "     match (xt_tcpudp) — the lean lvh 5.10 test kernel omits NETFILTER_XT_MATCH."
+      info "     The iproute plane needs a full distro kernel; it passes on --kernel 4.15,"
+      info "     and the default eBPF plane is validated on 5.10. Skipping (not a failure)."
+      exit 0   # skip cleanly (cmd_all's EXIT trap still tears down); no PASS banner
+    fi
+  fi
+
   vm_ssh B "sudo mkdir -p /opt/mymitm/dumps && sudo chown -R ubuntu /opt/mymitm"
   vm_scp B "$BIN" /opt/mymitm/mymitm
   vm_scp B "$CERT_DIR/leaf.pem" /opt/mymitm/leaf.pem
@@ -150,12 +193,15 @@ cmd_proxy() {
 }
 
 cmd_all() {
+  # Tear down on ANY exit — including a fail() mid-phase — unless --keep. Without
+  # this a failed run leaves its VMs holding the overlay write-locks and SSH
+  # ports, which then poisons the next run (stale VM answers on the same port).
+  [ "$KEEP" = 1 ] || trap cmd_down EXIT
   ensure_certs; cmd_up; cmd_router; cmd_proxy
   green "================================================================"
-  green " ALL PHASES PASS (data_plane=$DATA_PLANE)"
+  green " ALL PHASES PASS (kernel=$B_KERNEL, data_plane=$DATA_PLANE)"
   green " phase1 router + phase2 proxy both preserved src $A_IP at C"
   green "================================================================"
-  [ "$KEEP" = 1 ] || cmd_down
 }
 
 case "$CMD" in
