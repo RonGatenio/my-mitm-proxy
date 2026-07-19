@@ -6,3 +6,18 @@ members = ["mymitm", "mymitm-common"]
 [workspace.package]
 edition = "2021"
 license = "proprietary"
+
+# Hardened, minimal release: no symbol table, no debug info, size-optimized, and
+# abort-on-panic (so panics carry no unwinding machinery). CI builds this profile
+# additionally with `-Z build-std=std,panic_abort
+# -Z build-std-features=panic_immediate_abort`, which recompiles std to also drop
+# panic *message* strings (file paths, "called Option::unwrap() ...", etc.).
+# The plain `release` profile is left untouched — it keeps symbols/strings and is
+# the "regular" build. See docs/build-and-release.md.
+[profile.release-stripped]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

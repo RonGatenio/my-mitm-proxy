@@ -1,0 +1,152 @@
+name: Release
+
+# Pushing to the `release` branch cuts a versioned GitHub Release. For each
+# architecture it builds BOTH the regular (symbols kept) and the stripped
+# (no symbols/strings) static-musl binaries, then publishes them all under a
+# tag of the form 1.0.YYYYMMDD (the date the pipeline runs, UTC).
+#
+#   x86_64  -> ubuntu-latest      (native, required)
+#   aarch64 -> ubuntu-24.04-arm   (native, best-effort: continue-on-error so a
+#                                   runner the account can't use never blocks the
+#                                   x86_64 release)
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the tag + release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: echo "version=1.0.$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    # aarch64 is best-effort ("arm if easy"): if the arm runner is unavailable
+    # its failure/timeout is tolerated and the x86_64 release still ships.
+    continue-on-error: ${{ matrix.arch == 'aarch64' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            libclang-dev \
+            libelf-dev \
+            linux-libc-dev \
+            lld \
+            llvm \
+            llvm-dev \
+            musl-tools \
+            pkg-config \
+            zlib1g-dev
+
+      - name: Install Rust toolchain (${{ matrix.target }})
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src --target ${{ matrix.target }}
+          rustup target add ${{ matrix.target }} --toolchain nightly
+          rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          key: ${{ matrix.arch }}
+
+      - name: Install bpf-linker
+        run: test -x "$HOME/.cargo/bin/bpf-linker" || cargo install bpf-linker --locked
+
+      # Regular: optimized, symbols kept.
+      - name: Build release (regular)
+        run: cargo build -p mymitm --release --target ${{ matrix.target }}
+
+      # Stripped: no symbols, no debug info, size-optimized, abort-on-panic, and
+      # -Z build-std + panic_immediate_abort to also drop std panic-message strings.
+      - name: Build release (stripped, no symbols/strings)
+        run: |
+          cargo build -p mymitm \
+            --profile release-stripped \
+            -Z build-std=std,panic_abort \
+            -Z build-std-features=panic_immediate_abort \
+            --target ${{ matrix.target }}
+
+      - name: Verify fully static (both binaries)
+        run: |
+          for f in \
+            target/${{ matrix.target }}/release/mymitm \
+            target/${{ matrix.target }}/release-stripped/mymitm; do
+            echo "== $f =="
+            file "$f"
+            if readelf -d "$f" 2>/dev/null | grep -q 'NEEDED'; then
+              echo "ERROR: $f has dynamic NEEDED deps — not fully static"; exit 1
+            fi
+          done
+          echo "OK: both binaries statically linked, no NEEDED entries"
+
+      - name: Stage release assets
+        run: |
+          V="${{ needs.meta.outputs.version }}"
+          T="${{ matrix.target }}"
+          mkdir -p dist
+          install -m 0755 "target/$T/release/mymitm"          "dist/mymitm-$V-$T"
+          install -m 0755 "target/$T/release-stripped/mymitm" "dist/mymitm-$V-$T-stripped"
+          ( cd dist && for b in "mymitm-$V-$T" "mymitm-$V-$T-stripped"; do sha256sum "$b" > "$b.sha256"; done )
+          ls -l dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -l dist
+
+      - name: Publish GitHub Release ${{ needs.meta.outputs.version }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.version }}
+          name: ${{ needs.meta.outputs.version }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
