@@ -58,6 +58,12 @@ sudo bash tests/vm/run.sh all --data-plane iproute               # same, iproute
 # kernel 5.10
 sudo bash tests/vm/run.sh all --kernel 5.10                      # eBPF, kernel 5.10
 sudo bash tests/vm/run.sh all --kernel 5.10 --data-plane iproute # iproute, kernel 5.10
+
+# negative control: run the proxy with source-IP preservation OFF
+# (preserve_src_ip = false / --no-preserve-src-ip). Phase 2 then asserts C sees
+# the BOX IP (10.10.2.1), not the client (10.10.1.10) — proving the feature is
+# what changes the source IP.
+sudo bash tests/vm/run.sh all --kernel 5.10 --no-preserve
 ```
 
 Step by step (leaves the VMs running between commands — pass the same

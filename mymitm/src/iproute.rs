@@ -262,6 +262,9 @@ fn write_sysctl(key: &str, val: &str) -> std::io::Result<()> {
 pub struct IpRoutePlane {
     rules: RuleSet,
     saved: Vec<SavedSysctl>,
+    /// When false, `upstream_socket` skips IP_TRANSPARENT + bind-to-client and
+    /// just connect()s, so packets egress with the box's own source IP.
+    preserve_src_ip: bool,
 }
 
 impl IpRoutePlane {
@@ -342,8 +345,15 @@ impl IpRoutePlane {
             applied += 1;
         }
 
+        if !s.preserve_src_ip {
+            tracing::warn!(
+                "source-IP preservation DISABLED (preserve_src_ip=false): upstream socket is a \
+                 plain connect() from box_ip; the server will see the box IP, not the client IP"
+            );
+        }
+
         tracing::info!("iproute data plane installed (table {})", rules.table);
-        Ok(IpRoutePlane { rules, saved })
+        Ok(IpRoutePlane { rules, saved, preserve_src_ip: s.preserve_src_ip })
     }
 }
 
@@ -366,12 +376,22 @@ impl DataPlane for IpRoutePlane {
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
         )?;
-        // IP_TRANSPARENT: allows binding to a non-local (client) source address.
-        sock.set_ip_transparent_v4(true)?;
-        sock.set_reuse_address(true)?;
-        // Bind to dynamic client IP (ephemeral port 0) so packets egress with
-        // src = client_ip; the mangle rule marks replies back to us.
-        sock.bind(&SocketAddrV4::new(client_ip, 0).into())?;
+        if self.preserve_src_ip {
+            // IP_TRANSPARENT: allows binding to a non-local (client) source address.
+            sock.set_ip_transparent_v4(true)?;
+            sock.set_reuse_address(true)?;
+            // Bind to dynamic client IP (ephemeral port 0) so packets egress with
+            // src = client_ip; the mangle rule marks replies back to us.
+            sock.bind(&SocketAddrV4::new(client_ip, 0).into())?;
+        } else {
+            // No preservation: a plain connect() lets the kernel pick the source
+            // by route (the box's egress IP). The server sees the box, not the
+            // client. (The DNAT/mangle rules from setup() are harmless here — the
+            // reply's dst is already the box's own local IP.)
+            tracing::debug!(
+                "preserve_src_ip=false: plain connect() to {server}, source is box egress IP (client {client_ip} not spoofed)"
+            );
+        }
         sock.connect(&server.into())?;
         sock.set_nonblocking(true)?;
         Ok(sock.into())

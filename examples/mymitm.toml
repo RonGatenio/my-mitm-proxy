@@ -31,8 +31,20 @@ fwmark = 0x1337
 # Where decrypted payload dumps are written (JSONL index + .c2s/.s2c blobs).
 dump_path = "/var/tmp/mitm-dumps"
 
-# Tracing log level (RUST_LOG syntax, e.g. "info", "debug", "mymitm=trace").
-log_level = "info"
+# Logging. stdout and the log file each have their own level and BOTH default to
+# "off" (the proxy is silent unless asked to log). RUST_LOG/tracing syntax:
+# off|error|warn|info|debug|trace, or targeted e.g. "mymitm=debug".
+# CLI equivalents: --stdout-log-level / --file-log-level / --log-file.
+# stdout_log_level = "off"
+# file_log_level   = "off"
+# log_file         = "/var/tmp/mymitm.log"   # used only when file_log_level != off
+
+# Preserve the client's source IP on the upstream leg (the proxy dials the real
+# server as if it were the client). Default true. Set false — or pass
+# --no-preserve-src-ip — to dial with the box's own IP instead (standard proxy
+# behavior); the server then sees box_ip, not the client. Useful as a negative
+# control to confirm preservation is what changes the source IP.
+# preserve_src_ip = true
 
 # Optional: SNI hostname to send in the upstream TLS ClientHello.
 # If unset, the server IP string is used (works if the server accepts IP SNI).

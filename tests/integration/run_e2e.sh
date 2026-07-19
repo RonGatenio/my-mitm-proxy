@@ -185,7 +185,7 @@ local_addr = "10.8.0.1"
 local_port = 8443
 fwmark = 0x1337
 dump_path = "$DUMP_DIR"
-log_level = "info"
+stdout_log_level = "info"
 server_name = "server.test"
 data_plane = "ebpf"
 EOF
@@ -205,7 +205,7 @@ local_addr = "127.0.0.1"
 local_port = 8443
 fwmark = 0x1337
 dump_path = "$DUMP_DIR"
-log_level = "info"
+stdout_log_level = "info"
 server_name = "server.test"
 data_plane = "iproute"
 EOF

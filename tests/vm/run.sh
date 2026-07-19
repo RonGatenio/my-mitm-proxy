@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # VM test harness orchestrator. Run as root (needs ip/tap + /dev/kvm).
 #   sudo bash tests/vm/run.sh {up|router|proxy|all|down} \
-#        [--data-plane ebpf|iproute] [--kernel 4.15|5.10] [--keep]
+#        [--data-plane ebpf|iproute] [--kernel 4.15|5.10] [--no-preserve] [--keep]
+#
+# --no-preserve launches the proxy with `preserve_src_ip = false` and flips the
+# phase-2 assertion: the server C must then see the BOX IP, not the client IP.
+# It is the negative control proving preservation is what changes the src IP.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib.sh"
 
 DATA_PLANE=ebpf
 KEEP=0
+NO_PRESERVE=0
 CMD="${1:-}"; shift || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --data-plane) DATA_PLANE="$2"; shift 2;;
     --kernel) B_KERNEL="$2"; shift 2;;
+    --no-preserve) NO_PRESERVE=1; shift;;
     --keep) KEEP=1; shift;;
     *) red "unknown arg: $1"; exit 2;;
   esac
@@ -108,6 +114,9 @@ MARKER_PROXY="/marker-proxy-$$"
 
 write_b_toml() {  # writes mymitm.toml onto B for the selected data plane
   local local_addr; [ "$DATA_PLANE" = ebpf ] && local_addr="$B_LEFT_IP" || local_addr="127.0.0.1"
+  # Preservation is on by default; --no-preserve writes preserve_src_ip=false so
+  # the proxy dials C with the box's own IP (negative control).
+  local preserve="true"; [ "$NO_PRESERVE" = 1 ] && preserve="false"
   vm_ssh B "sudo tee /opt/mymitm/mymitm.toml >/dev/null" <<EOF
 target_server_ip = "$C_IP"
 target_server_port = 443
@@ -120,14 +129,16 @@ local_addr = "$local_addr"
 local_port = 8443
 fwmark = 0x1337
 dump_path = "/opt/mymitm/dumps"
-log_level = "info"
+stdout_log_level = "info"
 server_name = "server.test"
 data_plane = "$DATA_PLANE"
+preserve_src_ip = $preserve
 EOF
 }
 
 cmd_proxy() {
-  info "phase2: installing proxy on B (data_plane=$DATA_PLANE)"
+  local mode="preserve"; [ "$NO_PRESERVE" = 1 ] && mode="NO-preserve (negative control)"
+  info "phase2: installing proxy on B (data_plane=$DATA_PLANE, mode=$mode)"
 
   # The iproute plane uses iptables tcp matches (--dport/--sport), which need the
   # netfilter tcp match (xt_tcpudp). The lean lvh 5.10 *test* kernel is built
@@ -182,12 +193,22 @@ cmd_proxy() {
     && pass "phase2: decrypted request ($MARKER_PROXY) found in B's dump" \
     || { vm_ssh B "sudo ls -la /opt/mymitm/dumps/ && sudo cat /opt/mymitm/dumps/index.jsonl"; fail "(proxy) marker not found in any dump on B"; }
 
-  # (b) src IP still preserved at C.
+  # (b) which src IP did the server C actually see? Print C's raw log line either
+  #     way — that line IS the proof. The assertion then just checks it matches
+  #     the mode: preservation ON -> client IP; OFF -> the box's own IP.
   local log; log="$(vm_ssh C "cat /var/log/tls_server.log")"
+  echo "----- C:/var/log/tls_server.log (peer-IP path) -----"
   echo "$log"
-  echo "$log" | grep -q "^$A_IP "      || fail "(proxy) C did not log client IP $A_IP"
-  echo "$log" | grep -q "$B_RIGHT_IP " && fail "(proxy) C saw B's IP $B_RIGHT_IP (src not preserved)" || true
-  pass "phase2: C saw src=$A_IP (proxy preserved client IP, data_plane=$DATA_PLANE)"
+  echo "-----------------------------------------------------"
+  if [ "$NO_PRESERVE" = 1 ]; then
+    echo "$log" | grep -q "^$B_RIGHT_IP " || { vm_ssh B "sudo journalctl -u mymitm --no-pager -n40"; fail "(proxy,no-preserve) C did not log the box IP $B_RIGHT_IP"; }
+    echo "$log" | grep -q "^$A_IP "        && fail "(proxy,no-preserve) C saw client IP $A_IP but preservation was OFF" || true
+    pass "phase2: C saw src=$B_RIGHT_IP — preservation OFF => server sees the BOX IP (data_plane=$DATA_PLANE)"
+  else
+    echo "$log" | grep -q "^$A_IP "        || fail "(proxy) C did not log client IP $A_IP"
+    echo "$log" | grep -q "^$B_RIGHT_IP "  && fail "(proxy) C saw B's IP $B_RIGHT_IP (src not preserved)" || true
+    pass "phase2: C saw src=$A_IP — preservation ON => server sees the CLIENT IP (data_plane=$DATA_PLANE)"
+  fi
 
   vm_ssh B "sudo systemctl stop mymitm" || true
 }
@@ -200,7 +221,11 @@ cmd_all() {
   ensure_certs; cmd_up; cmd_router; cmd_proxy
   green "================================================================"
   green " ALL PHASES PASS (kernel=$B_KERNEL, data_plane=$DATA_PLANE)"
-  green " phase1 router + phase2 proxy both preserved src $A_IP at C"
+  if [ "$NO_PRESERVE" = 1 ]; then
+    green " negative control: phase2 proxy (preserve OFF) => C saw box $B_RIGHT_IP"
+  else
+    green " phase1 router + phase2 proxy both preserved src $A_IP at C"
+  fi
   green "================================================================"
 }
 
@@ -210,5 +235,5 @@ case "$CMD" in
   router) cmd_router;;
   proxy)  cmd_proxy;;
   all)    cmd_all;;
-  *)      red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--keep]"; exit 2;;
+  *)      red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--kernel 4.15|5.10] [--no-preserve] [--keep]"; exit 2;;
 esac

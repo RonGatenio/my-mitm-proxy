@@ -77,6 +77,9 @@ pub struct BpfPlane {
     used_tc: bool,
     box_ip: Ipv4Addr,
     fwmark: u32,
+    /// When false, do NOT publish the EGRESS entry, so cls_eth_egress finds no
+    /// SNAT target and leaves the source IP as box_ip (see `upstream_socket`).
+    preserve_src_ip: bool,
     /// EGRESS map: box ephemeral src port (NBO) -> client IP (NBO). Written per
     /// connection just before connect() so cls_eth_egress can SNAT correctly.
     egress_map: Mutex<AyaHashMap<MapData, u16, u32>>,
@@ -169,6 +172,14 @@ impl BpfPlane {
             tracing::info!("eBPF classifiers attached via TCX");
         }
 
+        if !s.preserve_src_ip {
+            tracing::warn!(
+                "source-IP preservation DISABLED (preserve_src_ip=false): upstream flows keep \
+                 box_ip {} as their source; the server will see the box IP, not the client IP",
+                s.box_ip
+            );
+        }
+
         Ok(BpfPlane {
             ebpf,
             tun: s.tun_iface.clone(),
@@ -176,6 +187,7 @@ impl BpfPlane {
             used_tc,
             box_ip: s.box_ip,
             fwmark: s.fwmark,
+            preserve_src_ip: s.preserve_src_ip,
             egress_map: Mutex::new(egress_map),
         })
     }
@@ -349,7 +361,13 @@ impl DataPlane for BpfPlane {
         // reused box_port could cause that new flow to be SNATted to the previous
         // client's IP. Delete-on-close would convert that from "wrong SNAT IP" to
         // "no SNAT" instead — recorded as a known follow-up (see spec).
-        {
+        //
+        // When preserve_src_ip is false we deliberately DO NOT publish the entry:
+        // cls_eth_egress then finds no EGRESS[box_port] and returns TC_ACT_OK,
+        // leaving the source as box_ip. The socket is already bound to box_ip, so
+        // the upstream flow simply egresses with the box's own IP — standard
+        // proxy behavior, and the negative control for source-IP preservation.
+        if self.preserve_src_ip {
             let mut map = self
                 .egress_map
                 .lock()
@@ -358,6 +376,12 @@ impl DataPlane for BpfPlane {
                 // Log and proceed: the flow just won't be SNAT'd (visible failure).
                 tracing::warn!("EGRESS insert failed for box_port={box_port}: {e}");
             }
+        } else {
+            tracing::debug!(
+                "preserve_src_ip=false: not publishing EGRESS[{box_port}] -> client {client_ip}; \
+                 flow keeps box_ip {} as source",
+                self.box_ip
+            );
         }
 
         sock.connect(&server.into())?;
