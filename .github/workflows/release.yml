@@ -86,15 +86,12 @@ jobs:
       - name: Build release (regular)
         run: cargo build -p mymitm --release --target ${{ matrix.target }}
 
-      # Stripped: no symbols, no debug info, size-optimized, abort-on-panic, and
-      # -Z build-std + panic_immediate_abort to also drop std panic-message strings.
-      - name: Build release (stripped, no symbols/strings)
-        run: |
-          cargo build -p mymitm \
-            --profile release-stripped \
-            -Z build-std=std,panic_abort \
-            -Z build-std-features=panic_immediate_abort \
-            --target ${{ matrix.target }}
+      # Stripped: no symbol table, no debug info, size-optimized, abort-on-panic.
+      # Profile-only (no -Z build-std) so it builds on any nightly — the newer
+      # nightly moved panic_immediate_abort to a real `-Cpanic=immediate-abort`
+      # strategy, which build-std-features no longer accepts.
+      - name: Build release (stripped, no symbols)
+        run: cargo build -p mymitm --profile release-stripped --target ${{ matrix.target }}
 
       - name: Verify fully static (both binaries)
         run: |

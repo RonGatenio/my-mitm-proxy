@@ -9,7 +9,7 @@ of libc.
 | Profile | Cargo invocation | Symbols | Size (x86_64) | Use |
 |---------|------------------|---------|---------------|-----|
 | `release` | `cargo build -p mymitm --release` | kept (`not stripped`) | ~6.9 MB | normal, debuggable build |
-| `release-stripped` | see below | **removed** (`stripped`) | ~2.3 MB | hardened / minimal build |
+| `release-stripped` | see below | **removed** (`stripped`) | ~3.2 MB | hardened / minimal build |
 
 Both are static: `file` reports `static-pie linked`, `ldd` reports `statically
 linked`, and `readelf -d` shows **no `NEEDED`** entries. CI fails the build if a
@@ -22,19 +22,15 @@ cargo build -p mymitm --release
 # -> target/x86_64-unknown-linux-musl/release/mymitm
 ```
 
-### Stripped (no symbols / no strings)
+### Stripped (no symbols)
 
 The `[profile.release-stripped]` (in the root `Cargo.toml`) sets
 `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`,
-`strip = "symbols"`. To also drop std **panic-message** strings, build it with
-`build-std` + `panic_immediate_abort` (nightly; the repo already pins nightly):
+`strip = "symbols"`. It is profile-only (no `-Z build-std`), so it builds on any
+toolchain:
 
 ```bash
-cargo build -p mymitm \
-  --profile release-stripped \
-  -Z build-std=std,panic_abort \
-  -Z build-std-features=panic_immediate_abort \
-  --target x86_64-unknown-linux-musl
+cargo build -p mymitm --profile release-stripped --target x86_64-unknown-linux-musl
 # -> target/x86_64-unknown-linux-musl/release-stripped/mymitm
 ```
 
@@ -43,16 +39,19 @@ cargo build -p mymitm \
 | | regular | stripped |
 |---|---|---|
 | `file` | `not stripped` | `stripped` |
-| `nm` symbol lines | 14,530 | *no symbols* |
-| total `strings` | 66,931 | 28,435 (−57%) |
-| panic `unwrap` strings | 58 | 0 |
-| size | 6.9 MB | 2.3 MB |
+| `nm` symbols | 14,530 lines | *no symbols* |
+| total `strings` | 66,931 | 30,234 (−55%) |
+| size | 6.9 MB | 3.2 MB |
+| `readelf -d` `NEEDED` | none | none (still fully static) |
 
-**What it does *not* remove:** the symbol table, debug info, and std panic
-strings are gone, but application-level string literals (our own log/format
-messages, and error strings in dependencies) remain in `.rodata` — removing those
-would require compiling the code paths out, not just stripping. So "no strings"
-means *no symbol/debug/panic strings*, not a literally string-free binary.
+**What it does *not* remove:** the symbol table and debug info are gone (that is
+the bulk of the `strings` drop), but application/std string literals — our own
+log/format messages, dependency error strings, and std **panic messages** —
+remain in `.rodata`. Removing those needs a per-toolchain `build-std` +
+immediate-abort rebuild that is **not portable across nightlies** (recent nightly
+replaced `-Z build-std-features=panic_immediate_abort` with a
+`-Cpanic=immediate-abort` strategy), so CI does not do it. "Stripped" here means
+*no symbols/debug info*, not a literally string-free binary.
 
 ## Verifying static linking
 
