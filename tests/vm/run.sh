@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # VM test harness orchestrator. Run as root (needs ip/tap + /dev/kvm).
 #   sudo bash tests/vm/run.sh {up|router|proxy|all|down} \
-#        [--data-plane ebpf|iproute] [--kernel 4.15|5.10] [--no-preserve] [--keep]
+#        [--data-plane ebpf|iproute] [--kernel 4.15|5.10|debian11] [--no-preserve] [--keep]
 #
 # --no-preserve launches the proxy with `preserve_src_ip = false` and flips the
 # phase-2 assertion: the server C must then see the BOX IP, not the client IP.
@@ -23,7 +23,9 @@ while [ $# -gt 0 ]; do
     *) red "unknown arg: $1"; exit 2;;
   esac
 done
-case "$B_KERNEL" in 4.15|5.10) ;; *) fail "unsupported --kernel '$B_KERNEL' (use 4.15 or 5.10)";; esac
+case "$B_KERNEL" in 4.15|5.10|debian11) ;; *) fail "unsupported --kernel '$B_KERNEL' (use 4.15, 5.10, or debian11)";; esac
+# uname -r prefix required on B. debian11 boots a native 5.10.x distro kernel.
+case "$B_KERNEL" in debian11) B_KVER_EXPECT=5.10 ;; *) B_KVER_EXPECT="$B_KERNEL" ;; esac
 
 [ "$(id -u)" -eq 0 ] || fail "must run as root (sudo)"
 
@@ -32,9 +34,15 @@ cmd_up() {
   [ -x "$BIN" ] || { info "building release binary"; ( cd "$REPO_ROOT" && cargo build -p mymitm --release ) || fail "cargo build failed"; }
   img_fetch
   net_up
-  # B's rootfs: bionic ships the 4.15 distro kernel; for 5.10 we boot jammy with
-  # an external lvh kernel (see vm_launch), so its base image is jammy too.
-  local b_img="$IMG_BIONIC"; [ "$B_KERNEL" = 5.10 ] && b_img="$IMG_JAMMY"
+  # B's rootfs: bionic ships the 4.15 distro kernel; 5.10 boots jammy with an
+  # external lvh kernel (see vm_launch); debian11 boots the Debian 11 image on
+  # its own native 5.10 kernel.
+  local b_img
+  case "$B_KERNEL" in
+    5.10)     b_img="$IMG_JAMMY" ;;
+    debian11) b_img="$IMG_DEB11" ;;
+    *)        b_img="$IMG_BIONIC" ;;
+  esac
   vm_overlay A "$IMG_JAMMY"; vm_seed A; vm_launch A "$MAC_A_CTRL" "$SSH_PORT_A"
   vm_overlay B "$b_img";     vm_seed B; vm_launch B "$MAC_B_CTRL" "$SSH_PORT_B"
   vm_overlay C "$IMG_JAMMY"; vm_seed C; vm_launch C "$MAC_C_CTRL" "$SSH_PORT_C"
@@ -44,13 +52,16 @@ cmd_up() {
   # kernel's modules (clsact/mangle) that are absent from the jammy rootfs.
   local kver; kver="$(vm_ssh B uname -r)"
   case "$kver" in
-    "$B_KERNEL"*) pass "B kernel is $kver";;
-    *) fail "B kernel is $kver (expected $B_KERNEL.*)";;
+    "$B_KVER_EXPECT"*) pass "B kernel is $kver (target $B_KERNEL)";;
+    *) fail "B kernel is $kver (expected $B_KVER_EXPECT.* for target $B_KERNEL)";;
   esac
   if [ "$B_KERNEL" = 5.10 ]; then
     b_install_modules_510
     pass "B: 5.10 modules installed (clsact/mangle loadable)"
   fi
+
+  # Resolve B's data-leg iface names (no-op unless Debian; see b_resolve_ifaces).
+  b_resolve_ifaces
 
   # B must forward between its legs for phase 1 (plain router). cloud-init writes
   # net.ipv4.ip_forward=1 to /etc/sysctl.d and applies it with `sysctl --system`
@@ -123,8 +134,8 @@ target_server_port = 443
 box_ip = "$B_RIGHT_IP"
 cert_path = "/opt/mymitm/leaf.pem"
 key_path = "/opt/mymitm/leaf.key"
-tun_iface = "left0"
-egress_iface = "right0"
+tun_iface = "$B_LEFT_IFACE"
+egress_iface = "$B_RIGHT_IFACE"
 local_addr = "$local_addr"
 local_port = 8443
 fwmark = 0x1337
@@ -139,6 +150,7 @@ EOF
 cmd_proxy() {
   local mode="preserve"; [ "$NO_PRESERVE" = 1 ] && mode="NO-preserve (negative control)"
   info "phase2: installing proxy on B (data_plane=$DATA_PLANE, mode=$mode)"
+  b_resolve_ifaces   # ensure B_LEFT_IFACE/B_RIGHT_IFACE are correct for a standalone `proxy`
 
   # The iproute plane uses iptables tcp matches (--dport/--sport), which need the
   # netfilter tcp match (xt_tcpudp). The lean lvh 5.10 *test* kernel is built
@@ -148,6 +160,14 @@ cmd_proxy() {
   # (add+delete a throwaway rule) and skip with a clear message rather than
   # letting mymitm die with a cryptic "Couldn't load match tcp".
   if [ "$DATA_PLANE" = iproute ]; then
+    # Debian genericcloud is minimal and may ship without iptables (it defaults
+    # to nftables). The iproute plane shells out to iptables, so install it.
+    if [ "$B_KERNEL" = debian11 ] && ! vm_ssh B "command -v iptables >/dev/null 2>&1"; then
+      info "installing iptables on B (Debian; the iproute plane needs it)"
+      vm_ssh B "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables" \
+        || fail "B: apt-get install iptables failed (guest needs outbound network)"
+    fi
     local probe
     probe="$(vm_ssh B "sudo iptables -t nat -A PREROUTING -p tcp -m tcp --dport 65531 -j ACCEPT 2>&1; \
                        sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 65531 -j ACCEPT 2>/dev/null")"
@@ -167,7 +187,7 @@ cmd_proxy() {
   vm_ssh B "chmod +x /opt/mymitm/mymitm"
   write_b_toml
   # eBPF DNATs the client flow to a local listener address on the tun iface.
-  [ "$DATA_PLANE" = ebpf ] && vm_ssh B "sudo sysctl -wq net.ipv4.conf.left0.route_localnet=1"
+  [ "$DATA_PLANE" = ebpf ] && vm_ssh B "sudo sysctl -wq net.ipv4.conf.$B_LEFT_IFACE.route_localnet=1"
   vm_ssh C "sudo truncate -s0 /var/log/tls_server.log"
   vm_ssh B "sudo rm -f /opt/mymitm/dumps/*"
 
@@ -235,5 +255,5 @@ case "$CMD" in
   router) cmd_router;;
   proxy)  cmd_proxy;;
   all)    cmd_all;;
-  *)      red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--kernel 4.15|5.10] [--no-preserve] [--keep]"; exit 2;;
+  *)      red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--kernel 4.15|5.10|debian11] [--no-preserve] [--keep]"; exit 2;;
 esac
