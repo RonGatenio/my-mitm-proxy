@@ -1,0 +1,22 @@
+# Reference mymitm config for the RD Gateway bring-up (proxy B, Debian/5.10).
+# b-deploy.ps1 regenerates this on B with the *actual* interface names it finds
+# for the two MACs (in case cloud-init's set-name rename didn't stick on Debian),
+# so treat the tun_iface/egress_iface here as the expected-case values.
+
+target_server_ip  = "10.20.2.10"   # GW (RD Gateway) on rdgw-right
+target_server_port = 443
+box_ip            = "10.20.2.1"    # B's right0 (egress toward GW)
+
+cert_path = "/opt/mymitm/leaf.pem" # GW's real leaf cert (see cert flow)
+key_path  = "/opt/mymitm/leaf.key"
+
+tun_iface    = "left0"             # client side (host traffic arrives here)
+egress_iface = "right0"            # server side (re-originate to GW)
+local_addr   = "10.20.1.1"         # eBPF: DNAT target = listener on the tun-iface addr
+local_port   = 8443
+
+fwmark    = 0x1337
+dump_path = "/opt/mymitm/dumps"
+log_level = "info"
+server_name = "gw.rdgw.test"       # upstream SNI toward GW
+data_plane = "ebpf"                # kernel 5.10 verifier is fine; switch to "iproute" to fall back
