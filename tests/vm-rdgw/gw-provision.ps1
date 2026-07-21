@@ -54,8 +54,10 @@ Say "bound cert to RD Gateway"
 #    creation via the RDS: provider hits NPS/permission errors; if it fails, create
 #    them in RD Gateway Manager -> Policies: CAP = local Administrators + password
 #    auth; RAP = allow connection to any network resource.
-#    New-Item form: -Path <container> -Name <leaf> (NOT a full path).
-$grp = "Administrators@$env:COMPUTERNAME"
+#    New-Item form: -Path <container> -Name <leaf> (NOT a full path); group is
+#    "Administrators@BUILTIN" (BUILTIN, not the computer name) and NPS must be running.
+Start-Service IAS -ErrorAction SilentlyContinue   # NPS; CAP is stored here
+$grp = "Administrators@BUILTIN"
 try {
   if (-not (Test-Path "RDS:\GatewayServer\CAP\rdgw-cap")) { New-Item -Path "RDS:\GatewayServer\CAP" -Name "rdgw-cap" -UserGroups $grp -AuthMethod 1 -ErrorAction Stop | Out-Null }
   if (-not (Test-Path "RDS:\GatewayServer\RAP\rdgw-rap")) { New-Item -Path "RDS:\GatewayServer\RAP" -Name "rdgw-rap" -UserGroups $grp -ComputerGroupType 2 -ErrorAction Stop | Out-Null }
