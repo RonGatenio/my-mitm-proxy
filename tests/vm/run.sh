@@ -1,20 +1,31 @@
 #!/usr/bin/env bash
 # VM test harness orchestrator. Run as root (needs ip/tap + /dev/kvm).
-#   sudo bash tests/vm/run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--keep]
+#   sudo bash tests/vm/run.sh {up|router|proxy|all|down} \
+#        [--data-plane ebpf|iproute] [--kernel 4.15|5.10|debian11] [--no-preserve] [--keep]
+#
+# --no-preserve launches the proxy with `preserve_src_ip = false` and flips the
+# phase-2 assertion: the server C must then see the BOX IP, not the client IP.
+# It is the negative control proving preservation is what changes the src IP.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib.sh"
 
 DATA_PLANE=ebpf
 KEEP=0
+NO_PRESERVE=0
 CMD="${1:-}"; shift || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --data-plane) DATA_PLANE="$2"; shift 2;;
+    --kernel) B_KERNEL="$2"; shift 2;;
+    --no-preserve) NO_PRESERVE=1; shift;;
     --keep) KEEP=1; shift;;
     *) red "unknown arg: $1"; exit 2;;
   esac
 done
+case "$B_KERNEL" in 4.15|5.10|debian11) ;; *) fail "unsupported --kernel '$B_KERNEL' (use 4.15, 5.10, or debian11)";; esac
+# uname -r prefix required on B. debian11 boots a native 5.10.x distro kernel.
+case "$B_KERNEL" in debian11) B_KVER_EXPECT=5.10 ;; *) B_KVER_EXPECT="$B_KERNEL" ;; esac
 
 [ "$(id -u)" -eq 0 ] || fail "must run as root (sudo)"
 
@@ -23,14 +34,42 @@ cmd_up() {
   [ -x "$BIN" ] || { info "building release binary"; ( cd "$REPO_ROOT" && cargo build -p mymitm --release ) || fail "cargo build failed"; }
   img_fetch
   net_up
-  vm_overlay A "$IMG_JAMMY";  vm_seed A; vm_launch A "$MAC_A_CTRL" "$SSH_PORT_A"
-  vm_overlay B "$IMG_BIONIC"; vm_seed B; vm_launch B "$MAC_B_CTRL" "$SSH_PORT_B"
-  vm_overlay C "$IMG_JAMMY";  vm_seed C; vm_launch C "$MAC_C_CTRL" "$SSH_PORT_C"
+  # B's rootfs: bionic ships the 4.15 distro kernel; 5.10 boots jammy with an
+  # external lvh kernel (see vm_launch); debian11 boots the Debian 11 image on
+  # its own native 5.10 kernel.
+  local b_img
+  case "$B_KERNEL" in
+    5.10)     b_img="$IMG_JAMMY" ;;
+    debian11) b_img="$IMG_DEB11" ;;
+    *)        b_img="$IMG_BIONIC" ;;
+  esac
+  vm_overlay A "$IMG_JAMMY"; vm_seed A; vm_launch A "$MAC_A_CTRL" "$SSH_PORT_A"
+  vm_overlay B "$b_img";     vm_seed B; vm_launch B "$MAC_B_CTRL" "$SSH_PORT_B"
+  vm_overlay C "$IMG_JAMMY"; vm_seed C; vm_launch C "$MAC_C_CTRL" "$SSH_PORT_C"
   wait_ssh A; wait_ssh B; wait_ssh C
 
-  # B must be kernel 4.15.
+  # B must be on the requested kernel. For 5.10, also install the external
+  # kernel's modules (clsact/mangle) that are absent from the jammy rootfs.
   local kver; kver="$(vm_ssh B uname -r)"
-  case "$kver" in 4.15*) pass "B kernel is $kver";; *) fail "B kernel is $kver (expected 4.15.*)";; esac
+  case "$kver" in
+    "$B_KVER_EXPECT"*) pass "B kernel is $kver (target $B_KERNEL)";;
+    *) fail "B kernel is $kver (expected $B_KVER_EXPECT.* for target $B_KERNEL)";;
+  esac
+  if [ "$B_KERNEL" = 5.10 ]; then
+    b_install_modules_510
+    pass "B: 5.10 modules installed (clsact/mangle loadable)"
+  fi
+
+  # Resolve B's data-leg iface names (no-op unless Debian; see b_resolve_ifaces).
+  b_resolve_ifaces
+
+  # B must forward between its legs for phase 1 (plain router). cloud-init writes
+  # net.ipv4.ip_forward=1 to /etc/sysctl.d and applies it with `sysctl --system`
+  # in runcmd — but that runs in the cloud-final stage, which on jammy is gated
+  # behind snapd seeding and lands well after wait_ssh (sshd comes up early). Set
+  # it explicitly here so the router phase never races cloud-init.
+  vm_ssh B "sudo sysctl -wq net.ipv4.ip_forward=1" || fail "B: could not enable ip_forward"
+  pass "B: ip_forward enabled"
 
   # Bring up the server on C: copy script + cert, then start the unit.
   vm_ssh C "sudo mkdir -p /opt/tlssrv && sudo chown ubuntu /opt/tlssrv"
@@ -86,26 +125,61 @@ MARKER_PROXY="/marker-proxy-$$"
 
 write_b_toml() {  # writes mymitm.toml onto B for the selected data plane
   local local_addr; [ "$DATA_PLANE" = ebpf ] && local_addr="$B_LEFT_IP" || local_addr="127.0.0.1"
+  # Preservation is on by default; --no-preserve writes preserve_src_ip=false so
+  # the proxy dials C with the box's own IP (negative control).
+  local preserve="true"; [ "$NO_PRESERVE" = 1 ] && preserve="false"
   vm_ssh B "sudo tee /opt/mymitm/mymitm.toml >/dev/null" <<EOF
 target_server_ip = "$C_IP"
 target_server_port = 443
 box_ip = "$B_RIGHT_IP"
 cert_path = "/opt/mymitm/leaf.pem"
 key_path = "/opt/mymitm/leaf.key"
-tun_iface = "left0"
-egress_iface = "right0"
+tun_iface = "$B_LEFT_IFACE"
+egress_iface = "$B_RIGHT_IFACE"
 local_addr = "$local_addr"
 local_port = 8443
 fwmark = 0x1337
 dump_path = "/opt/mymitm/dumps"
-log_level = "info"
+stdout_log_level = "info"
 server_name = "server.test"
 data_plane = "$DATA_PLANE"
+preserve_src_ip = $preserve
 EOF
 }
 
 cmd_proxy() {
-  info "phase2: installing proxy on B (data_plane=$DATA_PLANE)"
+  local mode="preserve"; [ "$NO_PRESERVE" = 1 ] && mode="NO-preserve (negative control)"
+  info "phase2: installing proxy on B (data_plane=$DATA_PLANE, mode=$mode)"
+  b_resolve_ifaces   # ensure B_LEFT_IFACE/B_RIGHT_IFACE are correct for a standalone `proxy`
+
+  # The iproute plane uses iptables tcp matches (--dport/--sport), which need the
+  # netfilter tcp match (xt_tcpudp). The lean lvh 5.10 *test* kernel is built
+  # without NETFILTER_XT_MATCH, so the match can't load there — a limitation of
+  # the test kernel, not the proxy: the iproute plane passes on the 4.15 full
+  # distro kernel, and a real distro 5.10 kernel ships xt_tcpudp. Probe for it
+  # (add+delete a throwaway rule) and skip with a clear message rather than
+  # letting mymitm die with a cryptic "Couldn't load match tcp".
+  if [ "$DATA_PLANE" = iproute ]; then
+    # Debian genericcloud is minimal and may ship without iptables (it defaults
+    # to nftables). The iproute plane shells out to iptables, so install it.
+    if [ "$B_KERNEL" = debian11 ] && ! vm_ssh B "command -v iptables >/dev/null 2>&1"; then
+      info "installing iptables on B (Debian; the iproute plane needs it)"
+      vm_ssh B "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+                sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables" \
+        || fail "B: apt-get install iptables failed (guest needs outbound network)"
+    fi
+    local probe
+    probe="$(vm_ssh B "sudo iptables -t nat -A PREROUTING -p tcp -m tcp --dport 65531 -j ACCEPT 2>&1; \
+                       sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 65531 -j ACCEPT 2>/dev/null")"
+    if echo "$probe" | grep -qiE "load match|unknown option"; then
+      info "SKIP (proxy, iproute): kernel $(vm_ssh B uname -r) lacks the netfilter tcp"
+      info "     match (xt_tcpudp) — the lean lvh 5.10 test kernel omits NETFILTER_XT_MATCH."
+      info "     The iproute plane needs a full distro kernel; it passes on --kernel 4.15,"
+      info "     and the default eBPF plane is validated on 5.10. Skipping (not a failure)."
+      exit 0   # skip cleanly (cmd_all's EXIT trap still tears down); no PASS banner
+    fi
+  fi
+
   vm_ssh B "sudo mkdir -p /opt/mymitm/dumps && sudo chown -R ubuntu /opt/mymitm"
   vm_scp B "$BIN" /opt/mymitm/mymitm
   vm_scp B "$CERT_DIR/leaf.pem" /opt/mymitm/leaf.pem
@@ -113,7 +187,7 @@ cmd_proxy() {
   vm_ssh B "chmod +x /opt/mymitm/mymitm"
   write_b_toml
   # eBPF DNATs the client flow to a local listener address on the tun iface.
-  [ "$DATA_PLANE" = ebpf ] && vm_ssh B "sudo sysctl -wq net.ipv4.conf.left0.route_localnet=1"
+  [ "$DATA_PLANE" = ebpf ] && vm_ssh B "sudo sysctl -wq net.ipv4.conf.$B_LEFT_IFACE.route_localnet=1"
   vm_ssh C "sudo truncate -s0 /var/log/tls_server.log"
   vm_ssh B "sudo rm -f /opt/mymitm/dumps/*"
 
@@ -139,23 +213,40 @@ cmd_proxy() {
     && pass "phase2: decrypted request ($MARKER_PROXY) found in B's dump" \
     || { vm_ssh B "sudo ls -la /opt/mymitm/dumps/ && sudo cat /opt/mymitm/dumps/index.jsonl"; fail "(proxy) marker not found in any dump on B"; }
 
-  # (b) src IP still preserved at C.
+  # (b) which src IP did the server C actually see? Print C's raw log line either
+  #     way — that line IS the proof. The assertion then just checks it matches
+  #     the mode: preservation ON -> client IP; OFF -> the box's own IP.
   local log; log="$(vm_ssh C "cat /var/log/tls_server.log")"
+  echo "----- C:/var/log/tls_server.log (peer-IP path) -----"
   echo "$log"
-  echo "$log" | grep -q "^$A_IP "      || fail "(proxy) C did not log client IP $A_IP"
-  echo "$log" | grep -q "$B_RIGHT_IP " && fail "(proxy) C saw B's IP $B_RIGHT_IP (src not preserved)" || true
-  pass "phase2: C saw src=$A_IP (proxy preserved client IP, data_plane=$DATA_PLANE)"
+  echo "-----------------------------------------------------"
+  if [ "$NO_PRESERVE" = 1 ]; then
+    echo "$log" | grep -q "^$B_RIGHT_IP " || { vm_ssh B "sudo journalctl -u mymitm --no-pager -n40"; fail "(proxy,no-preserve) C did not log the box IP $B_RIGHT_IP"; }
+    echo "$log" | grep -q "^$A_IP "        && fail "(proxy,no-preserve) C saw client IP $A_IP but preservation was OFF" || true
+    pass "phase2: C saw src=$B_RIGHT_IP — preservation OFF => server sees the BOX IP (data_plane=$DATA_PLANE)"
+  else
+    echo "$log" | grep -q "^$A_IP "        || fail "(proxy) C did not log client IP $A_IP"
+    echo "$log" | grep -q "^$B_RIGHT_IP "  && fail "(proxy) C saw B's IP $B_RIGHT_IP (src not preserved)" || true
+    pass "phase2: C saw src=$A_IP — preservation ON => server sees the CLIENT IP (data_plane=$DATA_PLANE)"
+  fi
 
   vm_ssh B "sudo systemctl stop mymitm" || true
 }
 
 cmd_all() {
+  # Tear down on ANY exit — including a fail() mid-phase — unless --keep. Without
+  # this a failed run leaves its VMs holding the overlay write-locks and SSH
+  # ports, which then poisons the next run (stale VM answers on the same port).
+  [ "$KEEP" = 1 ] || trap cmd_down EXIT
   ensure_certs; cmd_up; cmd_router; cmd_proxy
   green "================================================================"
-  green " ALL PHASES PASS (data_plane=$DATA_PLANE)"
-  green " phase1 router + phase2 proxy both preserved src $A_IP at C"
+  green " ALL PHASES PASS (kernel=$B_KERNEL, data_plane=$DATA_PLANE)"
+  if [ "$NO_PRESERVE" = 1 ]; then
+    green " negative control: phase2 proxy (preserve OFF) => C saw box $B_RIGHT_IP"
+  else
+    green " phase1 router + phase2 proxy both preserved src $A_IP at C"
+  fi
   green "================================================================"
-  [ "$KEEP" = 1 ] || cmd_down
 }
 
 case "$CMD" in
@@ -164,5 +255,5 @@ case "$CMD" in
   router) cmd_router;;
   proxy)  cmd_proxy;;
   all)    cmd_all;;
-  *)      red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--keep]"; exit 2;;
+  *)      red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--kernel 4.15|5.10|debian11] [--no-preserve] [--keep]"; exit 2;;
 esac

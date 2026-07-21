@@ -48,7 +48,7 @@ local_addr = "127.0.0.1"
 local_port = 8443
 fwmark = 0x1337
 dump_path = "$WORK/dumps"
-log_level = "debug"
+stdout_log_level = "debug"
 server_name = "server.test"
 EOF
 echo "setup done. WORK=$WORK TOML=$TOML"

@@ -6,3 +6,18 @@ members = ["mymitm", "mymitm-common"]
 [workspace.package]
 edition = "2021"
 license = "proprietary"
+
+# Hardened, minimal release: no symbol table, no debug info, size-optimized, and
+# abort-on-panic (no unwinding machinery). This strips the symbol/debug strings
+# that dominate `strings` output and cuts the binary roughly 3x. Application/std
+# string literals (including panic messages) inherently remain — removing those
+# needs a per-toolchain build-std flag that is not portable across nightlies.
+# The plain `release` profile is left untouched — it keeps symbols and is the
+# "regular" build. See docs/build-and-release.md.
+[profile.release-stripped]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -1,22 +1,25 @@
-name: CI & Release
+name: CI
 
-# Build + test on every push/PR; on a v* tag, also publish a GitHub Release
-# with the static musl binary attached.
+# Build + test on every push (to any branch except `release`, which is handled
+# by release.yml) and on PRs. This is the pipeline that must be green on the
+# default branch: it compiles the eBPF object, runs the unit tests, builds the
+# static musl release, and asserts the binary has zero shared-object deps.
 on:
   push:
-    branches: ["**"]
-    tags: ["v*"]
+    branches:
+      - '**'
+      - '!release'
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write # required for creating the Release on tag pushes
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -40,8 +43,8 @@ jobs:
             pkg-config \
             zlib1g-dev
 
-      # rust-toolchain.toml pins nightly + rust-src + the musl target;
-      # rustup honours it automatically. Install explicitly to be safe.
+      # rust-toolchain.toml pins nightly + rust-src + the musl target; install
+      # explicitly to be safe.
       - name: Install Rust toolchain
         run: |
           rustup toolchain install nightly --profile minimal --component rust-src --target x86_64-unknown-linux-musl
@@ -70,22 +73,22 @@ jobs:
       - name: Build release (static musl)
         run: cargo build -p mymitm --release
 
-      - name: Stage release asset
+      # The whole point of the musl build: a single self-contained binary. Fail
+      # the pipeline if the linker ever pulled in a shared-object dependency.
+      - name: Verify fully static (no shared-object deps)
         run: |
-          install -D -m 0755 \
-            target/x86_64-unknown-linux-musl/release/mymitm \
-            dist/mymitm-x86_64-unknown-linux-musl
-          sha256sum dist/mymitm-x86_64-unknown-linux-musl > dist/mymitm-x86_64-unknown-linux-musl.sha256
+          f=target/x86_64-unknown-linux-musl/release/mymitm
+          file "$f"
+          ldd "$f" 2>&1 || true
+          if readelf -d "$f" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "ERROR: binary has dynamic NEEDED dependencies — not fully static"
+            readelf -d "$f" | grep 'NEEDED'
+            exit 1
+          fi
+          echo "OK: statically linked, no NEEDED entries"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: mymitm-x86_64-unknown-linux-musl
-          path: dist/*
-
-      - name: Publish Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
+          path: target/x86_64-unknown-linux-musl/release/mymitm

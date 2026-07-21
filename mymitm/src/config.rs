@@ -32,10 +32,21 @@ struct FileCfg {
     #[serde(default = "d_mark")] fwmark: u32,
     #[serde(default = "d_dump")] dump_path: PathBuf,
     #[serde(default = "d_obj")] bpf_obj_name: String,
-    #[serde(default = "d_log")] log_level: String,
+    /// Log level for stdout and for the log file, independently. Both default to
+    /// "off" (the proxy is silent unless asked to log). RUST_LOG/tracing syntax:
+    /// off|error|warn|info|debug|trace, or targeted e.g. "mymitm=debug".
+    #[serde(default = "d_log_off")] stdout_log_level: String,
+    #[serde(default = "d_log_off")] file_log_level: String,
+    /// Where the file log is written (only when file_log_level != "off").
+    #[serde(default = "d_log_file")] log_file: PathBuf,
     #[serde(default)] data_plane: DataPlaneKind,
     #[serde(default)] attach_mode: AttachMode,
     #[serde(default)] server_name: Option<String>,
+    /// Preserve the client's source IP on the upstream leg (default true). Set
+    /// false to dial upstream with the box's own IP instead (standard proxy
+    /// behavior); the `--no-preserve-src-ip` CLI flag also forces this off.
+    #[serde(default = "d_preserve")] preserve_src_ip: bool,
+    #[serde(default = "d_ws_decode")] ws_decode: bool,
 }
 fn d_port() -> u16 { 443 }
 fn d_tun() -> String { "tun0".into() }
@@ -45,9 +56,12 @@ fn d_local_port() -> u16 { 8443 }
 fn d_mark() -> u32 { mymitm_common::DEFAULT_FWMARK }
 fn d_dump() -> PathBuf { "/var/tmp/mitm-dumps/".into() }
 fn d_obj() -> String { "mymitm".into() }
-fn d_log() -> String { "info".into() }
+fn d_log_off() -> String { "off".into() }
+fn d_log_file() -> PathBuf { "/var/tmp/mymitm.log".into() }
 fn d_cert() -> PathBuf { "/etc/mymitm/leaf.pem".into() }
 fn d_key() -> PathBuf { "/etc/mymitm/leaf.key".into() }
+fn d_preserve() -> bool { true }
+fn d_ws_decode() -> bool { true }
 
 #[derive(Parser, Debug)]
 #[command(version, about = "transparent TLS MITM with source-IP preservation")]
@@ -75,9 +89,24 @@ struct Cli {
     #[arg(long, value_enum, env = "MYMITM_ATTACH_MODE")] attach_mode: Option<AttachMode>,
     /// Override upstream SNI hostname
     #[arg(long = "server-name", env = "MYMITM_SERVER_NAME")] server_name: Option<String>,
+    /// Log level for stdout (off|error|warn|info|debug|trace or e.g. "mymitm=debug").
+    /// Default off — the proxy is silent unless this is set.
+    #[arg(long = "stdout-log-level", env = "MYMITM_STDOUT_LOG")] stdout_log_level: Option<String>,
+    /// Log level for the log file (same syntax). Default off.
+    #[arg(long = "file-log-level", env = "MYMITM_FILE_LOG")] file_log_level: Option<String>,
+    /// Path to the log file (used only when the file log level is not off).
+    #[arg(long = "log-file", env = "MYMITM_LOG_FILE")] log_file: Option<PathBuf>,
+    /// Disable source-IP preservation: dial the upstream with the box's own IP
+    /// instead of the client's. This is standard (non-transparent) proxy
+    /// behavior — the server then sees the box IP, not the client IP. Useful as
+    /// a negative control. Overrides `preserve_src_ip` in the config file.
+    #[arg(long = "no-preserve-src-ip", env = "MYMITM_NO_PRESERVE_SRC_IP", default_value_t = false)]
+    no_preserve_src_ip: bool,
     /// Reverse any leftover state (stale clsact qdisc / iproute rules) from a
     /// previous unclean exit, then continue startup.
     #[arg(long, default_value_t = false)] cleanup: bool,
+    /// Disable WebSocket decoding (kill-switch); raw dump is unaffected.
+    #[arg(long = "no-ws-decode", default_value_t = false)] no_ws_decode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,11 +124,15 @@ pub struct Settings {
     pub dump_path: PathBuf,
     pub bpf_obj_name: String,
     pub box_ip: Ipv4Addr,
-    pub log_level: String,
+    pub stdout_log_level: String,
+    pub file_log_level: String,
+    pub log_file: PathBuf,
     pub server_name: Option<String>,
     pub data_plane: DataPlaneKind,
     pub attach_mode: AttachMode,
+    pub preserve_src_ip: bool,
     pub cleanup: bool,
+    pub ws_decode: bool,
 }
 
 impl Settings {
@@ -126,11 +159,15 @@ impl Settings {
             dump_path: f.dump_path,
             bpf_obj_name: f.bpf_obj_name,
             box_ip: f.box_ip,
-            log_level: f.log_level,
+            stdout_log_level: f.stdout_log_level,
+            file_log_level: f.file_log_level,
+            log_file: f.log_file,
             server_name: f.server_name,
             data_plane: f.data_plane,
             attach_mode: f.attach_mode,
+            preserve_src_ip: f.preserve_src_ip,
             cleanup: false,
+            ws_decode: f.ws_decode,
         })
     }
 
@@ -148,7 +185,14 @@ impl Settings {
         if let Some(v) = cli.data_plane { s.data_plane = v; }
         if let Some(v) = cli.attach_mode { s.attach_mode = v; }
         if let Some(v) = cli.server_name { s.server_name = Some(v); }
+        if let Some(v) = cli.stdout_log_level { s.stdout_log_level = v; }
+        if let Some(v) = cli.file_log_level { s.file_log_level = v; }
+        if let Some(v) = cli.log_file { s.log_file = v; }
+        // The CLI flag is one-way: present => force preservation off. Absent
+        // leaves the config-file value (default true) untouched.
+        if cli.no_preserve_src_ip { s.preserve_src_ip = false; }
         s.cleanup = cli.cleanup;
+        if cli.no_ws_decode { s.ws_decode = false; }
         Ok(s)
     }
 
@@ -185,11 +229,15 @@ impl Settings {
             dump_path: PathBuf::from("/tmp"),
             bpf_obj_name: "mymitm".into(),
             box_ip: Ipv4Addr::new(192, 168, 1, 10),
-            log_level: "info".into(),
+            stdout_log_level: "off".into(),
+            file_log_level: "off".into(),
+            log_file: PathBuf::from("/var/tmp/mymitm.log"),
             server_name: None,
             data_plane: DataPlaneKind::Ebpf,
             attach_mode: AttachMode::Auto,
+            preserve_src_ip: true,
             cleanup: false,
+            ws_decode: true,
         }
     }
 }
@@ -231,6 +279,56 @@ mod tests {
         let s = Settings::from_toml_str(&toml).unwrap();
         assert!(matches!(s.data_plane, DataPlaneKind::IpRoute));
         assert!(matches!(s.attach_mode, AttachMode::Tc));
+    }
+
+    #[test]
+    fn preserve_src_ip_defaults_true_and_toml_can_disable() {
+        // Omitted -> preservation on (the product's whole point).
+        assert!(Settings::from_toml_str(base()).unwrap().preserve_src_ip);
+        // Explicit opt-out via the config file.
+        let toml = format!("{}\npreserve_src_ip = false", base());
+        assert!(!Settings::from_toml_str(&toml).unwrap().preserve_src_ip);
+    }
+
+    #[test]
+    fn cli_no_preserve_flag_parses() {
+        use clap::Parser;
+        let default = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert!(!default.no_preserve_src_ip, "flag defaults to false (preserve on)");
+        let off = Cli::try_parse_from(["mymitm", "--no-preserve-src-ip"]).unwrap();
+        assert!(off.no_preserve_src_ip, "flag present -> true (preserve off)");
+    }
+
+    #[test]
+    fn logging_defaults_off_and_overridable() {
+        // Both levels default to off; the log-file path has a sensible default.
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert_eq!(s.stdout_log_level, "off");
+        assert_eq!(s.file_log_level, "off");
+        assert_eq!(s.log_file, PathBuf::from("/var/tmp/mymitm.log"));
+        // The config file can raise either level and set the path.
+        let toml = format!(
+            "{}\nstdout_log_level = \"info\"\nfile_log_level = \"debug\"\nlog_file = \"/tmp/x.log\"",
+            base()
+        );
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert_eq!(s.stdout_log_level, "info");
+        assert_eq!(s.file_log_level, "debug");
+        assert_eq!(s.log_file, PathBuf::from("/tmp/x.log"));
+    }
+
+    #[test]
+    fn cli_log_args_parse() {
+        use clap::Parser;
+        let c = Cli::try_parse_from([
+            "mymitm",
+            "--stdout-log-level", "trace",
+            "--file-log-level", "info",
+            "--log-file", "/tmp/y.log",
+        ]).unwrap();
+        assert_eq!(c.stdout_log_level.as_deref(), Some("trace"));
+        assert_eq!(c.file_log_level.as_deref(), Some("info"));
+        assert_eq!(c.log_file.as_deref(), Some(std::path::Path::new("/tmp/y.log")));
     }
 
     #[test]
@@ -296,5 +394,25 @@ mod tests {
         assert!(matches!(c.data_plane, Some(DataPlaneKind::IpRoute)));
         assert!(matches!(c.attach_mode, Some(AttachMode::Tcx)));
         assert!(c.cleanup);
+    }
+
+    #[test]
+    fn ws_decode_defaults_true() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert!(s.ws_decode);
+    }
+
+    #[test]
+    fn ws_decode_can_be_disabled_in_file() {
+        let toml = format!("{}\nws_decode = false", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(!s.ws_decode);
+    }
+
+    #[test]
+    fn cli_no_ws_decode_flag_parses() {
+        use clap::Parser;
+        let c = Cli::try_parse_from(["mymitm", "--no-ws-decode"]).unwrap();
+        assert!(c.no_ws_decode);
     }
 }
