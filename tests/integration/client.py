@@ -23,6 +23,34 @@ REQUEST = b"PING-FROM-CLIENT"
 EXPECTED_RESPONSE = b"PONG-FROM-SERVER"
 
 
+def run_websocket(sock):
+    # Minimal hand-rolled WS client side (no external library): send the
+    # upgrade request, read the server's response, then send one masked
+    # "ping" text frame and drain until EOF before closing.
+    sock.sendall(
+        b"GET /ws HTTP/1.1\r\nHost: x\r\n"
+        b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    )
+    resp = sock.recv(4096)  # 101 response (often just this; pong may arrive separately)
+    print(f"WS_HANDSHAKE_RESPONSE={resp!r}", flush=True)
+    # client -> server masked text frame "ping"
+    mask = b"\x00\x00\x00\x00"  # zero mask: payload unchanged, still a valid masked frame
+    frame = bytes([0x81, 0x84]) + mask + b"ping"
+    sock.sendall(frame)
+
+    # Half-close our write side, then drain until EOF before closing. Without
+    # this we could close with the server's "pong" frame still unread, which
+    # triggers a Linux RST on close — and that RST can race with (and drop)
+    # the proxy's not-yet-read "ping" frame before it forwards it upstream.
+    sock.settimeout(2)
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        while sock.recv(4096):
+            pass
+    except OSError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cafile", required=True, help="genuine leaf cert, trusted as CA")
@@ -31,6 +59,8 @@ def main():
     ap.add_argument("--server-name", default="server.test", help="SNI / cert CN to verify")
     ap.add_argument("--bind-addr", default=None,
                     help="source IP to bind before connect (multi-client test)")
+    ap.add_argument("--websocket", action="store_true",
+                    help="run a WS upgrade + frame exchange instead of the PING/PONG request")
     args = ap.parse_args()
 
     # Real cert verification: trust ONLY the genuine leaf cert.
@@ -59,6 +89,12 @@ def main():
 
     peer_cert = tls.getpeercert()
     print(f"HANDSHAKE_OK peer_cert_subject={peer_cert.get('subject')}", flush=True)
+
+    if args.websocket:
+        run_websocket(tls)
+        tls.close()
+        print("WEBSOCKET_OK", flush=True)
+        return 0
 
     tls.sendall(REQUEST)
     resp = tls.recv(4096)

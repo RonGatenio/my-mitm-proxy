@@ -4,6 +4,7 @@ mod dataplane;
 mod dump;
 mod iproute;
 mod proxy;
+mod ws;
 
 use std::sync::Arc;
 
