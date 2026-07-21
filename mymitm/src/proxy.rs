@@ -269,7 +269,8 @@ async fn handle_conn(
         }
     }
 
-    conn.finish(&s.dump_path);
+    // Task 8 replaces this placeholder with the live WsTap::finalize() status.
+    conn.finish(&s.dump_path, &crate::ws::WsStatus::none());
     Ok(())
 }
 
