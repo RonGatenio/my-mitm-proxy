@@ -10,10 +10,15 @@ pub trait DataPlane: Send + Sync {
     fn upstream_socket(&self, client_ip: Ipv4Addr, server: SocketAddrV4) -> io::Result<TcpStream>;
 }
 
-/// Plain `connect()` with no source-IP preservation. Used by the loopback proxy
-/// unit test (no kernel plumbing) and as a `--data-plane`-less debug path.
+/// Plain `connect()` with no source-IP preservation — a test-only `DataPlane`
+/// for the loopback proxy tests, which exercise terminate/dial/pump/dump with no
+/// kernel plumbing. It is not wired to any `DataPlaneKind` variant, so it is
+/// compiled only under `cfg(test)`; add a `DataPlaneKind` variant in `config.rs`
+/// if a runtime debug plane is ever wanted.
+#[cfg(test)]
 pub struct DirectPlane;
 
+#[cfg(test)]
 impl DataPlane for DirectPlane {
     fn upstream_socket(&self, _client_ip: Ipv4Addr, server: SocketAddrV4) -> io::Result<TcpStream> {
         let s = TcpStream::connect(server)?;

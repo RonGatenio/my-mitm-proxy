@@ -28,7 +28,6 @@ use std::{
 
 use anyhow::{anyhow, Context as _};
 
-const EBPF_PKG: &str = "mymitm-ebpf";
 const EBPF_BIN: &str = "mymitm"; // [[bin]] name in mymitm-ebpf/Cargo.toml
 const EBPF_MANIFEST: &str = "../mymitm-ebpf/Cargo.toml";
 

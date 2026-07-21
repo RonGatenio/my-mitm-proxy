@@ -1,8 +1,17 @@
 //! eBPF lifecycle (userspace side).
 //!
-//! `BpfPlane::load_and_attach` loads the embedded eBPF object with CO-RE
-//! (`EbpfLoader` default → relocates against `/sys/kernel/btf/vmlinux`),
-//! populates the single-entry `CONFIG` map, and attaches all four classifiers.
+//! `BpfPlane::load_and_attach` loads the embedded eBPF object, populates the
+//! single-entry `CONFIG` map, and attaches all four classifiers.
+//!
+//! ## No CO-RE / kernel BTF required
+//! The object carries **no CO-RE relocations**: all packet access uses fixed
+//! byte offsets, and the one kernel-struct read (`__sk_buff.mark`) is against a
+//! UAPI-stable ABI struct whose field offsets never move. So no kernel (vmlinux)
+//! BTF is needed. `EbpfLoader`'s default still probes `/sys/kernel/btf/vmlinux`,
+//! but a missing file is harmless — nothing consumes it, so no relocation step
+//! ever runs. The only BTF that can affect the load is the object's *own*
+//! `.BTF`/`.BTF.ext`, which is stripped on kernels lacking `btf_func` (see
+//! `load_and_attach`).
 //!
 //! ## Attach mode: TCX vs legacy clsact+tc (`Settings.attach_mode`)
 //! Attachment honors `attach_mode` so the same binary works from kernel 4.15
@@ -86,8 +95,8 @@ pub struct BpfPlane {
 }
 
 impl BpfPlane {
-    /// Load the embedded object with CO-RE, populate `CONFIG`, init aya-log
-    /// (best-effort), and attach all four classifiers via TCX.
+    /// Load the embedded object, populate `CONFIG`, init aya-log (best-effort),
+    /// and attach all four classifiers (TCX or clsact+tc per `attach_mode`).
     pub fn load_and_attach(s: &Settings) -> anyhow::Result<BpfPlane> {
         // Kernels < 5.11 charge BPF map/program memory against RLIMIT_MEMLOCK
         // (5.11+ switched to memcg accounting). Raise it before creating any map,
@@ -437,7 +446,7 @@ fn strip_btf_sections(elf: &[u8]) -> Vec<u8> {
         for section in obj.sections() {
             if let Ok(name) = section.name() {
                 if name == ".BTF" || name == ".BTF.ext" {
-                    let (off, size) = (section.file_range().unwrap_or((0, 0)));
+                    let (off, size) = section.file_range().unwrap_or((0, 0));
                     let start = off as usize;
                     let end = start + size as usize;
                     if end <= out.len() {

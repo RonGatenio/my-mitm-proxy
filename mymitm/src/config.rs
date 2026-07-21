@@ -31,7 +31,6 @@ struct FileCfg {
     #[serde(default = "d_local_port")] local_port: u16,
     #[serde(default = "d_mark")] fwmark: u32,
     #[serde(default = "d_dump")] dump_path: PathBuf,
-    #[serde(default = "d_obj")] bpf_obj_name: String,
     /// Log level for stdout and for the log file, independently. Both default to
     /// "off" (the proxy is silent unless asked to log). RUST_LOG/tracing syntax:
     /// off|error|warn|info|debug|trace, or targeted e.g. "mymitm=debug".
@@ -55,7 +54,6 @@ fn d_local_ip() -> Ipv4Addr { Ipv4Addr::new(127,0,0,1) }
 fn d_local_port() -> u16 { 8443 }
 fn d_mark() -> u32 { mymitm_common::DEFAULT_FWMARK }
 fn d_dump() -> PathBuf { "/var/tmp/mitm-dumps/".into() }
-fn d_obj() -> String { "mymitm".into() }
 fn d_log_off() -> String { "off".into() }
 fn d_log_file() -> PathBuf { "/var/tmp/mymitm.log".into() }
 fn d_cert() -> PathBuf { "/etc/mymitm/leaf.pem".into() }
@@ -122,7 +120,6 @@ pub struct Settings {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub dump_path: PathBuf,
-    pub bpf_obj_name: String,
     pub box_ip: Ipv4Addr,
     pub stdout_log_level: String,
     pub file_log_level: String,
@@ -157,7 +154,6 @@ impl Settings {
             cert_path: f.cert_path,
             key_path: f.key_path,
             dump_path: f.dump_path,
-            bpf_obj_name: f.bpf_obj_name,
             box_ip: f.box_ip,
             stdout_log_level: f.stdout_log_level,
             file_log_level: f.file_log_level,
@@ -227,7 +223,6 @@ impl Settings {
             cert_path: PathBuf::from("/x/leaf.pem"),
             key_path: PathBuf::from("/x/leaf.key"),
             dump_path: PathBuf::from("/tmp"),
-            bpf_obj_name: "mymitm".into(),
             box_ip: Ipv4Addr::new(192, 168, 1, 10),
             stdout_log_level: "off".into(),
             file_log_level: "off".into(),
