@@ -41,10 +41,14 @@ dump_path = "/var/tmp/mitm-dumps"
 
 # Preserve the client's source IP on the upstream leg (the proxy dials the real
 # server as if it were the client). Default true. Set false — or pass
-# --no-preserve-src-ip — to dial with the box's own IP instead (standard proxy
+# --preserve-src-ip=false — to dial with the box's own IP instead (standard proxy
 # behavior); the server then sees box_ip, not the client. Useful as a negative
 # control to confirm preservation is what changes the source IP.
 # preserve_src_ip = true
+
+# Decode intercepted WebSocket traffic (in addition to the raw byte dump).
+# Default true. Set false — or pass --ws-decode=false — to skip decoding.
+# ws_decode = true
 
 # Optional: SNI hostname to send in the upstream TLS ClientHello.
 # If unset, the server IP string is used (works if the server accepts IP SNI).
