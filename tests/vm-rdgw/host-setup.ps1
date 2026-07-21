@@ -111,9 +111,11 @@ Say "B seed: $SeedIso"
 # ---- 5. B VM (Debian, Gen2) ----------------------------------------------------
 if (-not (Get-VM -Name rdgw-B -ErrorAction SilentlyContinue)){
   Copy-Item $BBaseVhdx $BVhdx -Force
-  New-VM -Name rdgw-B -Generation 2 -MemoryStartupBytes 1GB -VHDPath $BVhdx -SwitchName $SwLeft | Out-Null
+  # Gen1 / BIOS on purpose: Debian cloud images boot reliably under BIOS (matches the
+  # tests/vm QEMU harness). Gen2/UEFI can leave B powered-on but unbooted (no bootloader
+  # found -> no IP, ARP unreachable). fix-b-gen1.ps1 rebuilds an existing B this way.
+  New-VM -Name rdgw-B -Generation 1 -MemoryStartupBytes 1GB -VHDPath $BVhdx -SwitchName $SwLeft | Out-Null
   Set-VMProcessor rdgw-B -Count 2
-  Set-VMFirmware rdgw-B -EnableSecureBoot Off
   # NIC 1 -> left0 on rdgw-left ; NIC 2 -> right0 on rdgw-right
   $a=Get-VMNetworkAdapter -VMName rdgw-B | Select-Object -First 1
   Rename-VMNetworkAdapter -VMNetworkAdapter $a -NewName left0

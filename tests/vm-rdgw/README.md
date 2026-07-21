@@ -104,6 +104,10 @@ VM disks + ISOs live under `C:\Users\RonGatenio\rdgw-lab\` (outside the repo).
 
 ## Caveats / likely iteration points
 
+- **B must be Gen1/BIOS**: `host-setup.ps1` creates B as Generation 1. Debian cloud images
+  boot reliably under BIOS (as in the `tests/vm` QEMU harness); Gen2/UEFI can leave B
+  powered-on but unbooted — no IP, host ARP for 10.20.1.1 shows Unreachable. `fix-b-gen1.ps1`
+  rebuilds an existing B as Gen1, reusing the same disk + seed.
 - **B interface rename**: Debian's cloud-init renderer may not honor `set-name` to
   left0/right0. `b-deploy.ps1` resolves the real names by MAC and writes the TOML to match,
   so this is handled — but if B has no IPs at all, cloud-init didn't apply the net config
