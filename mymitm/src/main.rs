@@ -3,6 +3,7 @@ mod config;
 mod dataplane;
 mod dump;
 mod iproute;
+mod ntlm;
 mod proxy;
 mod ws;
 
