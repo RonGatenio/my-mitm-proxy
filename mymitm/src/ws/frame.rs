@@ -68,10 +68,6 @@ pub fn parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
             buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
         ]);
         header += 8;
-        // A length that overflows usize can never be satisfied; treat as protocol error.
-        if n > usize::MAX as u64 {
-            return Err(FrameError::BadControlFrame);
-        }
         n as usize
     };
 
@@ -81,12 +77,13 @@ pub fn parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
     }
 
     let mask_key_len = if masked { 4 } else { 0 };
-    let total = header + mask_key_len + payload_len;
-    if buf.len() < total {
-        return Ok(None);
+    let overhead = header + mask_key_len; // small (<= 14), cannot overflow
+    if buf.len() < overhead || payload_len > buf.len() - overhead {
+        return Ok(None); // not all bytes buffered yet (also handles absurd lengths safely)
     }
+    let total = overhead + payload_len; // safe: payload_len <= buf.len() - overhead
 
-    let mut payload = buf[header + mask_key_len..total].to_vec();
+    let mut payload = buf[overhead..total].to_vec();
     if masked {
         let key = &buf[header..header + 4];
         for (i, b) in payload.iter_mut().enumerate() {
@@ -203,5 +200,14 @@ mod tests {
         assert_eq!(f.payload, b"aa");
         let (f2, _) = parse_frame(&raw[consumed..]).unwrap().unwrap();
         assert_eq!(f2.payload, b"bb");
+    }
+
+    #[test]
+    fn huge_extended_length_does_not_panic() {
+        // 10-byte header: FIN=1, binary(0x2), unmasked, len7=127, length=u64::MAX, no payload.
+        let mut raw = vec![0x82u8, 0x7F];
+        raw.extend_from_slice(&u64::MAX.to_be_bytes());
+        // Must NOT panic; u64::MAX bytes aren't buffered, so this is "need more".
+        assert_eq!(parse_frame(&raw), Ok(None));
     }
 }
