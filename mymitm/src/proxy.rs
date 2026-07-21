@@ -239,7 +239,8 @@ async fn handle_conn(
     // path — making them truly async is a tracked follow-up, out of scope here.
     let server_sa = SocketAddr::from((s.server_ip, s.server_port));
     let mut conn = dumper.open_conn(peer, server_sa);
-    let mut tap: Option<WsTap> = if s.ws_decode { Some(WsTap::new()) } else { None };
+    // The WS tap feeds .ws.jsonl, a raw-dump artifact — skip it in NTLM-only mode.
+    let mut tap: Option<WsTap> = if s.raw_dump && s.ws_decode { Some(WsTap::new()) } else { None };
     let mut ws_out: Vec<WsMessage> = Vec::new();
     let (mut cr, mut cw) = tokio::io::split(client_tls);
     let (mut sr, mut sw) = tokio::io::split(server_tls);
@@ -362,7 +363,7 @@ mod tests {
 
         // ---- proxy ----
         let dump_dir = dir.path().join("dumps");
-        let dumper = Arc::new(Dumper::new(&dump_dir).unwrap());
+        let dumper = Arc::new(Dumper::new(&dump_dir, crate::dump::DumpOptions::default()).unwrap());
         let server_v4 = match server_addr.ip() {
             std::net::IpAddr::V4(v4) => v4,
             _ => unreachable!(),
@@ -493,7 +494,7 @@ mod tests {
         });
 
         let dump_dir = dir.path().join("dumps");
-        let dumper = Arc::new(Dumper::new(&dump_dir).unwrap());
+        let dumper = Arc::new(Dumper::new(&dump_dir, crate::dump::DumpOptions::default()).unwrap());
         let server_v4 = match server_addr.ip() { std::net::IpAddr::V4(v4) => v4, _ => unreachable!() };
         let mut settings = settings_for(&cert, &key, server_v4);
         settings.server_port = server_addr.port();
