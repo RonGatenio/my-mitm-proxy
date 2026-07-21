@@ -212,6 +212,69 @@ impl BpfPlane {
     }
 }
 
+/// Preflight check: confirm the running kernel can load, verify, AND attach our
+/// tc-classifiers, before we touch the real interfaces. Runs a full dry-run of the
+/// load+attach path against `lo` and tears it down. Returns a stage-tagged error
+/// (`[load]` / `[verifier]` / `[attach]`) with an actionable hint if eBPF is
+/// unusable on this kernel.
+///
+/// Safety on `lo`: `CONFIG` is intentionally left unpopulated, so it reads back
+/// all-zero; with `server_ip`/`server_port` == 0 the classifiers match no real
+/// loopback packet, and every classifier returns `TC_ACT_OK` on all paths — so the
+/// momentary attach can neither drop nor rewrite loopback traffic.
+pub fn probe_ebpf_support(s: &Settings) -> anyhow::Result<()> {
+    let krel = kernel_release();
+
+    // Stage 1: load — memlock, (maybe) BTF strip, EbpfLoader::load, map creation.
+    let mut ebpf = load_object().map_err(|e| {
+        anyhow::anyhow!(
+            "eBPF unusable [load]: {e}. Kernel may lack CONFIG_BPF_SYSCALL or BTF support."
+        )
+    })?;
+
+    // Stage 2: verifier — load ALL four classifiers so this kernel's verifier is
+    // exercised against every program (attach below only exercises one).
+    for (name, _, _) in PROGRAMS {
+        let prog: &mut SchedClassifier = ebpf
+            .program_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("program {name} not found in eBPF object"))?
+            .try_into()?;
+        prog.load().map_err(|e| {
+            anyhow::anyhow!(
+                "eBPF unusable [verifier]: program {name} rejected on kernel {krel}: {e}"
+            )
+        })?;
+    }
+
+    // Stage 3: attach — one classifier to `lo`, honoring attach_mode (Auto tries
+    // TCX then falls back to clsact+tc, reproducing the real path). This is where a
+    // missing cls_bpf / clsact surfaces.
+    let prog: &mut SchedClassifier = ebpf
+        .program_mut("cls_tun_ingress")
+        .ok_or_else(|| anyhow::anyhow!("program cls_tun_ingress not found in eBPF object"))?
+        .try_into()?;
+    let used_tc = attach_one(prog, "lo", TcAttachType::Ingress, s.attach_mode).map_err(|e| {
+        anyhow::anyhow!(
+            "eBPF unusable [attach]: tc/clsact attach on lo failed: {e}. Kernel likely lacks \
+             CONFIG_NET_CLS_BPF and/or clsact (CONFIG_NET_SCH_INGRESS). Rerun with \
+             --data-plane iproute."
+        )
+    })?;
+
+    // Stage 4: teardown. Dropping `ebpf` releases TCX links (auto-detach) and frees
+    // the maps; the legacy tc path additionally needs its clsact qdisc removed.
+    drop(ebpf);
+    if used_tc {
+        teardown_tc("lo");
+    }
+
+    tracing::info!(
+        "eBPF support confirmed (kernel {krel}, attach path: {})",
+        if used_tc { "tc" } else { "tcx" }
+    );
+    Ok(())
+}
+
 /// Attach one classifier honoring the requested mode. Returns `true` if it was
 /// attached via the legacy clsact/tc path (so `Drop` knows to remove the qdisc).
 ///
@@ -439,6 +502,22 @@ fn raise_memlock_rlimit() {
     }
 }
 
+/// Best-effort kernel release string (e.g. "5.10.0-21-amd64") via `uname(2)`, for
+/// diagnostics. Returns "unknown" if the syscall fails. `libc` is already a dep.
+fn kernel_release() -> String {
+    // SAFETY: `uts` is a POD struct that `uname` fully fills on success; we read
+    // the NUL-terminated `release` field only after checking the return code.
+    unsafe {
+        let mut uts: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut uts) != 0 {
+            return "unknown".to_string();
+        }
+        std::ffi::CStr::from_ptr(uts.release.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 /// Return a copy of the ELF bytes with the `.BTF` and `.BTF.ext` sections
 /// zeroed out. Used on kernels where basic BTF is available but `btf_func` is
 /// not (e.g. 4.14–4.17): aya normally sanitises the object BTF and then passes
@@ -627,5 +706,26 @@ mod tests {
 
         run_ip(&["link", "del", "mmtun0"]);
         run_ip(&["link", "del", "mmeth0"]);
+    }
+
+    // Privileged: the preflight probe must succeed on a kernel that supports our
+    // data plane, and must leave NO clsact qdisc behind on `lo` (teardown check).
+    // Run: sudo -E env "PATH=$PATH" cargo test -p mymitm probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_reports_support_and_leaves_lo_clean() {
+        let s = Settings::test_default();
+        probe_ebpf_support(&s).expect("probe_ebpf_support should succeed on this kernel");
+        // The probe must not leave a clsact qdisc on lo (TCX leaves nothing; the
+        // tc path must have torn its qdisc down).
+        let out = Command::new("tc")
+            .args(["qdisc", "show", "dev", "lo"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("clsact"),
+            "probe must leave no clsact qdisc on lo"
+        );
+        println!("PROBE_OK");
     }
 }
