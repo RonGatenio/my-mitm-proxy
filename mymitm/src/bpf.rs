@@ -94,46 +94,56 @@ pub struct BpfPlane {
     egress_map: Mutex<AyaHashMap<MapData, u16, u32>>,
 }
 
+/// Load the embedded eBPF object into the kernel: raise `RLIMIT_MEMLOCK`, detect
+/// `btf_func` support and strip `.BTF`/`.BTF.ext` when absent, then load with a
+/// VERBOSE verifier log. Shared head of `load_and_attach` and `probe_ebpf_support`
+/// so the two cannot drift. Returns the loaded (not-yet-attached) object; maps are
+/// created here and freed when the returned `Ebpf` drops.
+fn load_object() -> anyhow::Result<Ebpf> {
+    // Kernels < 5.11 charge BPF map/program memory against RLIMIT_MEMLOCK
+    // (5.11+ switched to memcg accounting). Raise it before creating any map,
+    // or map creation fails with EPERM on 4.15/5.10 — see raise_memlock_rlimit.
+    raise_memlock_rlimit();
+
+    // Detect whether the running kernel supports BTF function annotations
+    // (btf_func, added in kernel 4.18). On kernels 4.14–4.17, `is_btf_supported()`
+    // returns true (basic BTF works) but `btf_func` is false. Aya then:
+    //   (a) sanitises the object's BTF (FUNC→TYPEDEF, FUNC_PROTO→ENUM),
+    //   (b) uploads that sanitised BTF to the kernel (succeeds),
+    //   (c) sets prog_btf_fd + func_info in BPF_PROG_LOAD.
+    // The kernel rejects BPF_PROG_LOAD because func_info type_ids now resolve to
+    // TYPEDEF (not FUNC), returning EINVAL with an empty verifier log.
+    //
+    // Fix: when btf_func is not supported, zero out the .BTF and .BTF.ext sections
+    // from the in-memory ELF bytes before handing them to EbpfLoader. This prevents
+    // aya from ever finding func_info. Our object has NO CO-RE relocations, so
+    // stripping BTF is safe — the programs load and run identically without it.
+    let btf_func_ok = aya::features().btf().map(|f| f.btf_func()).unwrap_or(false);
+
+    const EBPF_OBJ: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/mymitm"));
+    let obj_bytes: std::borrow::Cow<'static, [u8]> = if !btf_func_ok {
+        tracing::info!(
+            "kernel does not support btf_func; stripping .BTF/.BTF.ext from eBPF object \
+             (safe: no CO-RE in our object)"
+        );
+        std::borrow::Cow::Owned(strip_btf_sections(EBPF_OBJ))
+    } else {
+        std::borrow::Cow::Borrowed(EBPF_OBJ)
+    };
+
+    // VerifierLogLevel::VERBOSE gives us the full verifier log on load failures
+    // (important for old kernels where the error message may otherwise be empty).
+    let ebpf = EbpfLoader::new()
+        .verifier_log_level(VerifierLogLevel::VERBOSE)
+        .load(&obj_bytes)?;
+    Ok(ebpf)
+}
+
 impl BpfPlane {
     /// Load the embedded object, populate `CONFIG`, init aya-log (best-effort),
     /// and attach all four classifiers (TCX or clsact+tc per `attach_mode`).
     pub fn load_and_attach(s: &Settings) -> anyhow::Result<BpfPlane> {
-        // Kernels < 5.11 charge BPF map/program memory against RLIMIT_MEMLOCK
-        // (5.11+ switched to memcg accounting). Raise it before creating any map,
-        // or map creation fails with EPERM on 4.15/5.10 — see raise_memlock_rlimit.
-        raise_memlock_rlimit();
-
-        // Detect whether the running kernel supports BTF function annotations
-        // (btf_func, added in kernel 4.18). On kernels 4.14–4.17, `is_btf_supported()`
-        // returns true (basic BTF works) but `btf_func` is false. Aya then:
-        //   (a) sanitises the object's BTF (FUNC→TYPEDEF, FUNC_PROTO→ENUM),
-        //   (b) uploads that sanitised BTF to the kernel (succeeds),
-        //   (c) sets prog_btf_fd + func_info in BPF_PROG_LOAD.
-        // The kernel rejects BPF_PROG_LOAD because func_info type_ids now resolve to
-        // TYPEDEF (not FUNC), returning EINVAL with an empty verifier log.
-        //
-        // Fix: when btf_func is not supported, zero out the .BTF and .BTF.ext sections
-        // from the in-memory ELF bytes before handing them to EbpfLoader. This prevents
-        // aya from ever finding func_info. Our object has NO CO-RE relocations, so
-        // stripping BTF is safe — the programs load and run identically without it.
-        let btf_func_ok = aya::features().btf().map(|f| f.btf_func()).unwrap_or(false);
-
-        const EBPF_OBJ: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/mymitm"));
-        let obj_bytes: std::borrow::Cow<'static, [u8]> = if !btf_func_ok {
-            tracing::info!(
-                "kernel does not support btf_func; stripping .BTF/.BTF.ext from eBPF object \
-                 (safe: no CO-RE in our object)"
-            );
-            std::borrow::Cow::Owned(strip_btf_sections(EBPF_OBJ))
-        } else {
-            std::borrow::Cow::Borrowed(EBPF_OBJ)
-        };
-
-        // VerifierLogLevel::VERBOSE gives us the full verifier log on load failures
-        // (important for old kernels where the error message may otherwise be empty).
-        let mut ebpf = EbpfLoader::new()
-            .verifier_log_level(VerifierLogLevel::VERBOSE)
-            .load(&obj_bytes)?;
+        let mut ebpf = load_object()?;
 
         // aya-log is best-effort: if the eBPF side emits no log map, init returns
         // an error we deliberately ignore so it never fails startup.
