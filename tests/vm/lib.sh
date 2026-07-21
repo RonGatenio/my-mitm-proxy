@@ -30,12 +30,14 @@ VMLINUZ_510="$LVH_DIR/$LVH_TAG_510/boot/vmlinuz-$KVER_510"
 MODS_PARENT_510="$LVH_DIR/$LVH_TAG_510/lib/modules"   # contains <KVER_510>/
 
 # --- topology constants ----------------------------------------------------
-BR_LEFT=br-left
-BR_RIGHT=br-right
-TAP_AL=tap-al      # A  data  -> br-left
-TAP_BL=tap-bl      # B  left  -> br-left
-TAP_BR=tap-br      # B  right -> br-right
-TAP_CR=tap-cr      # C  data  -> br-right
+# Host-global iface names are env-overridable so a second checkout can run
+# concurrently on the same host without colliding (defaults unchanged).
+BR_LEFT="${BR_LEFT:-br-left}"
+BR_RIGHT="${BR_RIGHT:-br-right}"
+TAP_AL="${TAP_AL:-tap-al}"      # A  data  -> br-left
+TAP_BL="${TAP_BL:-tap-bl}"      # B  left  -> br-left
+TAP_BR="${TAP_BR:-tap-br}"      # B  right -> br-right
+TAP_CR="${TAP_CR:-tap-cr}"      # C  data  -> br-right
 
 A_IP=10.10.1.10
 B_LEFT_IP=10.10.1.1
@@ -53,7 +55,7 @@ MAC_A_CTRL=52:54:00:00:00:0a; MAC_A_DATA=52:54:00:00:01:0a
 MAC_B_CTRL=52:54:00:00:00:0b; MAC_B_LEFT=52:54:00:00:01:0b; MAC_B_RIGHT=52:54:00:00:02:0b
 MAC_C_CTRL=52:54:00:00:00:0c; MAC_C_DATA=52:54:00:00:02:0c
 
-SSH_PORT_A=2201; SSH_PORT_B=2202; SSH_PORT_C=2203
+SSH_PORT_A="${SSH_PORT_A:-2201}"; SSH_PORT_B="${SSH_PORT_B:-2202}"; SSH_PORT_C="${SSH_PORT_C:-2203}"
 
 # Maintained "current" cloud images (bionic kernel == 4.15).
 URL_BIONIC="https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img"
