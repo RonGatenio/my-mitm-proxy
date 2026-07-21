@@ -520,7 +520,11 @@ def _parse_requests(c2s: bytes) -> List[Message]:
         elif isinstance(ev, h11.EndOfMessage):
             if cur is not None:
                 out.append(cur); cur = None
+            # Advance our (server) state with a synthetic response so h11 will
+            # permit the next cycle and we can parse further pipelined requests.
             try:
+                conn.send(h11.Response(status_code=200, headers=[("Content-Length", "0")]))
+                conn.send(h11.EndOfMessage())
                 conn.start_next_cycle()
             except h11.LocalProtocolError:
                 break
@@ -841,6 +845,10 @@ def status_for(exp, act):
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")   # robust on non-UTF-8 consoles
+    except Exception:
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--results", required=True)
@@ -1878,6 +1886,10 @@ def validate_headers(method, url, headers, body):
         return False
     parsed = _parse_authz(authz)
     signed = parsed["SignedHeaders"].split(";")
+    # SigV4 signs `host` as the URL authority; it may not appear as a literal
+    # header in the captured set, so derive it from the request URL when absent.
+    if "host" not in low:
+        low["host"] = urlsplit(url).netloc
     rebuilt = {h: low.get(h) for h in signed}
     if any(v is None for v in rebuilt.values()):
         return False

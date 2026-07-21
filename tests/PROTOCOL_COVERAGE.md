@@ -1,9 +1,12 @@
 # mymitmproxy — Network Protocol Test Coverage & Plan
 
-_Status: PLAN (2026-07-21). This is the agreed test plan; no protocol test code has been
-written yet. It explains the **existing** test suite and specifies the **new**
-application-protocol coverage we intend to add. It incorporates two research passes — a
-survey of mitmproxy's protocol coverage/tests, and a web-protocol + TLS-feature survey._
+_Status: P0 IMPLEMENTED (2026-07-21). The P0 harness (§13) ships under
+`tests/integration/protocols/` — matrix driver, dump-parser library, and the green-today
+rows (HTTP/1.x, keep-alive, streaming, pump, SSE, SigV4, pinning, lifecycle). All runs
+collect dumps + report into `tests/reports/`. P1/P2 remain planned. This doc explains the
+existing suite and specifies the full application-protocol coverage; it incorporates two
+research passes — a survey of mitmproxy's coverage/tests, and a web-protocol + TLS-feature
+survey._
 
 ---
 

@@ -92,6 +92,15 @@ SSH_OPTS=(-i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/n
 
 vm_ssh() { local vm="$1"; shift; ssh "${SSH_OPTS[@]}" -p "$(ssh_port_for "$vm")" ubuntu@127.0.0.1 "$@"; }
 vm_scp() { local vm="$1" src="$2" dst="$3"; scp "${SSH_OPTS[@]}" -P "$(ssh_port_for "$vm")" "$src" "ubuntu@127.0.0.1:$dst"; }
+vm_scp_from() { local vm="$1" src="$2" dst="$3"; scp "${SSH_OPTS[@]}" -P "$(ssh_port_for "$vm")" "ubuntu@127.0.0.1:$src" "$dst"; }
+
+# --- report folder (shared location with the netns matrix) -----------------
+REPORT_DIR="${REPORT_DIR:-$REPO_ROOT/tests/reports}"
+report_run_dir() {  # <suite> <mode> ; echoes the created run dir
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  local dir="$REPORT_DIR/$1-$2-$ts"; mkdir -p "$dir/dumps" "$dir/logs"
+  echo "$1-$2-$ts" > "$REPORT_DIR/LATEST"; echo "$dir"
+}
 
 # Resolve the current kernel iface name carrying a given MAC on a VM.
 vm_iface_by_mac() {  # vm_iface_by_mac <vm> <mac>
