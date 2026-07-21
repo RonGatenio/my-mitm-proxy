@@ -18,6 +18,23 @@ EXPECTED_REQUEST = b"PING-FROM-CLIENT"
 RESPONSE_BODY = b"PONG-FROM-SERVER"
 
 
+def serve_websocket(conn, first_data: bytes):
+    # first_data already contains the client's GET upgrade request headers
+    # (the caller already sniffed it to decide to dispatch here); nothing
+    # more to parse from it for this fixed exchange.
+    conn.sendall(
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    )
+    # server -> client text frame "pong" (fin=1, opcode=text=0x1, unmasked, len=4)
+    conn.sendall(bytes([0x81, 0x04]) + b"pong")
+    # read one client frame (masked "ping") and stop
+    try:
+        conn.recv(1024)
+    except OSError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cert", required=True)
@@ -58,7 +75,10 @@ def main():
         try:
             data = tls.recv(4096)
             print(f"[fake_server] recv {data!r}", flush=True)
-            tls.sendall(RESPONSE_BODY)
+            if b"upgrade: websocket" in data.lower():
+                serve_websocket(tls, data)
+            else:
+                tls.sendall(RESPONSE_BODY)
         except OSError as e:
             print(f"[fake_server] io error: {e}", flush=True)
         finally:
