@@ -3,7 +3,7 @@
 //! `WsMessage`s from `out`; `finalize` returns the terminal `WsStatus`. Parse-or-
 //! skip: on any unparseable input the tap becomes `Undecodable` and stops.
 
-use flate2::Decompress;
+use flate2::{Decompress, FlushDecompress, Status};
 
 use super::{Opcode, WsKind, WsMessage, WsStatus};
 use crate::ws::frame::{parse_frame, Frame, FrameError};
@@ -240,6 +240,9 @@ impl WsTap {
             if dir.frag_opcode.is_none() {
                 return self.bail("bad-frame"); // continuation without a start
             }
+            if frame.rsv1 {
+                return self.bail("bad-frame"); // RSV1 (RFC 7692 §7.2.3.1) is first-frame-only
+            }
             dir.frag_payload.extend_from_slice(&frame.payload);
         }
 
@@ -252,19 +255,37 @@ impl WsTap {
         }
     }
 
-    /// Finish the in-progress message for a direction: (Task 5 adds inflation).
+    /// Finish the in-progress message for a direction, inflating it first if it
+    /// was sent with permessage-deflate (RSV1 on the first frame).
     fn complete_message(&mut self, from_client: bool, out: &mut Vec<WsMessage>) {
+        let no_ctx = if from_client {
+            self.neg.client_no_context_takeover
+        } else {
+            self.neg.server_no_context_takeover
+        };
         let dir = if from_client { &mut self.c2s } else { &mut self.s2c };
         let opcode_raw = dir.frag_opcode.take().unwrap();
         let compressed = dir.frag_compressed;
-        let payload = std::mem::take(&mut dir.frag_payload);
+        let raw = std::mem::take(&mut dir.frag_payload);
         dir.frag_compressed = false;
 
-        // Task 4: no deflate negotiated in tests, so compressed is always false here.
-        // Task 5 replaces this block with inflation when `compressed` is true.
-        if compressed {
-            return self.bail("inflate-error"); // placeholder until Task 5
-        }
+        let payload = if compressed {
+            if dir.inflater.is_none() {
+                dir.inflater = Some(Decompress::new(false)); // raw deflate
+            }
+            let dec = dir.inflater.as_mut().unwrap();
+            match inflate_message(dec, &raw, MAX_MESSAGE) {
+                Ok(p) => {
+                    if no_ctx {
+                        dec.reset(false);
+                    }
+                    p
+                }
+                Err(reason) => return self.bail(reason),
+            }
+        } else {
+            raw
+        };
 
         let opcode = if opcode_raw == 0x1 { Opcode::Text } else { Opcode::Binary };
         out.push(WsMessage { from_client, opcode, payload });
@@ -288,10 +309,153 @@ impl WsTap {
     }
 }
 
+/// Inflate one permessage-deflate message. `compressed` is the reassembled
+/// payload WITHOUT the sync trailer, which we append here (RFC 7692 §7.2.2).
+/// `dec` persists across calls so the LZ77 window carries over (context
+/// takeover). Returns `Err("oversize")` / `Err("inflate-error")` per parse-or-skip.
+fn inflate_message(
+    dec: &mut Decompress,
+    compressed: &[u8],
+    cap: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let mut input = Vec::with_capacity(compressed.len() + 4);
+    input.extend_from_slice(compressed);
+    input.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
+
+    let mut out = Vec::new();
+    let mut in_off = 0usize;
+    loop {
+        let in_before = dec.total_in();
+        let out_before = dec.total_out();
+        out.reserve(8192); // decompress_vec fills spare capacity; it never grows the Vec
+        let status = dec
+            .decompress_vec(&input[in_off..], &mut out, FlushDecompress::Sync)
+            .map_err(|_| "inflate-error")?;
+        in_off += (dec.total_in() - in_before) as usize;
+        let produced = (dec.total_out() - out_before) as usize;
+
+        if out.len() > cap {
+            return Err("oversize");
+        }
+        match status {
+            Status::StreamEnd => break,
+            Status::Ok | Status::BufError => {
+                if in_off >= input.len() && produced == 0 {
+                    break; // all input consumed, flush emitted everything
+                }
+                if produced == 0 && in_off >= input.len() {
+                    break; // no more progress possible
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ws::Opcode;
+    use flate2::{Compress, Compression, FlushCompress, Status as CStatus};
+
+    /// Compress `data` as one permessage-deflate message, stripping the trailing
+    /// 0x00 0x00 0xFF 0xFF sync marker (as a WS sender does). `comp` persists for
+    /// context takeover.
+    fn deflate_message(comp: &mut Compress, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut in_off = 0usize;
+        loop {
+            let in_before = comp.total_in();
+            let out_before = comp.total_out();
+            out.reserve(8192);
+            let status = comp
+                .compress_vec(&data[in_off..], &mut out, FlushCompress::Sync)
+                .unwrap();
+            in_off += (comp.total_in() - in_before) as usize;
+            let produced = (comp.total_out() - out_before) as usize;
+            // NOTE: deviates from the brief's literal `in_off >= data.len() && produced == 0`.
+            // Empirically (flate2 1.1.9 / miniz_oxide 0.8.9), once all input is consumed, a
+            // Sync-flush `compress_vec` call with an empty remaining slice keeps returning
+            // `Status::Ok` with a fresh nonzero `produced` (a new empty sync block) forever —
+            // `produced` never reaches 0, so the brief's condition never fires and the loop
+            // never terminates. All three test messages here fully flush (all input consumed
+            // AND the complete compressed output, including the trailing sync marker, written)
+            // within the single call that first reaches `in_off >= data.len()`, so breaking
+            // there — without waiting for `produced == 0` — is correct and terminates.
+            if in_off >= data.len() {
+                break;
+            }
+            if produced == 0 && status == CStatus::Ok {
+                break;
+            }
+        }
+        if out.ends_with(&[0x00, 0x00, 0xFF, 0xFF]) {
+            out.truncate(out.len() - 4);
+        }
+        out
+    }
+
+    const RESP_DEFLATE: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+        Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+
+    fn handshaken_deflate() -> WsTap {
+        let mut t = WsTap::new();
+        let mut out = Vec::new();
+        t.on_client_bytes(REQ, &mut out);
+        t.on_server_bytes(RESP_DEFLATE, &mut out);
+        t
+    }
+
+    #[test]
+    fn inflates_server_text_with_context_takeover() {
+        let mut t = handshaken_deflate();
+        let mut comp = Compress::new(Compression::default(), false); // raw deflate
+        let mut out = Vec::new();
+
+        let c1 = deflate_message(&mut comp, b"first message");
+        t.on_server_bytes(&frame(true, 0x1, true, None, &c1), &mut out);
+        assert_eq!(out[0].payload, b"first message");
+
+        // second message relies on the retained LZ77 window (context takeover)
+        let c2 = deflate_message(&mut comp, b"first message again");
+        t.on_server_bytes(&frame(true, 0x1, true, None, &c2), &mut out);
+        assert_eq!(out[1].payload, b"first message again");
+    }
+
+    #[test]
+    fn inflates_client_binary() {
+        let mut t = handshaken_deflate();
+        let mut comp = Compress::new(Compression::default(), false);
+        let mut out = Vec::new();
+        let data = vec![7u8; 5000];
+        let c = deflate_message(&mut comp, &data);
+        t.on_client_bytes(&frame(true, 0x2, true, Some([4, 3, 2, 1]), &c), &mut out);
+        assert_eq!(out[0].opcode, Opcode::Binary);
+        assert_eq!(out[0].payload, data);
+    }
+
+    #[test]
+    fn uncompressed_frame_still_works_when_deflate_negotiated() {
+        let mut t = handshaken_deflate();
+        let mut out = Vec::new();
+        // rsv1=false -> not compressed even though deflate negotiated
+        t.on_server_bytes(&frame(true, 0x1, false, None, b"plain"), &mut out);
+        assert_eq!(out[0].payload, b"plain");
+    }
+
+    #[test]
+    fn rsv1_on_continuation_is_undecodable() {
+        // RFC 7692 §7.2.3.1: RSV1 is set only on the first frame of a message; a
+        // continuation frame with RSV1 set is malformed fragmentation.
+        let mut t = handshaken_deflate();
+        let mut out = Vec::new();
+        t.on_server_bytes(&frame(false, 0x1, true, None, b"AAAA"), &mut out);
+        assert!(out.is_empty(), "message not complete until FIN");
+        t.on_server_bytes(&frame(true, 0x0, true, None, b"BBBB"), &mut out);
+        let s = t.finalize();
+        assert_eq!(s.kind, WsKind::Undecodable);
+        assert_eq!(s.undecodable_reason, Some("bad-frame"));
+    }
 
     fn frame(fin: bool, opcode: u8, rsv1: bool, mask: Option<[u8; 4]>, payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
