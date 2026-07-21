@@ -102,16 +102,17 @@ impl WsTap {
     }
 
     fn feed_handshake(&mut self, from_client: bool, data: &[u8], out: &mut Vec<WsMessage>) {
-        let hs = if from_client { &mut self.c2s_hs } else { &mut self.s2c_hs };
-        hs.extend_from_slice(data);
+        {
+            let hs = if from_client { &mut self.c2s_hs } else { &mut self.s2c_hs };
+            hs.extend_from_slice(data);
+            if hs.len() > MAX_HANDSHAKE {
+                return self.bail("handshake-too-large");
+            }
+        }
 
         if from_client && self.req_consumed.is_none() {
             match scan_request(&self.c2s_hs) {
-                RequestScan::NeedMore => {
-                    if self.c2s_hs.len() > MAX_HANDSHAKE {
-                        return self.bail("handshake-too-large");
-                    }
-                }
+                RequestScan::NeedMore => {}
                 RequestScan::NotWebSocket => {
                     self.state = State::NotWebSocket;
                     return;
@@ -123,11 +124,7 @@ impl WsTap {
             }
         } else if !from_client && self.resp_consumed.is_none() {
             match scan_response(&self.s2c_hs) {
-                ResponseScan::NeedMore => {
-                    if self.s2c_hs.len() > MAX_HANDSHAKE {
-                        return self.bail("handshake-too-large");
-                    }
-                }
+                ResponseScan::NeedMore => {}
                 ResponseScan::NotWebSocket => {
                     self.state = State::NotWebSocket;
                     return;
@@ -164,13 +161,23 @@ impl WsTap {
     }
 
     fn parse_dir(&mut self, from_client: bool, out: &mut Vec<WsMessage>) {
-        loop {
-            let dir = if from_client { &mut self.c2s } else { &mut self.s2c };
+        // Bound the accumulated unparsed buffer (a single huge frame can't grow past the cap).
+        {
+            let dir = if from_client { &self.c2s } else { &self.s2c };
             if dir.buf.len() > MAX_MESSAGE {
                 return self.bail("oversize");
             }
-            match parse_frame(&dir.buf) {
-                Ok(None) => return,
+        }
+        // Parse every whole frame currently buffered, advancing a cursor instead of
+        // draining per frame (per-frame prefix drains are O(n^2) over a multi-frame buffer).
+        let mut cursor = 0usize;
+        loop {
+            let parsed = {
+                let dir = if from_client { &self.c2s } else { &self.s2c };
+                parse_frame(&dir.buf[cursor..])
+            };
+            match parsed {
+                Ok(None) => break,
                 Err(e) => {
                     return self.bail(match e {
                         FrameError::ReservedOpcode => "reserved-opcode",
@@ -179,14 +186,17 @@ impl WsTap {
                     });
                 }
                 Ok(Some((frame, consumed))) => {
-                    dir.buf.drain(0..consumed);
+                    cursor += consumed;
                     self.handle_frame(from_client, frame, out);
                     if !matches!(self.state, State::Framing) {
-                        return;
+                        return; // terminal (bail/close): remaining buffer is irrelevant
                     }
                 }
             }
         }
+        // Drop the fully-parsed frames once; keep any partial remainder for the next feed.
+        let dir = if from_client { &mut self.c2s } else { &mut self.s2c };
+        dir.buf.drain(0..cursor);
     }
 
     fn handle_frame(&mut self, from_client: bool, frame: Frame, out: &mut Vec<WsMessage>) {
@@ -239,7 +249,6 @@ impl WsTap {
 
         if frame.fin {
             self.complete_message(from_client, out);
-            if !matches!(self.state, State::Framing) {}
         }
     }
 
@@ -426,5 +435,36 @@ mod tests {
         assert_eq!(out[1].from_client, false);
         let s = t.finalize();
         assert_eq!(s.message_count, 2);
+    }
+
+    #[test]
+    fn many_frames_in_one_call_decode_in_order() {
+        // Exercises the cursor path: 1000 frames delivered in a single call must all
+        // decode, in order (guards against the O(n^2) drain regression + off-by-one).
+        let mut t = handshaken();
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        for i in 0..1000u32 {
+            buf.extend_from_slice(&frame(true, 0x2, false, None, &i.to_be_bytes()));
+        }
+        t.on_server_bytes(&buf, &mut out);
+        assert_eq!(out.len(), 1000);
+        for (i, m) in out.iter().enumerate() {
+            assert_eq!(m.opcode, Opcode::Binary);
+            assert_eq!(m.payload, (i as u32).to_be_bytes().to_vec());
+        }
+    }
+
+    #[test]
+    fn client_flood_after_request_hits_handshake_cap() {
+        // Client completes its upgrade request, then floods bytes before the server
+        // responds — must be capped (Fix B), not grow unbounded.
+        let mut t = WsTap::new();
+        let mut out = Vec::new();
+        t.on_client_bytes(REQ, &mut out);
+        t.on_client_bytes(&vec![b'x'; 70 * 1024], &mut out);
+        let s = t.finalize();
+        assert_eq!(s.kind, WsKind::Undecodable);
+        assert_eq!(s.undecodable_reason, Some("handshake-too-large"));
     }
 }
