@@ -44,7 +44,11 @@ only when given).
 ## Output — `ntlm.jsonl` (one grouped line per connection)
 
 A connection's Type-2 (from `.s2c`) and Type-3 (from `.c2s`) are held and emitted as a
-**single** record when the connection closes — never two lines:
+**single** record — never two lines. It is flushed **as soon as authentication completes**
+(the gateway's `101`/`2xx` answering the client's Type-3), so a live, long-lived RDP
+session is captured immediately and the record survives a mid-session proxy kill. A
+connection that closes without a completed auth (challenge-only, or a denied attempt) is
+flushed at connection close instead:
 
 ```json
 {"conn_id":"conn-00000006","ts":"…Z","client":"10.20.1.5:51616","server":"10.20.2.10:443",
@@ -90,10 +94,13 @@ rather than in a header.
   `base64_decode` for the `NTLM`/`Negotiate` carriers.
 - **dump.rs** — `open_conn` creates `.c2s`/`.s2c` only when `raw_dump`. Both directions
   accumulate a bounded (64 KiB) per-connection prefix (`ntlm_c2s_buf` / `ntlm_s2c_buf`)
-  whenever `ntlm_dump` is on — **no eager write**. At `finish()`, parse both prefixes
-  (`detect_challenge` on s2c, `detect_authenticate` on c2s), derive `endpoint` /
-  `rdg_user_id` / `auth_result`, assemble `net_ntlmv2`, and append **one** grouped line
-  to `ntlm.jsonl`. `index.jsonl` still written.
+  whenever `ntlm_dump` is on. The grouped record is emitted **once** (guarded by
+  `ntlm_emitted`) either **eagerly** — when a `.s2c` chunk carries a `101`/`2xx` and both
+  Type-2 + Type-3 are in hand — or as a **fallback at `finish()`** for a
+  challenge-only/denied connection. Emitting parses both prefixes (`detect_challenge` on
+  s2c, `detect_authenticate` on c2s), derives `endpoint` / `rdg_user_id` / `auth_result`,
+  assembles `net_ntlmv2`, and appends **one** line to `ntlm.jsonl`. `index.jsonl` still
+  written.
 - **proxy.rs** — gate the `WsTap` on `raw_dump && ws_decode`. `write_c2s`/`write_s2c`
   call sites unchanged (both already pumped every connection; the c2s NTLM accumulation
   rides along).
@@ -106,7 +113,8 @@ rather than in a header.
   *classifying* the RD Gateway upgrade — non-GET `RDG_OUT_DATA` + `401→101` NTLM
   round-trip — is a separate deferred `handshake.rs` v2; see the `ws:none` finding.)
 - One grouped record per connection (the gateway runs one Type-2/Type-3 handshake per
-  connection). The record is emitted at connection close so both halves are in hand.
+  connection), emitted as soon as auth succeeds — or at connection close for a
+  challenge-only/denied connection.
 - `net_ntlmv2` cracking is offline; the proxy only captures — it does not attempt or
   verify the hash.
 
@@ -118,6 +126,7 @@ rather than in a header.
 - **dump**: a challenge (s2c) + response (c2s) on one connection produce exactly **one**
   `ntlm.jsonl` line carrying the assembled `net_ntlmv2`; challenge-only still records the
   Type-2 fields with Type-3 fields null; `.c2s`/`.s2c` suppressed and `index.jsonl` still
-  written when `raw_dump=false`; both-off writes no stream/ntlm files.
+  written when `raw_dump=false`; both-off writes no stream/ntlm files; on a successful
+  auth the record is flushed on the `101` (before close) and not duplicated at close.
 - **live**: deploy to B with `raw_dump=false`, drive mstsc, confirm one grouped record
   with `net_ntlmv2` + `RDGW1` and no big per-connection files.

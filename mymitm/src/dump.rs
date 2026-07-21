@@ -48,6 +48,7 @@ pub struct ConnDump {
     ntlm_path: PathBuf,
     ntlm_c2s_buf: Vec<u8>,
     ntlm_s2c_buf: Vec<u8>,
+    ntlm_emitted: bool,
 }
 
 impl Dumper {
@@ -79,6 +80,7 @@ impl Dumper {
             ntlm_path: self.dir.join("ntlm.jsonl"),
             ntlm_c2s_buf: Vec::new(),
             ntlm_s2c_buf: Vec::new(),
+            ntlm_emitted: false,
         }
     }
 }
@@ -86,11 +88,19 @@ impl Dumper {
 impl ConnDump {
     pub fn write_c2s(&mut self, b: &[u8]) {
         write_some(&mut self.c2s, b);
-        ntlm_accumulate(&mut self.ntlm_c2s_buf, b, self.ntlm_dump);
+        ntlm_accumulate(&mut self.ntlm_c2s_buf, b, self.ntlm_dump && !self.ntlm_emitted);
     }
     pub fn write_s2c(&mut self, b: &[u8]) {
         write_some(&mut self.s2c, b);
-        ntlm_accumulate(&mut self.ntlm_s2c_buf, b, self.ntlm_dump);
+        ntlm_accumulate(&mut self.ntlm_s2c_buf, b, self.ntlm_dump && !self.ntlm_emitted);
+        // Flush the grouped record the moment auth completes: the server's
+        // success status (101/2xx) answering the client's Type-3 means both
+        // halves are now in hand — no need to wait for connection close, and no
+        // loss if the proxy is killed mid-session. Checked on the delivering
+        // chunk so the buffer scan runs at most once.
+        if self.ntlm_dump && !self.ntlm_emitted && s2c_saw_success(b) {
+            self.emit_ntlm_record(true);
+        }
     }
 
     /// Assemble and append the single grouped NTLM record for this connection.
@@ -98,10 +108,20 @@ impl ConnDump {
     /// the Type-3 response (from `.c2s`) are in hand and land on one line —
     /// yielding a hashcat-ready net-NTLMv2 hash when both halves were seen.
     /// Emits nothing if neither half was observed.
-    fn emit_ntlm_record(&self) {
+    fn emit_ntlm_record(&mut self, require_pair: bool) {
+        if self.ntlm_emitted {
+            return;
+        }
         let challenge = detect_challenge(&self.ntlm_s2c_buf);
         let response = detect_authenticate(&self.ntlm_c2s_buf);
-        if challenge.is_none() && response.is_none() {
+        // Eager path (require_pair) needs both halves; the close-time fallback
+        // records whatever half was seen.
+        let ready = if require_pair {
+            challenge.is_some() && response.is_some()
+        } else {
+            challenge.is_some() || response.is_some()
+        };
+        if !ready {
             return;
         }
 
@@ -165,6 +185,7 @@ impl ConnDump {
             crackable,
             "NTLM exchange captured"
         );
+        self.ntlm_emitted = true;
     }
 
     /// Append one decoded WebSocket message as a JSON line to `{id}.ws.jsonl`
@@ -210,10 +231,12 @@ impl ConnDump {
         }
     }
 
-    pub fn finish(self, dir: &Path, ws: &WsStatus) {
-        // Emit the single grouped NTLM record now that both directions are in hand.
+    pub fn finish(mut self, dir: &Path, ws: &WsStatus) {
+        // Fallback: emit any still-pending record (challenge-only, denied auth,
+        // or a success whose status chunk we didn't catch) now that the
+        // connection is closing. No-op if we already flushed eagerly.
         if self.ntlm_dump {
-            self.emit_ntlm_record();
+            self.emit_ntlm_record(false);
         }
         let rec = serde_json::json!({
             "conn_id": self.id, "client": self.client.to_string(),
@@ -585,5 +608,50 @@ mod tests {
         assert!(rec["username"].is_null());
         assert!(rec["net_ntlmv2"].is_null());
         assert!(rec["auth_result"].is_null());
+    }
+
+    #[test]
+    fn ntlm_dump_flushes_on_auth_success_before_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Dumper::new(dir.path(), DumpOptions {
+            raw_dump: false, ntlm_dump: true, server_name: None,
+        }).unwrap();
+        let mut c = d.open_conn(
+            "10.20.1.5:59338".parse().unwrap(),
+            "10.20.2.10:443".parse().unwrap());
+        let chal_b64 = B64.encode(crate::ntlm::CHALLENGE_MESSAGE_EXAMPLE);
+        let auth_b64 = B64.encode(crate::ntlm::AUTHENTICATE_MESSAGE_EXAMPLE);
+        let ntlm = dir.path().join("ntlm.jsonl");
+
+        // Client sends its Type-3 first (the proxy relays c2s before the server's
+        // 101 can come back).
+        c.write_c2s(format!(
+            "RDG_OUT_DATA /remoteDesktopGateway/ HTTP/1.1\r\nAuthorization: NTLM {auth_b64}\r\n\r\n"
+        ).as_bytes());
+        // Server challenge (401): the pair is now in hand, but auth has not yet
+        // succeeded, so nothing is flushed.
+        c.write_s2c(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {chal_b64}\r\n\r\n").as_bytes());
+        assert!(!ntlm.exists(), "must not flush before the server accepts the credential");
+
+        // Server accepts: 101 Switching Protocols -> flush now, WITHOUT finish()
+        // (the RDP tunnel connection stays open for the whole session).
+        c.write_s2c(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
+        let body = std::fs::read_to_string(&ntlm).expect("record flushed on auth success");
+        assert_eq!(body.lines().count(), 1);
+        let rec: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(rec["username"], "alice");
+        assert_eq!(
+            rec["net_ntlmv2"],
+            "alice::CORP:0123456789abcdef:0102030405060708090a0b0c0d0e0f10:0101000000000000"
+        );
+        assert_eq!(rec["auth_result"], "success");
+
+        // Closing the connection must NOT append a duplicate record.
+        c.finish(dir.path(), &crate::ws::WsStatus::none());
+        assert_eq!(
+            std::fs::read_to_string(&ntlm).unwrap().lines().count(),
+            1,
+            "no duplicate record at close after an eager flush"
+        );
     }
 }
