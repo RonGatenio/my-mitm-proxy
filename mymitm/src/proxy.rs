@@ -205,6 +205,66 @@ pub async fn run(s: Arc<Settings>, dumper: Arc<Dumper>, plane: Arc<dyn DataPlane
     }
 }
 
+/// Relay one direction: read from `src`, tee each chunk to its dump `sink`, and
+/// write it to `dst`. On clean EOF, shut down `dst`'s write half (propagating
+/// FIN) and return `Ok`, ending only this direction. A read/write error returns
+/// `Err` so the caller can tear the whole connection down.
+/// Shared WebSocket-tap state: both pump directions feed it (it must see both to
+/// decode), and it holds the `ConnMeta` that decoded messages are dumped into
+/// until the pump finishes and the caller reclaims it for `finish`.
+struct WsShared {
+    tap: Option<WsTap>,
+    meta: crate::dump::ConnMeta,
+    ws_out: Vec<WsMessage>,
+}
+
+impl WsShared {
+    fn feed(&mut self, from_client: bool, bytes: &[u8]) {
+        // NTLM capture is independent of the WebSocket tap: it must run even in
+        // NTLM-only mode, where the tap is disabled (raw_dump = false).
+        if from_client {
+            self.meta.feed_c2s(bytes);
+        } else {
+            self.meta.feed_s2c(bytes);
+        }
+        let Some(t) = self.tap.as_mut() else { return };
+        if from_client {
+            t.on_client_bytes(bytes, &mut self.ws_out);
+        } else {
+            t.on_server_bytes(bytes, &mut self.ws_out);
+        }
+        for m in self.ws_out.drain(..) { self.meta.write_ws_message(&m); }
+    }
+}
+
+async fn pump_dir<R, W>(
+    mut src: R,
+    mut dst: W,
+    mut sink: crate::dump::DirSink,
+    shared: Arc<std::sync::Mutex<WsShared>>,
+    from_client: bool,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = src.read(&mut buf).await?;
+        if n == 0 {
+            dst.shutdown().await.ok();
+            return Ok(());
+        }
+        sink.write(&buf[..n]);
+        dst.write_all(&buf[..n]).await?;
+        // Feed the WebSocket tap after relaying, so the lock stays off the hot path.
+        {
+            let mut g = shared.lock().unwrap_or_else(|e| e.into_inner());
+            g.feed(from_client, &buf[..n]);
+        }
+    }
+}
+
 async fn handle_conn(
     inbound: TcpStream,
     peer: SocketAddr,
@@ -232,62 +292,41 @@ async fn handle_conn(
     let server_tls = connector.connect(server_name, up).await?;
 
     // 3. Pump bytes both ways, dumping decrypted plaintext per direction.
-    //
-    // Both directions write into the single `ConnDump`, so we drive them from
-    // one `select!` loop (rather than two concurrently-borrowing tasks). Note
-    // the dump writes are synchronous, best-effort `std::fs` writes on the async
-    // path — making them truly async is a tracked follow-up, out of scope here.
     let server_sa = SocketAddr::from((s.server_ip, s.server_port));
-    let (mut meta, mut c2s_sink, mut s2c_sink) = dumper.open_conn(peer, server_sa);
+    let (meta, c2s_sink, s2c_sink) = dumper.open_conn(peer, server_sa);
+    let (cr, cw) = tokio::io::split(client_tls);
+    let (sr, sw) = tokio::io::split(server_tls);
+
+    // Two independent directions, each owning its reader, peer-writer, and dump
+    // sink — no shared borrow, so neither can head-of-line-block the other (the
+    // old single `select!` loop stalled one side while `write_all` awaited on the
+    // other). `try_join!` waits for both to finish; a hard error on either cancels
+    // the sibling and tears the connection down.
+    //
+    // The WebSocket tap must observe BOTH directions, so it — and the `ConnMeta`
+    // it dumps decoded messages into — live behind a shared mutex. Each direction
+    // feeds the tap AFTER relaying its bytes, so the lock never sits on the relay
+    // path and the two directions stay independent.
     // The WS tap feeds .ws.jsonl, a raw-dump artifact — skip it in NTLM-only mode.
-    let mut tap: Option<WsTap> = if s.raw_dump && s.ws_decode { Some(WsTap::new()) } else { None };
-    let mut ws_out: Vec<WsMessage> = Vec::new();
-    let (mut cr, mut cw) = tokio::io::split(client_tls);
-    let (mut sr, mut sw) = tokio::io::split(server_tls);
+    let tap = if s.raw_dump && s.ws_decode { Some(WsTap::new()) } else { None };
+    let shared = Arc::new(std::sync::Mutex::new(WsShared { tap, meta, ws_out: Vec::new() }));
 
-    let mut c2s_buf = [0u8; 16384];
-    let mut s2c_buf = [0u8; 16384];
-    let mut c2s_open = true;
-    let mut s2c_open = true;
+    let c2s = pump_dir(cr, sw, c2s_sink, shared.clone(), true);
+    let s2c = pump_dir(sr, cw, s2c_sink, shared.clone(), false);
+    let outcome = tokio::try_join!(c2s, s2c);
 
-    while c2s_open || s2c_open {
-        tokio::select! {
-            r = cr.read(&mut c2s_buf), if c2s_open => {
-                match r {
-                    Ok(0) | Err(_) => { c2s_open = false; sw.shutdown().await.ok(); }
-                    Ok(n) => {
-                        c2s_sink.write(&c2s_buf[..n]);
-                        meta.feed_c2s(&c2s_buf[..n]);
-                        if sw.write_all(&c2s_buf[..n]).await.is_err() { c2s_open = false; }
-                        if let Some(t) = tap.as_mut() {
-                            t.on_client_bytes(&c2s_buf[..n], &mut ws_out);
-                            for m in ws_out.drain(..) { meta.write_ws_message(&m); }
-                        }
-                    }
-                }
-            }
-            r = sr.read(&mut s2c_buf), if s2c_open => {
-                match r {
-                    Ok(0) | Err(_) => { s2c_open = false; cw.shutdown().await.ok(); }
-                    Ok(n) => {
-                        s2c_sink.write(&s2c_buf[..n]);
-                        meta.feed_s2c(&s2c_buf[..n]);
-                        if cw.write_all(&s2c_buf[..n]).await.is_err() { s2c_open = false; }
-                        if let Some(t) = tap.as_mut() {
-                            t.on_server_bytes(&s2c_buf[..n], &mut ws_out);
-                            for m in ws_out.drain(..) { meta.write_ws_message(&m); }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    // Both directions have joined, so `shared` is the sole remaining owner:
+    // reclaim the tap + meta, finalize the WebSocket status, write the index.
+    let WsShared { tap, meta, .. } = Arc::into_inner(shared)
+        .expect("both pump tasks have joined; no other Arc refs remain")
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
     let ws_status = match tap {
         Some(t) => t.finalize(),
         None => WsStatus::none(),
     };
     meta.finish(&s.dump_path, &ws_status);
+    outcome?;
     Ok(())
 }
 
@@ -433,6 +472,71 @@ mod tests {
         let s2c = std::fs::read(dump_dir.join(format!("{conn_id}.s2c"))).unwrap();
         assert_eq!(c2s, b"PING-FROM-CLIENT");
         assert_eq!(s2c, b"PONG-FROM-SERVER");
+    }
+
+    /// Full-duplex + half-close: the client streams a large blob then closes its
+    /// write half; the server, after the client's EOF, streams its own large blob
+    /// back. The client (write side closed) must still receive all of it. Exercises
+    /// both pump directions, multi-chunk streaming, and the per-direction dumps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pump_full_duplex_and_half_close() {
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_cert(dir.path(), vec!["localhost".into()]);
+        const N: usize = 200_000; // > pump buffer (16 KiB) -> many chunks
+        let up_blob = vec![0xABu8; N];
+        let down_blob = vec![0xCDu8; N];
+
+        // fake upstream server
+        let server_acceptor = TlsAcceptor::from(load_server_tls(&cert, &key).unwrap());
+        let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let up_expect = up_blob.clone();
+        let down_send = down_blob.clone();
+        tokio::spawn(async move {
+            let (sock, _) = server_listener.accept().await.unwrap();
+            let tls = server_acceptor.accept(sock).await.unwrap();
+            let (mut r, mut w) = tokio::io::split(tls);
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, up_expect);
+            w.write_all(&down_send).await.unwrap();
+            w.shutdown().await.ok();
+        });
+
+        // proxy
+        let dump_dir = dir.path().join("dumps");
+        let dumper = Arc::new(Dumper::new(&dump_dir, crate::dump::DumpOptions::default()).unwrap());
+        let server_v4 = match server_addr.ip() { std::net::IpAddr::V4(v4) => v4, _ => unreachable!() };
+        let mut settings = settings_for(&cert, &key, server_v4);
+        settings.server_port = server_addr.port();
+        settings.dump_path = dump_dir.clone();
+        let settings = Arc::new(settings);
+        let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(load_server_tls(&cert, &key).unwrap());
+        let connector = build_upstream_connector(&settings).unwrap();
+        {
+            let settings = settings.clone();
+            let dumper = dumper.clone();
+            let plane: Arc<dyn crate::dataplane::DataPlane> = Arc::new(crate::dataplane::DirectPlane);
+            tokio::spawn(async move {
+                let (inbound, peer) = proxy_listener.accept().await.unwrap();
+                handle_conn(inbound, peer, acceptor, connector, settings, dumper, plane).await.unwrap();
+            });
+        }
+
+        // client: send blob, half-close write, then read the server's blob in full
+        let client_connector = build_upstream_connector(&settings).unwrap();
+        let client_sock = TcpStream::connect(proxy_addr).await.unwrap();
+        let client_name = ServerName::try_from("localhost").unwrap();
+        let client_tls = client_connector.connect(client_name, client_sock).await.unwrap();
+        let (mut cr, mut cw) = tokio::io::split(client_tls);
+        cw.write_all(&up_blob).await.unwrap();
+        cw.shutdown().await.ok();
+        let mut got = Vec::new();
+        cr.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, down_blob);
     }
 
     /// The pin verifier must REJECT a different leaf cert.
