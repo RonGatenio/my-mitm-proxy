@@ -46,6 +46,7 @@ struct FileCfg {
     /// false to dial upstream with the box's own IP instead (standard proxy
     /// behavior); the `--no-preserve-src-ip` CLI flag also forces this off.
     #[serde(default = "d_preserve")] preserve_src_ip: bool,
+    #[serde(default = "d_ws_decode")] ws_decode: bool,
 }
 fn d_port() -> u16 { 443 }
 fn d_tun() -> String { "tun0".into() }
@@ -60,6 +61,7 @@ fn d_log_file() -> PathBuf { "/var/tmp/mymitm.log".into() }
 fn d_cert() -> PathBuf { "/etc/mymitm/leaf.pem".into() }
 fn d_key() -> PathBuf { "/etc/mymitm/leaf.key".into() }
 fn d_preserve() -> bool { true }
+fn d_ws_decode() -> bool { true }
 
 #[derive(Parser, Debug)]
 #[command(version, about = "transparent TLS MITM with source-IP preservation")]
@@ -103,6 +105,8 @@ struct Cli {
     /// Reverse any leftover state (stale clsact qdisc / iproute rules) from a
     /// previous unclean exit, then continue startup.
     #[arg(long, default_value_t = false)] cleanup: bool,
+    /// Disable WebSocket decoding (kill-switch); raw dump is unaffected.
+    #[arg(long = "no-ws-decode", default_value_t = false)] no_ws_decode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +132,7 @@ pub struct Settings {
     pub attach_mode: AttachMode,
     pub preserve_src_ip: bool,
     pub cleanup: bool,
+    pub ws_decode: bool,
 }
 
 impl Settings {
@@ -162,6 +167,7 @@ impl Settings {
             attach_mode: f.attach_mode,
             preserve_src_ip: f.preserve_src_ip,
             cleanup: false,
+            ws_decode: f.ws_decode,
         })
     }
 
@@ -186,6 +192,7 @@ impl Settings {
         // leaves the config-file value (default true) untouched.
         if cli.no_preserve_src_ip { s.preserve_src_ip = false; }
         s.cleanup = cli.cleanup;
+        if cli.no_ws_decode { s.ws_decode = false; }
         Ok(s)
     }
 
@@ -230,6 +237,7 @@ impl Settings {
             attach_mode: AttachMode::Auto,
             preserve_src_ip: true,
             cleanup: false,
+            ws_decode: true,
         }
     }
 }
@@ -386,5 +394,25 @@ mod tests {
         assert!(matches!(c.data_plane, Some(DataPlaneKind::IpRoute)));
         assert!(matches!(c.attach_mode, Some(AttachMode::Tcx)));
         assert!(c.cleanup);
+    }
+
+    #[test]
+    fn ws_decode_defaults_true() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert!(s.ws_decode);
+    }
+
+    #[test]
+    fn ws_decode_can_be_disabled_in_file() {
+        let toml = format!("{}\nws_decode = false", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(!s.ws_decode);
+    }
+
+    #[test]
+    fn cli_no_ws_decode_flag_parses() {
+        use clap::Parser;
+        let c = Cli::try_parse_from(["mymitm", "--no-ws-decode"]).unwrap();
+        assert!(c.no_ws_decode);
     }
 }
