@@ -128,6 +128,10 @@ impl ConnDump {
             "nb_domain_name": ch.nb_domain_name,
             "dns_computer_name": ch.dns_computer_name,
             "dns_domain_name": ch.dns_domain_name,
+            // The raw WWW-Authenticate value as sent ("NTLM|Negotiate <base64>"):
+            // the full Type-2 for downstream NTLM tooling / verification.
+            "www_authenticate": ch.scheme.as_deref().zip(ch.token.as_deref())
+                .map(|(s, t)| format!("{s} {t}")),
         });
         match OpenOptions::new().create(true).append(true).open(&self.ntlm_path) {
             Ok(mut f) => {
@@ -331,6 +335,8 @@ mod tests {
         assert_eq!(rec["server_challenge"], "0123456789abcdef");
         assert_eq!(rec["nb_computer_name"], "Server");
         assert_eq!(rec["nb_domain_name"], "Domain");
+        // the raw WWW-Authenticate value (scheme + verbatim token) as sent
+        assert_eq!(rec["www_authenticate"], format!("NTLM {b64}"));
         // index.jsonl still written even with raw_dump = false
         assert!(dir.path().join("index.jsonl").exists());
     }

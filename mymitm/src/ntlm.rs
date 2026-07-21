@@ -33,6 +33,14 @@ pub struct NtlmChallenge {
     pub dns_computer_name: Option<String>,
     /// TargetInfo AV_PAIR MsvAvDnsDomainName.
     pub dns_domain_name: Option<String>,
+    /// Auth scheme that carried the challenge — "NTLM" or "Negotiate" — when it
+    /// was detected in a `WWW-Authenticate`/`Authorization` header (`None` for a
+    /// raw-bytes hit).
+    pub scheme: Option<String>,
+    /// The verbatim base64 token as sent (the value after the scheme keyword) —
+    /// the full wire Type-2 / SPNEGO message, preserving fields we don't decode
+    /// (flags, timestamp, all AV pairs, MIC). `None` for a raw-bytes hit.
+    pub token: Option<String>,
 }
 
 const SIG: &[u8; 8] = b"NTLMSSP\0";
@@ -159,11 +167,12 @@ fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
     })
 }
 
-/// Extract the base64 tokens that follow an `NTLM`/`Negotiate` auth-scheme
-/// keyword (as seen in `Authorization:` / `WWW-Authenticate:` headers).
-fn auth_base64_tokens(buf: &[u8]) -> Vec<&[u8]> {
+/// Extract the `(scheme, base64-token)` pairs that follow an `NTLM`/`Negotiate`
+/// auth-scheme keyword (as seen in `WWW-Authenticate:` / `Authorization:`
+/// headers). `scheme` is the canonical label; `token` is the verbatim base64.
+fn auth_tokens(buf: &[u8]) -> Vec<(&'static str, &[u8])> {
     let mut out = Vec::new();
-    for kw in [b"ntlm".as_slice(), b"negotiate".as_slice()] {
+    for (kw, label) in [(b"ntlm".as_slice(), "NTLM"), (b"negotiate".as_slice(), "Negotiate")] {
         let mut from = 0;
         while let Some(rel) = find_ci(&buf[from..], kw) {
             let mut i = from + rel + kw.len();
@@ -175,7 +184,7 @@ fn auth_base64_tokens(buf: &[u8]) -> Vec<&[u8]> {
                 i += 1;
             }
             if i > start {
-                out.push(&buf[start..i]);
+                out.push((label, &buf[start..i]));
             }
             from += rel + kw.len();
         }
@@ -223,8 +232,11 @@ pub fn detect_challenge(stream: &[u8]) -> Option<NtlmChallenge> {
     if let Some(c) = scan_raw(stream) {
         return Some(c);
     }
-    for token in auth_base64_tokens(stream) {
-        if let Some(c) = scan_raw(&base64_decode(token)) {
+    for (scheme, token) in auth_tokens(stream) {
+        if let Some(mut c) = scan_raw(&base64_decode(token)) {
+            // Preserve the raw wire carrier alongside the decoded fields.
+            c.scheme = Some(scheme.to_string());
+            c.token = Some(String::from_utf8_lossy(token).into_owned());
             return Some(c);
         }
     }
@@ -282,6 +294,9 @@ mod tests {
         );
         assert_eq!(c.nb_computer_name.as_deref(), Some("Server"));
         assert_eq!(c.nb_domain_name.as_deref(), Some("Domain"));
+        // Found as raw bytes (no auth header) -> no carrier scheme/token.
+        assert_eq!(c.scheme, None);
+        assert_eq!(c.token, None);
     }
 
     /// Standard base64 (RFC 4648) encoder — test-only, for building inputs.
@@ -322,6 +337,9 @@ mod tests {
             [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
         );
         assert_eq!(c.nb_computer_name.as_deref(), Some("Server"));
+        // The raw WWW-Authenticate carrier is surfaced: scheme + verbatim token.
+        assert_eq!(c.scheme.as_deref(), Some("NTLM"));
+        assert_eq!(c.token.as_deref(), Some(b64.as_str()));
     }
 
     #[test]
@@ -345,6 +363,8 @@ mod tests {
             c.server_challenge,
             [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
         );
+        assert_eq!(c.scheme.as_deref(), Some("Negotiate"));
+        assert_eq!(c.token.as_deref(), Some(b64.as_str()));
     }
 
     #[test]

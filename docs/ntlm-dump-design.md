@@ -35,8 +35,15 @@ only when given).
 ```json
 {"conn_id":"conn-00000001","ts":"…Z","client":"10.20.1.5:51616","server":"10.20.2.10:443",
  "server_name":"gw.rdgw.test","server_challenge":"<16 hex chars>","target_name":"RDGW1",
- "nb_computer_name":"RDGW1","nb_domain_name":"RDGW1","dns_computer_name":"RDGW1","dns_domain_name":null}
+ "nb_computer_name":"RDGW1","nb_domain_name":"RDGW1","dns_computer_name":"RDGW1","dns_domain_name":null,
+ "www_authenticate":"NTLM <base64 Type-2 as sent>"}
 ```
+
+`www_authenticate` is the raw carrier as sent — the scheme (`NTLM` or SPNEGO-wrapped
+`Negotiate`) plus the verbatim base64 Type-2. The decoded fields above are a summary;
+this preserves the full message (negotiate flags, timestamp, all AV_PAIRs, MIC) for
+downstream NTLM tooling / verification. `null` when a challenge is found as raw bytes
+rather than in a header.
 
 ## Implementation
 
