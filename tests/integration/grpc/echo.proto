@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+// Minimal echo service exercising all four gRPC RPC shapes so the byte-relay
+// MITM can be proven to preserve HTTP/2 end-to-end (HPACK, flow control,
+// multiplexing, trailers) for each shape — especially BiDi (full-duplex), the
+// one shape the earlier spike never exercised.
+package echo;
+
+message EchoRequest {
+  string message = 1;
+  int32 seq = 2;
+}
+
+message EchoReply {
+  string message = 1;
+  int32 seq = 2;
+}
+
+service Echo {
+  // Unary: one request, one reply.
+  rpc Unary(EchoRequest) returns (EchoReply);
+  // Server-streaming: one request, a stream of replies (incremental delivery).
+  rpc ServerStream(EchoRequest) returns (stream EchoReply);
+  // Client-streaming: a stream of requests, one aggregated reply.
+  rpc ClientStream(stream EchoRequest) returns (EchoReply);
+  // Bidirectional: full-duplex streams both ways over one h2 stream.
+  rpc BiDi(stream EchoRequest) returns (stream EchoReply);
+}
