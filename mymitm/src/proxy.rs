@@ -238,7 +238,7 @@ async fn handle_conn(
     // the dump writes are synchronous, best-effort `std::fs` writes on the async
     // path — making them truly async is a tracked follow-up, out of scope here.
     let server_sa = SocketAddr::from((s.server_ip, s.server_port));
-    let mut conn = dumper.open_conn(peer, server_sa);
+    let (mut meta, mut c2s_sink, mut s2c_sink) = dumper.open_conn(peer, server_sa);
     // The WS tap feeds .ws.jsonl, a raw-dump artifact — skip it in NTLM-only mode.
     let mut tap: Option<WsTap> = if s.raw_dump && s.ws_decode { Some(WsTap::new()) } else { None };
     let mut ws_out: Vec<WsMessage> = Vec::new();
@@ -256,11 +256,12 @@ async fn handle_conn(
                 match r {
                     Ok(0) | Err(_) => { c2s_open = false; sw.shutdown().await.ok(); }
                     Ok(n) => {
-                        conn.write_c2s(&c2s_buf[..n]);
+                        c2s_sink.write(&c2s_buf[..n]);
+                        meta.feed_c2s(&c2s_buf[..n]);
                         if sw.write_all(&c2s_buf[..n]).await.is_err() { c2s_open = false; }
                         if let Some(t) = tap.as_mut() {
                             t.on_client_bytes(&c2s_buf[..n], &mut ws_out);
-                            for m in ws_out.drain(..) { conn.write_ws_message(&m); }
+                            for m in ws_out.drain(..) { meta.write_ws_message(&m); }
                         }
                     }
                 }
@@ -269,11 +270,12 @@ async fn handle_conn(
                 match r {
                     Ok(0) | Err(_) => { s2c_open = false; cw.shutdown().await.ok(); }
                     Ok(n) => {
-                        conn.write_s2c(&s2c_buf[..n]);
+                        s2c_sink.write(&s2c_buf[..n]);
+                        meta.feed_s2c(&s2c_buf[..n]);
                         if cw.write_all(&s2c_buf[..n]).await.is_err() { s2c_open = false; }
                         if let Some(t) = tap.as_mut() {
                             t.on_server_bytes(&s2c_buf[..n], &mut ws_out);
-                            for m in ws_out.drain(..) { conn.write_ws_message(&m); }
+                            for m in ws_out.drain(..) { meta.write_ws_message(&m); }
                         }
                     }
                 }
@@ -285,7 +287,7 @@ async fn handle_conn(
         Some(t) => t.finalize(),
         None => WsStatus::none(),
     };
-    conn.finish(&s.dump_path, &ws_status);
+    meta.finish(&s.dump_path, &ws_status);
     Ok(())
 }
 
