@@ -99,7 +99,7 @@ it together:
 > SNAT" (visible), never to "SNAT to the wrong client".
 
 > **Toggling preservation.** Preservation is on by default. Setting
-> `preserve_src_ip = false` (or passing `--no-preserve-src-ip`) makes
+> `preserve_src_ip = false` (or passing `--preserve-src-ip=false`) makes
 > `BpfPlane::upstream_socket` skip publishing `EGRESS[box_port]` altogether, so
 > `cls_eth_egress` takes exactly the untouched path above and the flow egresses
 > with `box_ip` — the server sees the box, not the client. In the iproute plane

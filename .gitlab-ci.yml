@@ -7,7 +7,11 @@ variables:
   CARGO_TERM_COLOR: "always"
 
 cache:
-  key: "$CI_COMMIT_REF_SLUG"
+  # NOTE: bump the suffix to discard a stale/broken cached bpf-linker. The
+  # previous cache held a bpf-linker compiled against the image's default
+  # (stable) toolchain, whose rustc-llvm-proxy aborted in
+  # LLVMInitializeBPFTarget when invoked under nightly during the eBPF build.
+  key: "$CI_COMMIT_REF_SLUG-v2"
   paths:
     - .cargo-home/bin/
     - .cargo-home/git/
@@ -37,9 +41,15 @@ build-and-test:
       pkg-config
       zlib1g-dev
     - rustup toolchain install nightly --profile minimal --component rust-src --target x86_64-unknown-linux-musl
+    # Make nightly the default so external `cargo install` and the bpf-linker
+    # runtime LLVM proxy resolve the SAME toolchain the eBPF build uses. On the
+    # rust:bookworm image the default is otherwise stable, which produced a
+    # bpf-linker built against a mismatched LLVM (LLVMInitializeBPFTarget abort).
+    - rustup default nightly
     - rustup show
     - rustup target add x86_64-unknown-linux-musl --toolchain nightly
-    - test -x "$CARGO_HOME/bin/bpf-linker" || cargo install bpf-linker --locked
+    # Build bpf-linker explicitly under nightly so it links nightly's LLVM.
+    - test -x "$CARGO_HOME/bin/bpf-linker" || cargo +nightly install bpf-linker --locked
     - rustc --version
     - cargo --version
     - bpf-linker --version

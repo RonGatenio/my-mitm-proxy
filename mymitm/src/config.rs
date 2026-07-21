@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use serde::Deserialize;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -44,7 +44,7 @@ struct FileCfg {
     #[serde(default)] server_name: Option<String>,
     /// Preserve the client's source IP on the upstream leg (default true). Set
     /// false to dial upstream with the box's own IP instead (standard proxy
-    /// behavior); the `--no-preserve-src-ip` CLI flag also forces this off.
+    /// behavior); the `--preserve-src-ip=false` CLI flag also forces this off.
     #[serde(default = "d_preserve")] preserve_src_ip: bool,
     #[serde(default = "d_ws_decode")] ws_decode: bool,
 }
@@ -96,17 +96,21 @@ struct Cli {
     #[arg(long = "file-log-level", env = "MYMITM_FILE_LOG")] file_log_level: Option<String>,
     /// Path to the log file (used only when the file log level is not off).
     #[arg(long = "log-file", env = "MYMITM_LOG_FILE")] log_file: Option<PathBuf>,
-    /// Disable source-IP preservation: dial the upstream with the box's own IP
-    /// instead of the client's. This is standard (non-transparent) proxy
-    /// behavior — the server then sees the box IP, not the client IP. Useful as
-    /// a negative control. Overrides `preserve_src_ip` in the config file.
-    #[arg(long = "no-preserve-src-ip", env = "MYMITM_NO_PRESERVE_SRC_IP", default_value_t = false)]
-    no_preserve_src_ip: bool,
+    /// Source-IP preservation on the upstream leg (`--preserve-src-ip=true|false`).
+    /// True (the default in the config file) dials the upstream with the client's
+    /// IP; false dials with the box's own IP — standard (non-transparent) proxy
+    /// behavior, so the server sees the box IP, not the client IP. Useful as a
+    /// negative control. When given, overrides `preserve_src_ip` in the config
+    /// file; when omitted, the config-file value stands.
+    #[arg(long = "preserve-src-ip", env = "MYMITM_PRESERVE_SRC_IP", action = ArgAction::Set)]
+    preserve_src_ip: Option<bool>,
     /// Reverse any leftover state (stale clsact qdisc / iproute rules) from a
     /// previous unclean exit, then continue startup.
     #[arg(long, default_value_t = false)] cleanup: bool,
-    /// Disable WebSocket decoding (kill-switch); raw dump is unaffected.
-    #[arg(long = "no-ws-decode", default_value_t = false)] no_ws_decode: bool,
+    /// WebSocket decoding (`--ws-decode=true|false`); raw dump is unaffected.
+    /// When given, overrides `ws_decode` in the config file (default true); when
+    /// omitted, the config-file value stands.
+    #[arg(long = "ws-decode", action = ArgAction::Set)] ws_decode: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,11 +192,11 @@ impl Settings {
         if let Some(v) = cli.stdout_log_level { s.stdout_log_level = v; }
         if let Some(v) = cli.file_log_level { s.file_log_level = v; }
         if let Some(v) = cli.log_file { s.log_file = v; }
-        // The CLI flag is one-way: present => force preservation off. Absent
-        // leaves the config-file value (default true) untouched.
-        if cli.no_preserve_src_ip { s.preserve_src_ip = false; }
+        // Boolean overrides take an explicit true/false; `None` (flag omitted)
+        // leaves the config-file value untouched.
+        if let Some(v) = cli.preserve_src_ip { s.preserve_src_ip = v; }
         s.cleanup = cli.cleanup;
-        if cli.no_ws_decode { s.ws_decode = false; }
+        if let Some(v) = cli.ws_decode { s.ws_decode = v; }
         Ok(s)
     }
 
@@ -291,12 +295,16 @@ mod tests {
     }
 
     #[test]
-    fn cli_no_preserve_flag_parses() {
+    fn cli_preserve_src_ip_flag_parses() {
         use clap::Parser;
         let default = Cli::try_parse_from(["mymitm"]).unwrap();
-        assert!(!default.no_preserve_src_ip, "flag defaults to false (preserve on)");
-        let off = Cli::try_parse_from(["mymitm", "--no-preserve-src-ip"]).unwrap();
-        assert!(off.no_preserve_src_ip, "flag present -> true (preserve off)");
+        assert_eq!(default.preserve_src_ip, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--preserve-src-ip=false"]).unwrap();
+        assert_eq!(off.preserve_src_ip, Some(false), "explicit false overrides");
+        let on = Cli::try_parse_from(["mymitm", "--preserve-src-ip", "true"]).unwrap();
+        assert_eq!(on.preserve_src_ip, Some(true), "explicit true overrides");
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--preserve-src-ip"]).is_err());
     }
 
     #[test]
@@ -410,9 +418,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_no_ws_decode_flag_parses() {
+    fn cli_ws_decode_flag_parses() {
         use clap::Parser;
-        let c = Cli::try_parse_from(["mymitm", "--no-ws-decode"]).unwrap();
-        assert!(c.no_ws_decode);
+        let default = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert_eq!(default.ws_decode, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--ws-decode=false"]).unwrap();
+        assert_eq!(off.ws_decode, Some(false), "explicit false overrides");
+        let on = Cli::try_parse_from(["mymitm", "--ws-decode", "true"]).unwrap();
+        assert_eq!(on.ws_decode, Some(true), "explicit true overrides");
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--ws-decode"]).is_err());
     }
 }
