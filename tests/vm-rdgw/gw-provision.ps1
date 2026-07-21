@@ -45,18 +45,22 @@ Import-Module RemoteDesktopServices -ErrorAction Stop
 $sec = ConvertTo-SecureString $PfxPassword -AsPlainText -Force
 $cert = Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation Cert:\LocalMachine\My -Password $sec
 Say "imported cert $($cert.Thumbprint) ($($cert.Subject))"
-Set-Item -Path "RDS:\GatewayServer\SSLCertificate\SSLCertSHA1Hash" -Value $cert.Thumbprint
+Set-Item -Path "RDS:\GatewayServer\SSLCertificate\Thumbprint" -Value $cert.Thumbprint  # node is Thumbprint, NOT SSLCertSHA1Hash on WS2025
 Say "bound cert to RD Gateway"
 
 # 4) CAP (who may use the gateway) + RAP (what they may reach) -------------------
-#    AuthMethod 1 = password (NTLM/Negotiate).  ComputerGroupType 2 = any resource.
+#    The NTLM CHALLENGE we want is emitted during gateway auth, BEFORE CAP/RAP are
+#    evaluated, so these are only needed for a full RDP *session*. On WS2025 scripted
+#    creation via the RDS: provider hits NPS/permission errors; if it fails, create
+#    them in RD Gateway Manager -> Policies: CAP = local Administrators + password
+#    auth; RAP = allow connection to any network resource.
+#    New-Item form: -Path <container> -Name <leaf> (NOT a full path).
 $grp = "Administrators@$env:COMPUTERNAME"
-if (Test-Path "RDS:\GatewayServer\CAP\rdgw-cap") { Remove-Item "RDS:\GatewayServer\CAP\rdgw-cap" -Recurse -Force }
-New-Item -Path "RDS:\GatewayServer\CAP\rdgw-cap" -UserGroups $grp -AuthMethod 1 | Out-Null
-Say "CAP rdgw-cap -> $grp (password auth)"
-if (Test-Path "RDS:\GatewayServer\RAP\rdgw-rap") { Remove-Item "RDS:\GatewayServer\RAP\rdgw-rap" -Recurse -Force }
-New-Item -Path "RDS:\GatewayServer\RAP\rdgw-rap" -UserGroups $grp -ComputerGroupType 2 | Out-Null
-Say "RAP rdgw-rap -> any resource"
+try {
+  if (-not (Test-Path "RDS:\GatewayServer\CAP\rdgw-cap")) { New-Item -Path "RDS:\GatewayServer\CAP" -Name "rdgw-cap" -UserGroups $grp -AuthMethod 1 -ErrorAction Stop | Out-Null }
+  if (-not (Test-Path "RDS:\GatewayServer\RAP\rdgw-rap")) { New-Item -Path "RDS:\GatewayServer\RAP" -Name "rdgw-rap" -UserGroups $grp -ComputerGroupType 2 -ErrorAction Stop | Out-Null }
+  Say "CAP/RAP created ($grp)"
+} catch { Say "CAP/RAP not scripted: $($_.Exception.Message). Configure in RD Gateway Manager for a full RDP session (challenge capture works without them)." }
 
 # 5) RDP on this box so it can be its own session host ---------------------------
 Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0

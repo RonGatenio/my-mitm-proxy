@@ -91,7 +91,7 @@ echo 'PEM/key written'
 } else { Say "cert already present in $CertDir" }
 
 # ---- 4. B cloud-init seed ------------------------------------------------------
-if (-not (Test-Path "$Lab\b_key")){ & ssh-keygen -t ed25519 -N '""' -f "$Lab\b_key" | Out-Null; Say "ssh key $Lab\b_key" }
+if (-not (Test-Path "$Lab\b_key")){ & ssh-keygen -t ed25519 -C rdgw-b -N '' -f "$Lab\b_key" -q; Say "ssh key $Lab\b_key" }  # -N '' = empty passphrase (pwsh7); NOT '""' which sets a literal 2-char passphrase and breaks BatchMode key auth
 $pub = (Get-Content "$Lab\b_key.pub" -Raw).Trim()
 $ud  = (Get-Content "$Root\b-cloud-init\user-data" -Raw).Replace("__SSH_PUBKEY__",$pub)
 # write seed inputs with LF endings
@@ -116,6 +116,7 @@ if (-not (Get-VM -Name rdgw-B -ErrorAction SilentlyContinue)){
   # found -> no IP, ARP unreachable). fix-b-gen1.ps1 rebuilds an existing B this way.
   New-VM -Name rdgw-B -Generation 1 -MemoryStartupBytes 1GB -VHDPath $BVhdx -SwitchName $SwLeft | Out-Null
   Set-VMProcessor rdgw-B -Count 2
+  Set-VMMemory rdgw-B -DynamicMemoryEnabled $false   # static; dynamic balloons the Debian guest and spams the console
   # NIC 1 -> left0 on rdgw-left ; NIC 2 -> right0 on rdgw-right
   $a=Get-VMNetworkAdapter -VMName rdgw-B | Select-Object -First 1
   Rename-VMNetworkAdapter -VMNetworkAdapter $a -NewName left0

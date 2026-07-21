@@ -22,6 +22,7 @@ if (Get-VM rdgw-B -ErrorAction SilentlyContinue){
 }
 New-VM -Name rdgw-B -Generation 1 -MemoryStartupBytes 1GB -VHDPath $BVhdx -SwitchName $SwLeft | Out-Null
 Set-VMProcessor rdgw-B -Count 2
+Set-VMMemory rdgw-B -DynamicMemoryEnabled $false
 $a=Get-VMNetworkAdapter -VMName rdgw-B | Select-Object -First 1
 Rename-VMNetworkAdapter -VMNetworkAdapter $a -NewName left0
 Set-VMNetworkAdapter -VMName rdgw-B -Name left0 -StaticMacAddress $MacBLeft

@@ -31,6 +31,9 @@ write_files:
       After=network-online.target
       Wants=network-online.target
       [Service]
+      # eBPF map creation needs memlock headroom; kernel 5.10 (< 5.11) still charges
+      # BPF maps against RLIMIT_MEMLOCK, and systemd's 64 KiB default fails with EPERM.
+      LimitMEMLOCK=infinity
       ExecStart=/opt/mymitm/mymitm --config /opt/mymitm/mymitm.toml
       Restart=no
       [Install]
