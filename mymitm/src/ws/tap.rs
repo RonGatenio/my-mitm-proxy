@@ -1,4 +1,430 @@
-//! Per-connection WebSocket decode state machine. Implemented in Task 4.
+//! Per-connection WebSocket decode state machine. I/O-free: `proxy.rs` feeds
+//! observed bytes via `on_client_bytes` / `on_server_bytes` and drains completed
+//! `WsMessage`s from `out`; `finalize` returns the terminal `WsStatus`. Parse-or-
+//! skip: on any unparseable input the tap becomes `Undecodable` and stops.
 
-/// Placeholder so `ws::WsTap` resolves; real implementation lands in Task 4.
-pub struct WsTap;
+use flate2::Decompress;
+
+use super::{Opcode, WsKind, WsMessage, WsStatus};
+use crate::ws::frame::{parse_frame, Frame, FrameError};
+use crate::ws::handshake::{scan_request, scan_response, Negotiation, RequestScan, ResponseScan};
+
+const MAX_HANDSHAKE: usize = 64 * 1024;
+const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+
+enum State {
+    Handshake,
+    Framing,
+    Closed,
+    NotWebSocket,
+    Undecodable(&'static str),
+}
+
+/// Per-direction framing state.
+struct DirState {
+    buf: Vec<u8>,
+    frag_opcode: Option<u8>, // 0x1 or 0x2 while a fragmented message is open
+    frag_payload: Vec<u8>,
+    frag_compressed: bool,
+    inflater: Option<Decompress>, // lazily created; persists for context takeover
+}
+
+impl DirState {
+    fn new() -> DirState {
+        DirState {
+            buf: Vec::new(),
+            frag_opcode: None,
+            frag_payload: Vec::new(),
+            frag_compressed: false,
+            inflater: None,
+        }
+    }
+}
+
+pub struct WsTap {
+    state: State,
+    // handshake accumulation
+    c2s_hs: Vec<u8>,
+    s2c_hs: Vec<u8>,
+    req_consumed: Option<usize>,
+    resp_consumed: Option<usize>,
+    req_ok: bool,
+    // framing
+    neg: Negotiation,
+    c2s: DirState,
+    s2c: DirState,
+    message_count: u64,
+    close_code: Option<u16>,
+    close_reason: Option<String>,
+}
+
+impl WsTap {
+    pub fn new() -> WsTap {
+        WsTap {
+            state: State::Handshake,
+            c2s_hs: Vec::new(),
+            s2c_hs: Vec::new(),
+            req_consumed: None,
+            resp_consumed: None,
+            req_ok: false,
+            neg: Negotiation::default(),
+            c2s: DirState::new(),
+            s2c: DirState::new(),
+            message_count: 0,
+            close_code: None,
+            close_reason: None,
+        }
+    }
+
+    pub fn on_client_bytes(&mut self, data: &[u8], out: &mut Vec<WsMessage>) {
+        self.feed(true, data, out);
+    }
+
+    pub fn on_server_bytes(&mut self, data: &[u8], out: &mut Vec<WsMessage>) {
+        self.feed(false, data, out);
+    }
+
+    fn bail(&mut self, reason: &'static str) {
+        self.state = State::Undecodable(reason);
+    }
+
+    fn feed(&mut self, from_client: bool, data: &[u8], out: &mut Vec<WsMessage>) {
+        match self.state {
+            State::Handshake => {
+                self.feed_handshake(from_client, data, out);
+            }
+            State::Framing => {
+                self.feed_framing(from_client, data, out);
+            }
+            // Terminal states ignore further bytes.
+            State::Closed | State::NotWebSocket | State::Undecodable(_) => {}
+        }
+    }
+
+    fn feed_handshake(&mut self, from_client: bool, data: &[u8], out: &mut Vec<WsMessage>) {
+        let hs = if from_client { &mut self.c2s_hs } else { &mut self.s2c_hs };
+        hs.extend_from_slice(data);
+
+        if from_client && self.req_consumed.is_none() {
+            match scan_request(&self.c2s_hs) {
+                RequestScan::NeedMore => {
+                    if self.c2s_hs.len() > MAX_HANDSHAKE {
+                        return self.bail("handshake-too-large");
+                    }
+                }
+                RequestScan::NotWebSocket => {
+                    self.state = State::NotWebSocket;
+                    return;
+                }
+                RequestScan::Upgrade { consumed } => {
+                    self.req_consumed = Some(consumed);
+                    self.req_ok = true;
+                }
+            }
+        } else if !from_client && self.resp_consumed.is_none() {
+            match scan_response(&self.s2c_hs) {
+                ResponseScan::NeedMore => {
+                    if self.s2c_hs.len() > MAX_HANDSHAKE {
+                        return self.bail("handshake-too-large");
+                    }
+                }
+                ResponseScan::NotWebSocket => {
+                    self.state = State::NotWebSocket;
+                    return;
+                }
+                ResponseScan::Accepted { consumed, neg } => {
+                    self.resp_consumed = Some(consumed);
+                    self.neg = neg;
+                }
+            }
+        }
+
+        // Transition once both sides confirmed the upgrade.
+        if self.req_ok {
+            if let (Some(rc), Some(sc)) = (self.req_consumed, self.resp_consumed) {
+                if self.neg.unsupported_extension {
+                    return self.bail("unsupported-extension");
+                }
+                // Move post-handshake tails into the framing buffers, then parse.
+                self.c2s.buf = self.c2s_hs.split_off(rc);
+                self.s2c.buf = self.s2c_hs.split_off(sc);
+                self.state = State::Framing;
+                self.parse_dir(true, out);
+                if matches!(self.state, State::Framing) {
+                    self.parse_dir(false, out);
+                }
+            }
+        }
+    }
+
+    fn feed_framing(&mut self, from_client: bool, data: &[u8], out: &mut Vec<WsMessage>) {
+        let dir = if from_client { &mut self.c2s } else { &mut self.s2c };
+        dir.buf.extend_from_slice(data);
+        self.parse_dir(from_client, out);
+    }
+
+    fn parse_dir(&mut self, from_client: bool, out: &mut Vec<WsMessage>) {
+        loop {
+            let dir = if from_client { &mut self.c2s } else { &mut self.s2c };
+            if dir.buf.len() > MAX_MESSAGE {
+                return self.bail("oversize");
+            }
+            match parse_frame(&dir.buf) {
+                Ok(None) => return,
+                Err(e) => {
+                    return self.bail(match e {
+                        FrameError::ReservedOpcode => "reserved-opcode",
+                        FrameError::ReservedBits => "reserved-bits",
+                        FrameError::BadControlFrame => "bad-control-frame",
+                    });
+                }
+                Ok(Some((frame, consumed))) => {
+                    dir.buf.drain(0..consumed);
+                    self.handle_frame(from_client, frame, out);
+                    if !matches!(self.state, State::Framing) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_frame(&mut self, from_client: bool, frame: Frame, out: &mut Vec<WsMessage>) {
+        // Control frames (0x8-0xA).
+        if frame.opcode & 0x08 != 0 {
+            match frame.opcode {
+                0x8 => {
+                    if frame.payload.len() >= 2 {
+                        self.close_code = Some(u16::from_be_bytes([frame.payload[0], frame.payload[1]]));
+                        if frame.payload.len() > 2 {
+                            self.close_reason =
+                                Some(String::from_utf8_lossy(&frame.payload[2..]).into_owned());
+                        }
+                    }
+                    self.state = State::Closed;
+                }
+                _ => {} // ping / pong: parsed to advance the stream, not emitted
+            }
+            return;
+        }
+
+        // Data frames (0x0 continuation, 0x1 text, 0x2 binary).
+        let dir = if from_client { &mut self.c2s } else { &mut self.s2c };
+        let is_start = frame.opcode == 0x1 || frame.opcode == 0x2;
+        if is_start {
+            if dir.frag_opcode.is_some() {
+                return self.bail("bad-frame"); // new data frame mid-fragmentation
+            }
+            if frame.rsv1 {
+                if !self.neg.permessage_deflate {
+                    return self.bail("rsv1-without-deflate");
+                }
+                dir.frag_compressed = true;
+            } else {
+                dir.frag_compressed = false;
+            }
+            dir.frag_opcode = Some(frame.opcode);
+            dir.frag_payload = frame.payload;
+        } else {
+            // continuation
+            if dir.frag_opcode.is_none() {
+                return self.bail("bad-frame"); // continuation without a start
+            }
+            dir.frag_payload.extend_from_slice(&frame.payload);
+        }
+
+        if dir.frag_payload.len() > MAX_MESSAGE {
+            return self.bail("oversize");
+        }
+
+        if frame.fin {
+            self.complete_message(from_client, out);
+            if !matches!(self.state, State::Framing) {}
+        }
+    }
+
+    /// Finish the in-progress message for a direction: (Task 5 adds inflation).
+    fn complete_message(&mut self, from_client: bool, out: &mut Vec<WsMessage>) {
+        let dir = if from_client { &mut self.c2s } else { &mut self.s2c };
+        let opcode_raw = dir.frag_opcode.take().unwrap();
+        let compressed = dir.frag_compressed;
+        let payload = std::mem::take(&mut dir.frag_payload);
+        dir.frag_compressed = false;
+
+        // Task 4: no deflate negotiated in tests, so compressed is always false here.
+        // Task 5 replaces this block with inflation when `compressed` is true.
+        if compressed {
+            return self.bail("inflate-error"); // placeholder until Task 5
+        }
+
+        let opcode = if opcode_raw == 0x1 { Opcode::Text } else { Opcode::Binary };
+        out.push(WsMessage { from_client, opcode, payload });
+        self.message_count += 1;
+    }
+
+    pub fn finalize(self) -> WsStatus {
+        let (kind, reason) = match self.state {
+            State::Framing | State::Closed => (WsKind::Decoded, None),
+            State::NotWebSocket | State::Handshake => (WsKind::None, None),
+            State::Undecodable(r) => (WsKind::Undecodable, Some(r)),
+        };
+        WsStatus {
+            kind,
+            permessage_deflate: self.neg.permessage_deflate,
+            message_count: self.message_count,
+            close_code: self.close_code,
+            close_reason: self.close_reason,
+            undecodable_reason: reason,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ws::Opcode;
+
+    fn frame(fin: bool, opcode: u8, rsv1: bool, mask: Option<[u8; 4]>, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        let b0 = (if fin { 0x80 } else { 0 }) | (if rsv1 { 0x40 } else { 0 }) | (opcode & 0x0F);
+        v.push(b0);
+        let mask_bit = if mask.is_some() { 0x80 } else { 0 };
+        let len = payload.len();
+        if len < 126 {
+            v.push(mask_bit | len as u8);
+        } else if len <= 0xFFFF {
+            v.push(mask_bit | 126);
+            v.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            v.push(mask_bit | 127);
+            v.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        match mask {
+            Some(key) => {
+                v.extend_from_slice(&key);
+                for (i, b) in payload.iter().enumerate() {
+                    v.push(b ^ key[i % 4]);
+                }
+            }
+            None => v.extend_from_slice(payload),
+        }
+        v
+    }
+
+    const REQ: &[u8] = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    const RESP: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+    /// Drive a full handshake, returns a tap in Framing state.
+    fn handshaken() -> WsTap {
+        let mut t = WsTap::new();
+        let mut out = Vec::new();
+        t.on_client_bytes(REQ, &mut out);
+        t.on_server_bytes(RESP, &mut out);
+        assert!(out.is_empty());
+        t
+    }
+
+    #[test]
+    fn plain_http_response_is_none() {
+        let mut t = WsTap::new();
+        let mut out = Vec::new();
+        t.on_client_bytes(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n", &mut out);
+        t.on_server_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi", &mut out);
+        let s = t.finalize();
+        assert_eq!(s.kind, WsKind::None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn decodes_masked_client_text() {
+        let mut t = handshaken();
+        let mut out = Vec::new();
+        t.on_client_bytes(&frame(true, 0x1, false, Some([1, 2, 3, 4]), b"hi client"), &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].from_client, true);
+        assert_eq!(out[0].opcode, Opcode::Text);
+        assert_eq!(out[0].payload, b"hi client");
+    }
+
+    #[test]
+    fn decodes_server_binary_and_reassembles_fragments() {
+        let mut t = handshaken();
+        let mut out = Vec::new();
+        // fragmented binary: first (fin=0, binary) + continuation (fin=1)
+        t.on_server_bytes(&frame(false, 0x2, false, None, b"AAAA"), &mut out);
+        assert!(out.is_empty(), "message not complete until FIN");
+        t.on_server_bytes(&frame(true, 0x0, false, None, b"BBBB"), &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].opcode, Opcode::Binary);
+        assert_eq!(out[0].payload, b"AAAABBBB");
+    }
+
+    #[test]
+    fn ping_between_fragments_is_ignored() {
+        let mut t = handshaken();
+        let mut out = Vec::new();
+        t.on_server_bytes(&frame(false, 0x1, false, None, b"AA"), &mut out);
+        t.on_server_bytes(&frame(true, 0x9, false, None, b"pingpayload"[..5].as_ref()), &mut out); // ping
+        t.on_server_bytes(&frame(true, 0x0, false, None, b"BB"), &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload, b"AABB");
+    }
+
+    #[test]
+    fn close_records_code_and_reason() {
+        let mut t = handshaken();
+        let mut out = Vec::new();
+        let mut payload = vec![0x03, 0xE8]; // 1000
+        payload.extend_from_slice(b"bye");
+        t.on_client_bytes(&frame(true, 0x8, false, Some([9, 9, 9, 9]), &payload), &mut out);
+        let s = t.finalize();
+        assert_eq!(s.kind, WsKind::Decoded);
+        assert_eq!(s.close_code, Some(1000));
+        assert_eq!(s.close_reason.as_deref(), Some("bye"));
+    }
+
+    #[test]
+    fn invalid_frame_is_undecodable() {
+        let mut t = handshaken();
+        let mut out = Vec::new();
+        // reserved opcode 0x3
+        t.on_client_bytes(&frame(true, 0x3, false, Some([1, 2, 3, 4]), b"x"), &mut out);
+        let s = t.finalize();
+        assert_eq!(s.kind, WsKind::Undecodable);
+        assert_eq!(s.undecodable_reason, Some("reserved-opcode"));
+    }
+
+    #[test]
+    fn rsv1_without_deflate_is_undecodable() {
+        let mut t = handshaken(); // handshake did NOT negotiate deflate
+        let mut out = Vec::new();
+        t.on_server_bytes(&frame(true, 0x2, true, None, b"z"), &mut out);
+        let s = t.finalize();
+        assert_eq!(s.kind, WsKind::Undecodable);
+        assert_eq!(s.undecodable_reason, Some("rsv1-without-deflate"));
+    }
+
+    #[test]
+    fn handshake_header_cap_is_undecodable() {
+        let mut t = WsTap::new();
+        let mut out = Vec::new();
+        let huge = vec![b'a'; 70 * 1024]; // > 64 KiB, no CRLFCRLF
+        t.on_client_bytes(&huge, &mut out);
+        let s = t.finalize();
+        assert_eq!(s.kind, WsKind::Undecodable);
+        assert_eq!(s.undecodable_reason, Some("handshake-too-large"));
+    }
+
+    #[test]
+    fn message_count_and_ordering() {
+        let mut t = handshaken();
+        let mut out = Vec::new();
+        t.on_client_bytes(&frame(true, 0x1, false, Some([1, 2, 3, 4]), b"c1"), &mut out);
+        t.on_server_bytes(&frame(true, 0x1, false, None, b"s1"), &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].from_client, true);
+        assert_eq!(out[1].from_client, false);
+        let s = t.finalize();
+        assert_eq!(s.message_count, 2);
+    }
+}
