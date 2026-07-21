@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use crate::ntlm::{detect_challenge, NtlmChallenge};
+use crate::ntlm::{detect_authenticate, detect_challenge, NtlmChallenge, NtlmResponse};
 use crate::ws::{Opcode, WsMessage, WsStatus};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -41,12 +41,13 @@ pub struct ConnDump {
     ws_tried: bool,
     ws_path: PathBuf,
     start: String,
-    // NTLM CHALLENGE capture (independent of the raw streams).
+    // NTLM exchange capture (independent of the raw streams): bounded prefixes of
+    // both directions, parsed and emitted as one grouped record at finish().
     ntlm_dump: bool,
     server_name: Option<String>,
     ntlm_path: PathBuf,
-    ntlm_buf: Vec<u8>,
-    ntlm_scan_done: bool,
+    ntlm_c2s_buf: Vec<u8>,
+    ntlm_s2c_buf: Vec<u8>,
 }
 
 impl Dumper {
@@ -76,62 +77,76 @@ impl Dumper {
             ntlm_dump: self.opts.ntlm_dump,
             server_name: self.opts.server_name.clone(),
             ntlm_path: self.dir.join("ntlm.jsonl"),
-            ntlm_buf: Vec::new(),
-            ntlm_scan_done: false,
+            ntlm_c2s_buf: Vec::new(),
+            ntlm_s2c_buf: Vec::new(),
         }
     }
 }
 
 impl ConnDump {
-    pub fn write_c2s(&mut self, b: &[u8]) { write_some(&mut self.c2s, b); }
+    pub fn write_c2s(&mut self, b: &[u8]) {
+        write_some(&mut self.c2s, b);
+        ntlm_accumulate(&mut self.ntlm_c2s_buf, b, self.ntlm_dump);
+    }
     pub fn write_s2c(&mut self, b: &[u8]) {
         write_some(&mut self.s2c, b);
-        self.ntlm_scan(b);
+        ntlm_accumulate(&mut self.ntlm_s2c_buf, b, self.ntlm_dump);
     }
 
-    /// Feed server→client plaintext to the NTLM CHALLENGE detector. The auth
-    /// handshake is tiny and lands before the tunnel goes opaque, so we buffer a
-    /// bounded prefix; on the first hit, append one record to `ntlm.jsonl` and
-    /// stop scanning this connection.
-    fn ntlm_scan(&mut self, b: &[u8]) {
-        const CAP: usize = 64 * 1024;
-        if !self.ntlm_dump || self.ntlm_scan_done {
+    /// Assemble and append the single grouped NTLM record for this connection.
+    /// Called at connection close so both the Type-2 challenge (from `.s2c`) and
+    /// the Type-3 response (from `.c2s`) are in hand and land on one line —
+    /// yielding a hashcat-ready net-NTLMv2 hash when both halves were seen.
+    /// Emits nothing if neither half was observed.
+    fn emit_ntlm_record(&self) {
+        let challenge = detect_challenge(&self.ntlm_s2c_buf);
+        let response = detect_authenticate(&self.ntlm_c2s_buf);
+        if challenge.is_none() && response.is_none() {
             return;
         }
-        let room = CAP.saturating_sub(self.ntlm_buf.len());
-        if room > 0 {
-            self.ntlm_buf.extend_from_slice(&b[..room.min(b.len())]);
-        }
-        if let Some(ch) = detect_challenge(&self.ntlm_buf) {
-            self.write_ntlm_record(&ch);
-            self.ntlm_scan_done = true;
-            self.ntlm_buf = Vec::new();
-        } else if self.ntlm_buf.len() >= CAP {
-            // Bounded: the challenge was not in the first CAP bytes; stop scanning.
-            self.ntlm_scan_done = true;
-            self.ntlm_buf = Vec::new();
-        }
-    }
 
-    /// Append one NTLM CHALLENGE record (nonce + gateway computer/domain names +
-    /// which target it connected to) as a JSON line to `ntlm.jsonl`.
-    fn write_ntlm_record(&self, ch: &NtlmChallenge) {
+        let net_ntlmv2 = match (&challenge, &response) {
+            (Some(ch), Some(r)) => build_net_ntlmv2(ch, r),
+            _ => None,
+        };
+        let crackable = net_ntlmv2.is_some();
+        // A credential was actually submitted only if a Type-3 was captured;
+        // otherwise the outcome ("success"/"denied") is not meaningful.
+        let auth_result = response.as_ref().map(|_| {
+            if s2c_saw_success(&self.ntlm_s2c_buf) { "success" } else { "denied" }
+        });
+        // Raw carrier as sent, e.g. "Negotiate <base64>".
+        let carrier = |scheme: &Option<String>, token: &Option<String>| {
+            scheme.as_deref().zip(token.as_deref()).map(|(s, t)| format!("{s} {t}"))
+        };
+
         let rec = serde_json::json!({
             "conn_id": self.id,
             "ts": now_iso(),
             "client": self.client.to_string(),
             "server": self.server.to_string(),
             "server_name": self.server_name,
-            "server_challenge": hex(&ch.server_challenge),
-            "target_name": ch.target_name,
-            "nb_computer_name": ch.nb_computer_name,
-            "nb_domain_name": ch.nb_domain_name,
-            "dns_computer_name": ch.dns_computer_name,
-            "dns_domain_name": ch.dns_domain_name,
-            // The raw WWW-Authenticate value as sent ("NTLM|Negotiate <base64>"):
-            // the full Type-2 for downstream NTLM tooling / verification.
-            "www_authenticate": ch.scheme.as_deref().zip(ch.token.as_deref())
-                .map(|(s, t)| format!("{s} {t}")),
+            // request context (c2s)
+            "endpoint": http_endpoint(&self.ntlm_c2s_buf),
+            "rdg_user_id": rdg_user_id(&self.ntlm_c2s_buf),
+            // net-NTLMv2: identity + proof (Type-3) paired with the challenge (Type-2)
+            "username": response.as_ref().and_then(|r| r.username.clone()),
+            "domain": response.as_ref().and_then(|r| r.domain.clone()),
+            "workstation": response.as_ref().and_then(|r| r.workstation.clone()),
+            "server_challenge": challenge.as_ref().map(|c| hex(&c.server_challenge)),
+            "nt_proof_str": response.as_ref().and_then(|r| r.nt_proof_str.as_deref().map(hex)),
+            "blob": response.as_ref().and_then(|r| r.blob.as_deref().map(hex)),
+            "net_ntlmv2": net_ntlmv2,
+            // gateway machine name (Type-2)
+            "target_name": challenge.as_ref().and_then(|c| c.target_name.clone()),
+            "nb_computer_name": challenge.as_ref().and_then(|c| c.nb_computer_name.clone()),
+            "nb_domain_name": challenge.as_ref().and_then(|c| c.nb_domain_name.clone()),
+            "dns_computer_name": challenge.as_ref().and_then(|c| c.dns_computer_name.clone()),
+            "dns_domain_name": challenge.as_ref().and_then(|c| c.dns_domain_name.clone()),
+            // raw carriers, verbatim as sent (full wire Type-2 / Type-3 messages)
+            "www_authenticate": challenge.as_ref().and_then(|c| carrier(&c.scheme, &c.token)),
+            "authorization": response.as_ref().and_then(|r| carrier(&r.scheme, &r.token)),
+            "auth_result": auth_result,
         });
         match OpenOptions::new().create(true).append(true).open(&self.ntlm_path) {
             Ok(mut f) => {
@@ -143,8 +158,12 @@ impl ConnDump {
         }
         tracing::info!(
             conn = %self.id,
-            computer = ch.nb_computer_name.as_deref().or(ch.dns_computer_name.as_deref()).unwrap_or("?"),
-            "NTLM challenge captured"
+            computer = challenge.as_ref()
+                .and_then(|c| c.nb_computer_name.as_deref().or(c.dns_computer_name.as_deref()))
+                .unwrap_or("?"),
+            user = response.as_ref().and_then(|r| r.username.as_deref()).unwrap_or("?"),
+            crackable,
+            "NTLM exchange captured"
         );
     }
 
@@ -192,6 +211,10 @@ impl ConnDump {
     }
 
     pub fn finish(self, dir: &Path, ws: &WsStatus) {
+        // Emit the single grouped NTLM record now that both directions are in hand.
+        if self.ntlm_dump {
+            self.emit_ntlm_record();
+        }
         let rec = serde_json::json!({
             "conn_id": self.id, "client": self.client.to_string(),
             "server": self.server.to_string(), "start_ts": self.start, "end_ts": now_iso(),
@@ -228,6 +251,106 @@ fn now_iso() -> String {
 /// Lowercase hex of a byte slice (e.g. the 8-byte server challenge → 16 chars).
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+const NTLM_CAP: usize = 64 * 1024;
+
+/// Append `b` to a bounded per-connection NTLM prefix buffer (only while
+/// `ntlm_dump` is on and the cap is unmet). The auth handshake is small and
+/// lands before the tunnel goes opaque, so a bounded prefix of each direction
+/// suffices to recover the whole exchange without buffering an RDP session.
+fn ntlm_accumulate(buf: &mut Vec<u8>, b: &[u8], enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let room = NTLM_CAP.saturating_sub(buf.len());
+    if room > 0 {
+        buf.extend_from_slice(&b[..room.min(b.len())]);
+    }
+}
+
+/// Assemble the hashcat net-NTLMv2 line (mode 5600):
+/// `username::domain:server_challenge:nt_proof_str:blob`. `None` unless the
+/// Type-3 carried both a username and an NtChallengeResponse.
+fn build_net_ntlmv2(ch: &NtlmChallenge, r: &NtlmResponse) -> Option<String> {
+    let user = r.username.as_deref()?;
+    let domain = r.domain.as_deref().unwrap_or("");
+    let nt_proof = r.nt_proof_str.as_deref()?;
+    let blob = r.blob.as_deref()?;
+    Some(format!(
+        "{user}::{domain}:{}:{}:{}",
+        hex(&ch.server_challenge),
+        hex(nt_proof),
+        hex(blob)
+    ))
+}
+
+/// Naive byte-substring search.
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// The first request line's "METHOD SP request-target", dropping the trailing
+/// HTTP version — e.g. "RDG_OUT_DATA /remoteDesktopGateway/". `None` if there is
+/// no CRLF-terminated first line or it is not valid UTF-8.
+fn http_endpoint(c2s: &[u8]) -> Option<String> {
+    let end = find_subslice(c2s, b"\r\n")?;
+    let line = std::str::from_utf8(&c2s[..end]).ok()?;
+    let target = match line.rfind(" HTTP/") {
+        Some(i) => &line[..i],
+        None => line,
+    };
+    let target = target.trim();
+    (!target.is_empty()).then(|| target.to_string())
+}
+
+/// Decode the `RDG-User-Id` request header (base64 of a UTF-16LE string) to its
+/// UPN, e.g. "Administrator@RDGW1".
+fn rdg_user_id(c2s: &[u8]) -> Option<String> {
+    let v = header_value(c2s, b"rdg-user-id")?;
+    let raw = B64.decode(v).ok()?;
+    Some(crate::ntlm::utf16le(&raw))
+}
+
+/// Case-insensitive lookup of a header value within the first request's header
+/// block (up to the blank line). Returns the trimmed value bytes.
+fn header_value<'a>(buf: &'a [u8], name_lower: &[u8]) -> Option<&'a [u8]> {
+    let head_end = find_subslice(buf, b"\r\n\r\n").unwrap_or(buf.len());
+    for line in buf[..head_end].split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
+        let (k, v) = line.split_at(colon);
+        if !k.eq_ignore_ascii_case(name_lower) {
+            continue;
+        }
+        let v = &v[1..]; // skip ':'
+        let start = v.iter().position(|&b| !matches!(b, b' ' | b'\t')).unwrap_or(v.len());
+        let v = &v[start..];
+        let end = v.iter().rposition(|&b| !matches!(b, b' ' | b'\t')).map_or(0, |i| i + 1);
+        return Some(&v[..end]);
+    }
+    None
+}
+
+/// Best-effort: did the server return a success status (101 or 2xx) anywhere in
+/// the captured s2c prefix? Distinguishes an accepted credential submission
+/// ("success") from a rejected one ("denied").
+fn s2c_saw_success(s2c: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(rel) = find_subslice(&s2c[from..], b"HTTP/1.") {
+        let i = from + rel;
+        let code_at = i + 9; // "HTTP/1." + minor digit + space
+        if let Some(code) = s2c.get(code_at..code_at + 3) {
+            if code == b"101" || code[0] == b'2' {
+                return true;
+            }
+        }
+        from = i + 7;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -371,5 +494,96 @@ mod tests {
         assert!(!dir.path().join(format!("{id}.c2s")).exists());
         assert!(!dir.path().join(format!("{id}.s2c")).exists());
         assert!(!dir.path().join("ntlm.jsonl").exists());
+    }
+
+    /// base64 of a UPN as UTF-16LE — how RD Gateway encodes `RDG-User-Id`.
+    fn rdg_user_id_b64(upn: &str) -> String {
+        let mut bytes = Vec::new();
+        for u in upn.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        B64.encode(bytes)
+    }
+
+    #[test]
+    fn ntlm_dump_groups_challenge_and_response_into_one_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Dumper::new(dir.path(), DumpOptions {
+            raw_dump: false, ntlm_dump: true, server_name: Some("gw.rdgw.test".into()),
+        }).unwrap();
+        let mut c = d.open_conn(
+            "10.20.1.5:51616".parse().unwrap(),
+            "10.20.2.10:443".parse().unwrap());
+        let id = c.id.clone();
+
+        let chal_b64 = B64.encode(crate::ntlm::CHALLENGE_MESSAGE_EXAMPLE);
+        let auth_b64 = B64.encode(crate::ntlm::AUTHENTICATE_MESSAGE_EXAMPLE);
+        let uid = rdg_user_id_b64("Administrator@RDGW1");
+
+        // Client request: endpoint, RDG-User-Id, and the Type-3 response.
+        let c2s = format!(
+            "RDG_OUT_DATA /remoteDesktopGateway/ HTTP/1.1\r\n\
+             RDG-User-Id: {uid}\r\n\
+             Authorization: NTLM {auth_b64}\r\n\r\n");
+        c.write_c2s(c2s.as_bytes());
+        // Server: 401 challenge, then 101 (auth accepted).
+        c.write_s2c(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {chal_b64}\r\n\r\n").as_bytes());
+        c.write_s2c(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
+        c.finish(dir.path(), &crate::ws::WsStatus::none());
+
+        // Exactly one grouped line for the connection — not two.
+        let body = std::fs::read_to_string(dir.path().join("ntlm.jsonl")).unwrap();
+        assert_eq!(body.lines().count(), 1, "one grouped record per connection");
+        let rec: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+
+        assert_eq!(rec["conn_id"], id);
+        assert_eq!(rec["server_name"], "gw.rdgw.test");
+        assert_eq!(rec["endpoint"], "RDG_OUT_DATA /remoteDesktopGateway/");
+        assert_eq!(rec["rdg_user_id"], "Administrator@RDGW1");
+        // Type-3 identity (from c2s)
+        assert_eq!(rec["username"], "alice");
+        assert_eq!(rec["domain"], "CORP");
+        assert_eq!(rec["workstation"], "WS01");
+        // Type-2 challenge + gateway name (from s2c)
+        assert_eq!(rec["server_challenge"], "0123456789abcdef");
+        assert_eq!(rec["nb_computer_name"], "Server");
+        // Type-3 proof (from c2s)
+        assert_eq!(rec["nt_proof_str"], "0102030405060708090a0b0c0d0e0f10");
+        assert_eq!(rec["blob"], "0101000000000000");
+        // Assembled hashcat -m 5600 line (both halves)
+        assert_eq!(
+            rec["net_ntlmv2"],
+            "alice::CORP:0123456789abcdef:0102030405060708090a0b0c0d0e0f10:0101000000000000"
+        );
+        // Raw carriers, both directions, verbatim as sent
+        assert_eq!(rec["www_authenticate"], format!("NTLM {chal_b64}"));
+        assert_eq!(rec["authorization"], format!("NTLM {auth_b64}"));
+        // Outcome: 401 -> 101 means the credential was accepted
+        assert_eq!(rec["auth_result"], "success");
+    }
+
+    #[test]
+    fn ntlm_dump_challenge_only_leaves_response_fields_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Dumper::new(dir.path(), DumpOptions {
+            raw_dump: false, ntlm_dump: true, server_name: None,
+        }).unwrap();
+        let mut c = d.open_conn("10.0.0.1:1".parse().unwrap(), "10.0.0.2:443".parse().unwrap());
+        let chal_b64 = B64.encode(crate::ntlm::CHALLENGE_MESSAGE_EXAMPLE);
+        // A client that never submits credentials: a Type-1 negotiate, no Type-3.
+        c.write_c2s(b"GET /rpc/rpcproxy.dll HTTP/1.1\r\nAuthorization: NTLM TlRMTVNTUAABAAAA\r\n\r\n");
+        c.write_s2c(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {chal_b64}\r\n\r\n").as_bytes());
+        c.finish(dir.path(), &crate::ws::WsStatus::none());
+
+        let body = std::fs::read_to_string(dir.path().join("ntlm.jsonl")).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        let rec: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        // Challenge captured...
+        assert_eq!(rec["server_challenge"], "0123456789abcdef");
+        assert_eq!(rec["nb_computer_name"], "Server");
+        // ...but no response half, so nothing crackable and no outcome.
+        assert!(rec["username"].is_null());
+        assert!(rec["net_ntlmv2"].is_null());
+        assert!(rec["auth_result"].is_null());
     }
 }

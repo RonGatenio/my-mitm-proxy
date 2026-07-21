@@ -43,6 +43,30 @@ pub struct NtlmChallenge {
     pub token: Option<String>,
 }
 
+/// A parsed NTLM AUTHENTICATE_MESSAGE (NTLMSSP Type 3) — the client's response.
+/// Together with the Type-2 `server_challenge` from the same connection, the
+/// `nt_proof_str` + `blob` form a crackable net-NTLMv2 hash (hashcat `-m 5600`:
+/// `username::domain:server_challenge:nt_proof_str:blob`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NtlmResponse {
+    /// AUTHENTICATE_MESSAGE DomainName (the account's domain / NetBIOS name).
+    pub domain: Option<String>,
+    /// AUTHENTICATE_MESSAGE UserName.
+    pub username: Option<String>,
+    /// AUTHENTICATE_MESSAGE Workstation (the client machine name).
+    pub workstation: Option<String>,
+    /// NtChallengeResponse[0..16] — the NTProofStr (HMAC-MD5 over the challenge).
+    pub nt_proof_str: Option<Vec<u8>>,
+    /// NtChallengeResponse[16..] — the NTLMv2 "temp"/blob (response version,
+    /// timestamp, client challenge, target AV pairs).
+    pub blob: Option<Vec<u8>>,
+    /// Auth scheme that carried the response — "NTLM" or "Negotiate" — when found
+    /// in an `Authorization` header (`None` for a raw-bytes hit).
+    pub scheme: Option<String>,
+    /// The verbatim base64 token as sent — the full wire Type-3 / SPNEGO message.
+    pub token: Option<String>,
+}
+
 const SIG: &[u8; 8] = b"NTLMSSP\0";
 
 fn le_u16(b: &[u8], o: usize) -> u16 {
@@ -54,7 +78,7 @@ fn le_u32(b: &[u8], o: usize) -> u32 {
 }
 
 /// Decode a UTF-16LE byte slice (lossy; a trailing odd byte is ignored).
-fn utf16le(b: &[u8]) -> String {
+pub(crate) fn utf16le(b: &[u8]) -> String {
     let units: Vec<u16> = b
         .chunks_exact(2)
         .map(|p| u16::from_le_bytes([p[0], p[1]]))
@@ -76,6 +100,23 @@ fn read_field_str(msg: &[u8], fields_off: usize) -> Option<String> {
         return None;
     }
     Some(utf16le(&msg[off..end]))
+}
+
+/// Read a `*_Fields` descriptor (Len `u16` @ `fields_off`, BufferOffset `u32`
+/// @ `fields_off + 4`) and return the referenced raw payload bytes, if non-empty
+/// and in-bounds. (Byte-slice sibling of `read_field_str`, for the Type-3
+/// NtChallengeResponse.)
+fn read_field_bytes(msg: &[u8], fields_off: usize) -> Option<&[u8]> {
+    let len = le_u16(msg, fields_off) as usize;
+    let off = le_u32(msg, fields_off + 4) as usize;
+    if len == 0 {
+        return None;
+    }
+    let end = off.checked_add(len)?;
+    if end > msg.len() {
+        return None;
+    }
+    Some(&msg[off..end])
 }
 
 /// Parse a CHALLENGE_MESSAGE from a slice that begins at the NTLMSSP signature.
@@ -144,6 +185,48 @@ fn scan_raw(buf: &[u8]) -> Option<NtlmChallenge> {
         if &buf[i..i + 8] == SIG {
             if let Some(c) = parse_challenge(&buf[i..]) {
                 return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Parse an AUTHENTICATE_MESSAGE from a slice that begins at the NTLMSSP
+/// signature. Returns `None` if the slice is not a well-formed Type-3 message.
+/// Layout per [MS-NLMP] §2.2.1.3: DomainName/UserName/Workstation via
+/// `read_field_str`; NtChallengeResponse (NTProofStr ‖ blob) via
+/// `read_field_bytes`. The fixed header runs through WorkstationFields (0x34).
+fn parse_authenticate(msg: &[u8]) -> Option<NtlmResponse> {
+    if msg.len() < 52 || &msg[0..8] != SIG || le_u32(msg, 8) != 3 {
+        return None;
+    }
+    let mut r = NtlmResponse {
+        domain: read_field_str(msg, 28),      // DomainNameFields  @ 0x1c
+        username: read_field_str(msg, 36),    // UserNameFields    @ 0x24
+        workstation: read_field_str(msg, 44), // WorkstationFields @ 0x2c
+        ..Default::default()
+    };
+    // NtChallengeResponse @ 0x14 = NTProofStr (first 16 bytes) ‖ blob (rest).
+    if let Some(nt) = read_field_bytes(msg, 20) {
+        if nt.len() >= 16 {
+            r.nt_proof_str = Some(nt[..16].to_vec());
+            r.blob = Some(nt[16..].to_vec());
+        }
+    }
+    Some(r)
+}
+
+/// Find an AUTHENTICATE_MESSAGE at any offset where the raw NTLMSSP signature
+/// appears in `buf` (also used to locate a signature embedded in a decoded
+/// SPNEGO token). Type-3 sibling of `scan_raw`.
+fn scan_raw_auth(buf: &[u8]) -> Option<NtlmResponse> {
+    if buf.len() < 8 {
+        return None;
+    }
+    for i in 0..=buf.len() - 8 {
+        if &buf[i..i + 8] == SIG {
+            if let Some(r) = parse_authenticate(&buf[i..]) {
+                return Some(r);
             }
         }
     }
@@ -243,6 +326,26 @@ pub fn detect_challenge(stream: &[u8]) -> Option<NtlmChallenge> {
     None
 }
 
+/// Scan a decrypted byte stream (client→server) for the first NTLM
+/// AUTHENTICATE_MESSAGE (Type 3), through raw bytes, base64 `NTLM` tokens, and
+/// SPNEGO `Negotiate` tokens. The Type-3 carries the account identity and the
+/// NTLMv2 response needed (with the Type-2 challenge) to assemble a net-NTLMv2
+/// hash.
+pub fn detect_authenticate(stream: &[u8]) -> Option<NtlmResponse> {
+    if let Some(r) = scan_raw_auth(stream) {
+        return Some(r);
+    }
+    for (scheme, token) in auth_tokens(stream) {
+        if let Some(mut r) = scan_raw_auth(&base64_decode(token)) {
+            // Preserve the raw wire carrier alongside the decoded fields.
+            r.scheme = Some(scheme.to_string());
+            r.token = Some(String::from_utf8_lossy(token).into_owned());
+            return Some(r);
+        }
+    }
+    None
+}
+
 /// The CHALLENGE_MESSAGE from [MS-NLMP] §4.2 example values, laid out per
 /// §2.2.1.2. Server challenge `0123456789abcdef`, TargetName "Server",
 /// TargetInfo NbDomainName "Domain" + NbComputerName "Server". At module scope
@@ -279,6 +382,43 @@ pub(crate) const CHALLENGE_MESSAGE_EXAMPLE: [u8; 104] = [
     0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76, 0x00, 0x65, 0x00, 0x72, 0x00,
     //   MsvAvEOL (AvId=0, Len=0)
     0x00, 0x00, 0x00, 0x00,
+];
+
+/// A hand-laid-out AUTHENTICATE_MESSAGE (NTLMSSP Type 3) per [MS-NLMP] §2.2.1.3,
+/// for the Type-3 parser tests (and reused by the dump-path tests via
+/// `crate::ntlm::AUTHENTICATE_MESSAGE_EXAMPLE`). No Version/MIC block: the payload
+/// starts right after NegotiateFlags at 0x40. Values: Domain "CORP", User "alice",
+/// Workstation "WS01", NtChallengeResponse = NTProofStr(01..10) ‖ blob(01 01 00…).
+#[cfg(test)]
+#[rustfmt::skip]
+pub(crate) const AUTHENTICATE_MESSAGE_EXAMPLE: [u8; 114] = [
+    // 0x00  Signature "NTLMSSP\0"
+    0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00,
+    // 0x08  MessageType = 3 (AUTHENTICATE)
+    0x03, 0x00, 0x00, 0x00,
+    // 0x0c  LmChallengeResponseFields: Len=0, MaxLen=0, BufferOffset=64
+    0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+    // 0x14  NtChallengeResponseFields: Len=24, MaxLen=24, BufferOffset=64
+    0x18, 0x00, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+    // 0x1c  DomainNameFields: Len=8, MaxLen=8, BufferOffset=88
+    0x08, 0x00, 0x08, 0x00, 0x58, 0x00, 0x00, 0x00,
+    // 0x24  UserNameFields: Len=10, MaxLen=10, BufferOffset=96
+    0x0a, 0x00, 0x0a, 0x00, 0x60, 0x00, 0x00, 0x00,
+    // 0x2c  WorkstationFields: Len=8, MaxLen=8, BufferOffset=106
+    0x08, 0x00, 0x08, 0x00, 0x6a, 0x00, 0x00, 0x00,
+    // 0x34  EncryptedRandomSessionKeyFields: Len=0, MaxLen=0, BufferOffset=0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x3c  NegotiateFlags = NTLMSSP_NEGOTIATE_UNICODE
+    0x01, 0x00, 0x00, 0x00,
+    // 0x40  NtChallengeResponse (24): NTProofStr(16) ‖ blob(8)
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // 0x58  DomainName "CORP" (UTF-16LE)
+    0x43, 0x00, 0x4f, 0x00, 0x52, 0x00, 0x50, 0x00,
+    // 0x60  UserName "alice" (UTF-16LE)
+    0x61, 0x00, 0x6c, 0x00, 0x69, 0x00, 0x63, 0x00, 0x65, 0x00,
+    // 0x6a  Workstation "WS01" (UTF-16LE)
+    0x57, 0x00, 0x53, 0x00, 0x30, 0x00, 0x31, 0x00,
 ];
 
 #[cfg(test)]
@@ -384,5 +524,69 @@ mod tests {
         assert_eq!(base64_decode(b"TWE="), b"Ma");
         assert_eq!(base64_decode(b"TQ=="), b"M");
         assert!(base64_decode(b"").is_empty());
+    }
+
+    #[test]
+    fn detects_authenticate_in_raw_bytes() {
+        let r = detect_authenticate(&AUTHENTICATE_MESSAGE_EXAMPLE).expect("authenticate detected");
+        assert_eq!(r.username.as_deref(), Some("alice"));
+        assert_eq!(r.domain.as_deref(), Some("CORP"));
+        assert_eq!(r.workstation.as_deref(), Some("WS01"));
+        assert_eq!(
+            r.nt_proof_str.as_deref(),
+            Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16][..])
+        );
+        assert_eq!(r.blob.as_deref(), Some(&[1, 1, 0, 0, 0, 0, 0, 0][..]));
+        // Found as raw bytes (no auth header) -> no carrier scheme/token.
+        assert_eq!(r.scheme, None);
+        assert_eq!(r.token, None);
+    }
+
+    #[test]
+    fn detects_authenticate_in_base64_authorization() {
+        let b64 = base64_encode(&AUTHENTICATE_MESSAGE_EXAMPLE);
+        let req = format!(
+            "RDG_OUT_DATA /remoteDesktopGateway/ HTTP/1.1\r\n\
+             Authorization: NTLM {b64}\r\n\r\n"
+        );
+        let r = detect_authenticate(req.as_bytes()).expect("authenticate detected in header");
+        assert_eq!(r.username.as_deref(), Some("alice"));
+        assert_eq!(r.domain.as_deref(), Some("CORP"));
+        // The raw Authorization carrier is surfaced: scheme + verbatim token.
+        assert_eq!(r.scheme.as_deref(), Some("NTLM"));
+        assert_eq!(r.token.as_deref(), Some(b64.as_str()));
+    }
+
+    #[test]
+    fn detects_authenticate_embedded_in_negotiate_spnego_token() {
+        // The NTLMSSP AUTHENTICATE_MESSAGE embedded inside a larger SPNEGO
+        // NegTokenResp, as it appears in an `Authorization: Negotiate` header.
+        let prefix: &[u8] = &[0xa1, 0x82, 0x01, 0x00, 0x30, 0x82, 0x00, 0xfc, 0xa2, 0x03];
+        let mut token = prefix.to_vec();
+        token.extend_from_slice(&AUTHENTICATE_MESSAGE_EXAMPLE);
+        let b64 = base64_encode(&token);
+        let req = format!("POST /rpc/rpcproxy.dll HTTP/1.1\r\nAuthorization: Negotiate {b64}\r\n\r\n");
+        let r = detect_authenticate(req.as_bytes()).expect("authenticate detected in SPNEGO token");
+        assert_eq!(r.username.as_deref(), Some("alice"));
+        assert_eq!(r.workstation.as_deref(), Some("WS01"));
+        assert_eq!(r.scheme.as_deref(), Some("Negotiate"));
+        assert_eq!(r.token.as_deref(), Some(b64.as_str()));
+    }
+
+    #[test]
+    fn detect_authenticate_ignores_challenge_and_type1() {
+        // A CHALLENGE_MESSAGE (Type 2) is not an AUTHENTICATE.
+        assert!(detect_authenticate(&CHALLENGE_MESSAGE_EXAMPLE).is_none());
+        // A NEGOTIATE_MESSAGE (Type 1) is not an AUTHENTICATE.
+        let mut m = SIG.to_vec();
+        m.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // MessageType = 1
+        m.resize(64, 0);
+        assert!(detect_authenticate(&m).is_none());
+    }
+
+    #[test]
+    fn detect_challenge_ignores_authenticate() {
+        // Symmetric guard: the Type-2 detector must not match a Type-3 message.
+        assert!(detect_challenge(&AUTHENTICATE_MESSAGE_EXAMPLE).is_none());
     }
 }
