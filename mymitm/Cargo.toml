@@ -23,6 +23,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls = { version = "0.23", default-features = false, features = ["ring","std"] }
 rustls-pemfile = "2"
 socket2 = "0.6"
+flate2 = "1"
+base64 = "0.22"
 
 [build-dependencies]
 cargo_metadata = "0.23"
