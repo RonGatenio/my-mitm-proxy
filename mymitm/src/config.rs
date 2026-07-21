@@ -50,6 +50,10 @@ struct FileCfg {
     #[serde(default = "d_raw_dump")] raw_dump: bool,
     /// Scan the decrypted .s2c stream for the NTLM CHALLENGE -> ntlm.jsonl.
     #[serde(default = "d_ntlm_dump")] ntlm_dump: bool,
+    /// Preflight-probe eBPF support at startup before committing to the real
+    /// interfaces (default true). `--verify-bpf-support=false` skips the probe and
+    /// goes straight to load+attach. Only consulted for the eBPF data plane.
+    #[serde(default = "d_verify_bpf")] verify_bpf_support: bool,
 }
 fn d_port() -> u16 { 443 }
 fn d_tun() -> String { "tun0".into() }
@@ -66,6 +70,7 @@ fn d_preserve() -> bool { true }
 fn d_ws_decode() -> bool { true }
 fn d_raw_dump() -> bool { true }
 fn d_ntlm_dump() -> bool { true }
+fn d_verify_bpf() -> bool { true }
 
 #[derive(Parser, Debug)]
 #[command(version, about = "transparent TLS MITM with source-IP preservation")]
@@ -124,6 +129,11 @@ struct Cli {
     /// ntlm.jsonl (`--ntlm-dump=true|false`). Default true; overrides `ntlm_dump`
     /// in the config file when given.
     #[arg(long = "ntlm-dump", action = ArgAction::Set)] ntlm_dump: Option<bool>,
+    /// Preflight-check that eBPF is usable on this kernel before startup
+    /// (`--verify-bpf-support=true|false`, default true). False skips the probe.
+    /// eBPF data plane only; ignored for `--data-plane iproute`.
+    #[arg(long = "verify-bpf-support", env = "MYMITM_VERIFY_BPF_SUPPORT", action = ArgAction::Set)]
+    verify_bpf_support: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +161,7 @@ pub struct Settings {
     pub ws_decode: bool,
     pub raw_dump: bool,
     pub ntlm_dump: bool,
+    pub verify_bpf_support: bool,
 }
 
 impl Settings {
@@ -187,6 +198,7 @@ impl Settings {
             ws_decode: f.ws_decode,
             raw_dump: f.raw_dump,
             ntlm_dump: f.ntlm_dump,
+            verify_bpf_support: f.verify_bpf_support,
         })
     }
 
@@ -214,6 +226,7 @@ impl Settings {
         if let Some(v) = cli.ws_decode { s.ws_decode = v; }
         if let Some(v) = cli.raw_dump { s.raw_dump = v; }
         if let Some(v) = cli.ntlm_dump { s.ntlm_dump = v; }
+        if let Some(v) = cli.verify_bpf_support { s.verify_bpf_support = v; }
         Ok(s)
     }
 
@@ -260,6 +273,7 @@ impl Settings {
             ws_decode: true,
             raw_dump: true,
             ntlm_dump: true,
+            verify_bpf_support: true,
         }
     }
 }
@@ -477,5 +491,31 @@ mod tests {
         assert_eq!(on.ntlm_dump, Some(true));
         // A bare flag with no value is rejected (explicit value required).
         assert!(Cli::try_parse_from(["mymitm", "--raw-dump"]).is_err());
+    }
+
+    #[test]
+    fn verify_bpf_support_defaults_true() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert!(s.verify_bpf_support);
+    }
+
+    #[test]
+    fn verify_bpf_support_can_be_disabled_in_file() {
+        let toml = format!("{}\nverify_bpf_support = false", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(!s.verify_bpf_support);
+    }
+
+    #[test]
+    fn cli_verify_bpf_support_flag_parses() {
+        use clap::Parser;
+        let default = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert_eq!(default.verify_bpf_support, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--verify-bpf-support=false"]).unwrap();
+        assert_eq!(off.verify_bpf_support, Some(false), "explicit false overrides");
+        let on = Cli::try_parse_from(["mymitm", "--verify-bpf-support", "true"]).unwrap();
+        assert_eq!(on.verify_bpf_support, Some(true), "explicit true overrides");
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--verify-bpf-support"]).is_err());
     }
 }
