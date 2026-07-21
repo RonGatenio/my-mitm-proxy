@@ -19,6 +19,7 @@ pub struct ConnDump {
     c2s: Option<File>,
     s2c: Option<File>,
     ws: Option<File>,
+    ws_tried: bool,
     ws_path: PathBuf,
     start: String,
 }
@@ -41,6 +42,7 @@ impl Dumper {
             c2s: mk("c2s"),
             s2c: mk("s2c"),
             ws: None,
+            ws_tried: false,
             ws_path: self.dir.join(format!("{id}.ws.jsonl")),
             start: now_iso(),
         }
@@ -55,7 +57,8 @@ impl ConnDump {
     /// (created lazily on first message). Text with valid UTF-8 goes in `data`;
     /// binary and invalid-UTF-8 text go in `b64`.
     pub fn write_ws_message(&mut self, msg: &WsMessage) {
-        if self.ws.is_none() {
+        if self.ws.is_none() && !self.ws_tried {
+            self.ws_tried = true;
             self.ws = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -74,15 +77,17 @@ impl ConnDump {
             "ts": now_iso(),
             "len": msg.payload.len(),
         });
-        match (msg.opcode, std::str::from_utf8(&msg.payload)) {
-            (Opcode::Text, Ok(s)) => {
-                rec["data"] = serde_json::Value::String(s.to_string());
-            }
-            (Opcode::Text, Err(_)) => {
-                rec["b64"] = serde_json::Value::String(B64.encode(&msg.payload));
-                rec["invalid_utf8"] = serde_json::Value::Bool(true);
-            }
-            (Opcode::Binary, _) => {
+        match msg.opcode {
+            Opcode::Text => match std::str::from_utf8(&msg.payload) {
+                Ok(s) => {
+                    rec["data"] = serde_json::Value::String(s.to_string());
+                }
+                Err(_) => {
+                    rec["b64"] = serde_json::Value::String(B64.encode(&msg.payload));
+                    rec["invalid_utf8"] = serde_json::Value::Bool(true);
+                }
+            },
+            Opcode::Binary => {
                 rec["b64"] = serde_json::Value::String(B64.encode(&msg.payload));
             }
         }

@@ -256,11 +256,11 @@ async fn handle_conn(
                     Ok(0) | Err(_) => { c2s_open = false; sw.shutdown().await.ok(); }
                     Ok(n) => {
                         conn.write_c2s(&c2s_buf[..n]);
+                        if sw.write_all(&c2s_buf[..n]).await.is_err() { c2s_open = false; }
                         if let Some(t) = tap.as_mut() {
                             t.on_client_bytes(&c2s_buf[..n], &mut ws_out);
                             for m in ws_out.drain(..) { conn.write_ws_message(&m); }
                         }
-                        if sw.write_all(&c2s_buf[..n]).await.is_err() { c2s_open = false; }
                     }
                 }
             }
@@ -269,11 +269,11 @@ async fn handle_conn(
                     Ok(0) | Err(_) => { s2c_open = false; cw.shutdown().await.ok(); }
                     Ok(n) => {
                         conn.write_s2c(&s2c_buf[..n]);
+                        if cw.write_all(&s2c_buf[..n]).await.is_err() { s2c_open = false; }
                         if let Some(t) = tap.as_mut() {
                             t.on_server_bytes(&s2c_buf[..n], &mut ws_out);
                             for m in ws_out.drain(..) { conn.write_ws_message(&m); }
                         }
-                        if cw.write_all(&s2c_buf[..n]).await.is_err() { s2c_open = false; }
                     }
                 }
             }

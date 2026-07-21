@@ -87,7 +87,9 @@ def main():
             except OSError:
                 pass
             tls.close()
-        # Keep serving — the multi-client test sends two connections.
+        # Keep serving — the harness sends up to three connections per run
+        # (MODE=ebpf: two plain-TLS clients + one WebSocket client; MODE=iproute:
+        # one plain-TLS client + one WebSocket client).
 
 
 if __name__ == "__main__":

@@ -9,6 +9,12 @@ use super::{Opcode, WsKind, WsMessage, WsStatus};
 use crate::ws::frame::{parse_frame, Frame, FrameError};
 use crate::ws::handshake::{scan_request, scan_response, Negotiation, RequestScan, ResponseScan};
 
+/// Cap on accumulated, not-yet-transitioned-to-framing handshake bytes per
+/// direction. v1 limitation: this counts raw header bytes PLUS any framing
+/// bytes an optimistic peer bundles into the same read(s) — e.g. a client that
+/// pipelines a large first WS frame before waiting for the server's 101. Such
+/// pipelining can trip this cap before the handshake itself completes, which
+/// is (fail-safe) reported as `handshake-too-large` rather than decoded.
 const MAX_HANDSHAKE: usize = 64 * 1024;
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
@@ -203,6 +209,10 @@ impl WsTap {
         // Control frames (0x8-0xA).
         if frame.opcode & 0x08 != 0 {
             match frame.opcode {
+                // v1 limitation: decoding stops at the FIRST Close frame seen in
+                // EITHER direction — `state` becomes `Closed` here and no further
+                // frames from either side are parsed/emitted. The raw `.c2s`/`.s2c`
+                // dumps are independent of tap state and remain complete regardless.
                 0x8 => {
                     if frame.payload.len() >= 2 {
                         self.close_code = Some(u16::from_be_bytes([frame.payload[0], frame.payload[1]]));
@@ -331,23 +341,15 @@ fn inflate_message(
         let status = dec
             .decompress_vec(&input[in_off..], &mut out, FlushDecompress::Sync)
             .map_err(|_| "inflate-error")?;
-        in_off += (dec.total_in() - in_before) as usize;
+        let consumed = (dec.total_in() - in_before) as usize;
         let produced = (dec.total_out() - out_before) as usize;
+        in_off += consumed;
 
         if out.len() > cap {
             return Err("oversize");
         }
-        match status {
-            Status::StreamEnd => break,
-            Status::Ok | Status::BufError => {
-                if in_off >= input.len() && produced == 0 {
-                    break; // all input consumed, flush emitted everything
-                }
-                if produced == 0 && in_off >= input.len() {
-                    break; // no more progress possible
-                }
-            }
-        }
+        if status == Status::StreamEnd { break; }
+        if produced == 0 && consumed == 0 { break; }   // no progress: done, or stuck — either way stop
     }
     Ok(out)
 }
@@ -441,6 +443,28 @@ mod tests {
         // rsv1=false -> not compressed even though deflate negotiated
         t.on_server_bytes(&frame(true, 0x1, false, None, b"plain"), &mut out);
         assert_eq!(out[0].payload, b"plain");
+    }
+
+    #[test]
+    fn inflate_message_oversize_is_err() {
+        // A payload that easily inflates past a tiny cap must be rejected, not
+        // truncated or allowed to grow the output Vec without bound.
+        let mut comp = Compress::new(Compression::default(), false);
+        let mut dec = Decompress::new(false);
+        let data = vec![b'z'; 5000];
+        let compressed = deflate_message(&mut comp, &data);
+        assert_eq!(inflate_message(&mut dec, &compressed, 16), Err("oversize"));
+    }
+
+    #[test]
+    fn inflate_message_invalid_deflate_is_err() {
+        // Clearly-invalid raw-deflate bytes (first block header has the reserved
+        // BTYPE=3) must surface as "inflate-error", not panic or hang. If the
+        // no-progress guard in `inflate_message` regressed, this would hang
+        // instead of returning.
+        let mut dec = Decompress::new(false);
+        let garbage = vec![0xFFu8; 32];
+        assert_eq!(inflate_message(&mut dec, &garbage, MAX_MESSAGE), Err("inflate-error"));
     }
 
     #[test]
@@ -604,7 +628,9 @@ mod tests {
     #[test]
     fn many_frames_in_one_call_decode_in_order() {
         // Exercises the cursor path: 1000 frames delivered in a single call must all
-        // decode, in order (guards against the O(n^2) drain regression + off-by-one).
+        // decode, in order. This guards ordering/correctness of the cursor path
+        // (not a performance regression — 1000 frames is too little data to detect
+        // an O(n^2) drain).
         let mut t = handshaken();
         let mut out = Vec::new();
         let mut buf = Vec::new();
