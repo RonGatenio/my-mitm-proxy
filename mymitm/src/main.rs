@@ -1,3 +1,4 @@
+mod alpn;
 mod bpf;
 mod config;
 mod dataplane;
