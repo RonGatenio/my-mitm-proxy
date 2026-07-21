@@ -205,10 +205,6 @@ pub async fn run(s: Arc<Settings>, dumper: Arc<Dumper>, plane: Arc<dyn DataPlane
     }
 }
 
-/// Relay one direction: read from `src`, tee each chunk to its dump `sink`, and
-/// write it to `dst`. On clean EOF, shut down `dst`'s write half (propagating
-/// FIN) and return `Ok`, ending only this direction. A read/write error returns
-/// `Err` so the caller can tear the whole connection down.
 /// Shared WebSocket-tap state: both pump directions feed it (it must see both to
 /// decode), and it holds the `ConnMeta` that decoded messages are dumped into
 /// until the pump finishes and the caller reclaims it for `finish`.
@@ -237,6 +233,15 @@ impl WsShared {
     }
 }
 
+/// Relay one direction: read from `src`, tee each chunk to its dump `sink`, and
+/// write it to `dst`. On clean EOF, shut down `dst`'s write half (propagating
+/// FIN) and return `Ok`, ending only this direction. A peer that closes its TCP
+/// connection without a TLS `close_notify` (common with many non-Rust TLS
+/// stacks, e.g. plain HTTP/2 or gRPC servers that just `close()` the socket)
+/// surfaces to rustls as `io::ErrorKind::UnexpectedEof`; that is treated the
+/// same as a clean EOF, not a hard error, matching the old `select!` loop's
+/// behavior. Any other read error, or any write error, returns `Err` so the
+/// caller can tear the whole connection down.
 async fn pump_dir<R, W>(
     mut src: R,
     mut dst: W,
@@ -250,7 +255,14 @@ where
 {
     let mut buf = [0u8; 16384];
     loop {
-        let n = src.read(&mut buf).await?;
+        let n = match src.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                dst.shutdown().await.ok();
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             dst.shutdown().await.ok();
             return Ok(());
@@ -537,6 +549,87 @@ mod tests {
         let mut got = Vec::new();
         cr.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, down_blob);
+    }
+
+    /// A peer that closes its TCP connection WITHOUT a TLS `close_notify` (very
+    /// common: many non-Rust HTTP/2 servers, gRPC endpoints, or anything that
+    /// just calls `close()` on the socket) must NOT be treated as a hard error.
+    /// rustls surfaces this as `io::ErrorKind::UnexpectedEof`. The fake upstream
+    /// here reads the request fully, writes its response, then returns WITHOUT
+    /// calling `shutdown()` — dropping the split halves closes the raw TCP
+    /// socket but never sends a close_notify alert. The proxy must still treat
+    /// this as a clean half-close of that one direction: `handle_conn` returns
+    /// `Ok(())`, and the client (whose direction never errored) receives the
+    /// full response followed by a clean close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pump_survives_upstream_close_without_close_notify() {
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_cert(dir.path(), vec!["localhost".into()]);
+        const N: usize = 200_000; // > pump buffer (16 KiB) -> many chunks
+        let up_blob = vec![0xABu8; N];
+        let down_blob = vec![0xCDu8; N];
+
+        // fake upstream server: reads the request fully, writes the response,
+        // then drops the TLS stream WITHOUT shutdown() -> no close_notify sent.
+        let server_acceptor = TlsAcceptor::from(load_server_tls(&cert, &key).unwrap());
+        let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server_listener.local_addr().unwrap();
+        let up_expect = up_blob.clone();
+        let down_send = down_blob.clone();
+        tokio::spawn(async move {
+            let (sock, _) = server_listener.accept().await.unwrap();
+            let tls = server_acceptor.accept(sock).await.unwrap();
+            let (mut r, mut w) = tokio::io::split(tls);
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, up_expect);
+            w.write_all(&down_send).await.unwrap();
+            // Intentionally NOT calling w.shutdown(): r and w are dropped here,
+            // closing the raw TCP socket without ever sending close_notify.
+        });
+
+        // proxy
+        let dump_dir = dir.path().join("dumps");
+        let dumper = Arc::new(Dumper::new(&dump_dir, crate::dump::DumpOptions::default()).unwrap());
+        let server_v4 = match server_addr.ip() { std::net::IpAddr::V4(v4) => v4, _ => unreachable!() };
+        let mut settings = settings_for(&cert, &key, server_v4);
+        settings.server_port = server_addr.port();
+        settings.dump_path = dump_dir.clone();
+        let settings = Arc::new(settings);
+        let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(load_server_tls(&cert, &key).unwrap());
+        let connector = build_upstream_connector(&settings).unwrap();
+        // Capture the JoinHandle (do NOT .unwrap() handle_conn's result inside the
+        // task) so we can assert on its outcome instead of panicking on a task join.
+        let handle = {
+            let settings = settings.clone();
+            let dumper = dumper.clone();
+            let plane: Arc<dyn crate::dataplane::DataPlane> = Arc::new(crate::dataplane::DirectPlane);
+            tokio::spawn(async move {
+                let (inbound, peer) = proxy_listener.accept().await.unwrap();
+                handle_conn(inbound, peer, acceptor, connector, settings, dumper, plane).await
+            })
+        };
+
+        // client: send blob, half-close write, then read the server's blob in full
+        let client_connector = build_upstream_connector(&settings).unwrap();
+        let client_sock = TcpStream::connect(proxy_addr).await.unwrap();
+        let client_name = ServerName::try_from("localhost").unwrap();
+        let client_tls = client_connector.connect(client_name, client_sock).await.unwrap();
+        let (mut cr, mut cw) = tokio::io::split(client_tls);
+        cw.write_all(&up_blob).await.unwrap();
+        cw.shutdown().await.ok();
+        let mut got = Vec::new();
+        cr.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, down_blob);
+
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "handle_conn should return Ok(()) when the upstream closes without a TLS close_notify, got {result:?}"
+        );
     }
 
     /// The pin verifier must REJECT a different leaf cert.
