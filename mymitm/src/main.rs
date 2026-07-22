@@ -100,6 +100,11 @@ async fn main() -> anyhow::Result<()> {
     use crate::dataplane::DataPlane;
     let plane: Arc<dyn DataPlane> = match settings.data_plane {
         config::DataPlaneKind::Ebpf => {
+            // Preflight: confirm eBPF is usable on this kernel and fail fast with a
+            // stage-tagged diagnostic if not (skipped by --verify-bpf-support=false).
+            if settings.verify_bpf_support {
+                bpf::probe_ebpf_support(&settings)?;
+            }
             Arc::new(bpf::BpfPlane::load_and_attach(&settings)?)
         }
         config::DataPlaneKind::IpRoute => {
