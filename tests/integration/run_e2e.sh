@@ -47,6 +47,7 @@ SRV_LOG="$WORK/server.log"
 PROXY_LOG="$WORK/proxy.log"
 CLIENT_LOG="$WORK/client.log"
 CLIENT2_LOG="$WORK/client2.log"
+WS_CLIENT_LOG="$WORK/ws_client.log"
 
 # Names chosen for teardown-safe uniqueness.
 NS_CLI=mmcli
@@ -260,6 +261,16 @@ if [ "$MODE" = "ebpf" ]; then
   echo "--------------------------"
 fi
 
+info "running WebSocket client in netns $NS_CLI (src $CLIENT_IP -> $SERVER_IP:443)"
+ip netns exec "$NS_CLI" python3 "$SCRIPT_DIR/client.py" \
+  --cafile "$CERT" --host "$SERVER_IP" --port 443 \
+  --server-name server.test \
+  --bind-addr "$CLIENT_IP" --websocket >"$WS_CLIENT_LOG" 2>&1
+WS_CLIENT_RC=$?
+echo "----- websocket client output -----"
+cat "$WS_CLIENT_LOG"
+echo "--------------------------"
+
 # give the proxy a moment to flush dump files
 sleep 0.5
 
@@ -318,6 +329,15 @@ S2C="$DUMP_DIR/$CONN_ID.s2c"
 grep -q "PING-FROM-CLIENT" "$C2S" || fail "(3) c2s dump lacks decrypted request; content: $(cat "$C2S")"
 grep -q "PONG-FROM-SERVER" "$S2C" || fail "(3) s2c dump lacks decrypted response; content: $(cat "$S2C")"
 green "ASSERTION 3 PASS: dump index + c2s/s2c contain decrypted plaintext (conn_id=$CONN_ID)"
+
+# ---- assertion 3b: WebSocket decode (.ws.jsonl) --------------------------
+[ "$WS_CLIENT_RC" -eq 0 ] || fail "(3b) websocket client exited nonzero (rc=$WS_CLIENT_RC)"
+WS_FILE="$(ls "$DUMP_DIR"/conn-*.ws.jsonl 2>/dev/null | head -n1)"
+[ -n "$WS_FILE" ] || fail "(3b) no .ws.jsonl produced in $DUMP_DIR"
+grep -q '"pong"' "$WS_FILE" || fail "(3b) server->client 'pong' not decoded in $WS_FILE; content: $(cat "$WS_FILE")"
+grep -q '"ping"' "$WS_FILE" || fail "(3b) client->server 'ping' not decoded in $WS_FILE; content: $(cat "$WS_FILE")"
+grep -q '"ws":"decoded"' "$IDX" || grep -q '"ws": "decoded"' "$IDX" || fail "(3b) index.jsonl missing ws:decoded; content: $(cat "$IDX")"
+green "ASSERTION 3b PASS: WebSocket messages decoded both directions (ping/pong)"
 
 # ---- assertion 4: source-IP preservation ---------------------------------
 [ -f "$PEERFILE" ] || fail "(4) fake server recorded no peer IPs (no connection reached it?)"

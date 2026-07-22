@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use serde::Deserialize;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -31,7 +31,6 @@ struct FileCfg {
     #[serde(default = "d_local_port")] local_port: u16,
     #[serde(default = "d_mark")] fwmark: u32,
     #[serde(default = "d_dump")] dump_path: PathBuf,
-    #[serde(default = "d_obj")] bpf_obj_name: String,
     /// Log level for stdout and for the log file, independently. Both default to
     /// "off" (the proxy is silent unless asked to log). RUST_LOG/tracing syntax:
     /// off|error|warn|info|debug|trace, or targeted e.g. "mymitm=debug".
@@ -44,8 +43,17 @@ struct FileCfg {
     #[serde(default)] server_name: Option<String>,
     /// Preserve the client's source IP on the upstream leg (default true). Set
     /// false to dial upstream with the box's own IP instead (standard proxy
-    /// behavior); the `--no-preserve-src-ip` CLI flag also forces this off.
+    /// behavior); the `--preserve-src-ip=false` CLI flag also forces this off.
     #[serde(default = "d_preserve")] preserve_src_ip: bool,
+    #[serde(default = "d_ws_decode")] ws_decode: bool,
+    /// Write the raw per-connection decrypted streams (.c2s/.s2c/.ws.jsonl).
+    #[serde(default = "d_raw_dump")] raw_dump: bool,
+    /// Scan the decrypted .s2c stream for the NTLM CHALLENGE -> ntlm.jsonl.
+    #[serde(default = "d_ntlm_dump")] ntlm_dump: bool,
+    /// Preflight-probe eBPF support at startup before committing to the real
+    /// interfaces (default true). `--verify-bpf-support=false` skips the probe and
+    /// goes straight to load+attach. Only consulted for the eBPF data plane.
+    #[serde(default = "d_verify_bpf")] verify_bpf_support: bool,
 }
 fn d_port() -> u16 { 443 }
 fn d_tun() -> String { "tun0".into() }
@@ -54,12 +62,15 @@ fn d_local_ip() -> Ipv4Addr { Ipv4Addr::new(127,0,0,1) }
 fn d_local_port() -> u16 { 8443 }
 fn d_mark() -> u32 { mymitm_common::DEFAULT_FWMARK }
 fn d_dump() -> PathBuf { "/var/tmp/mitm-dumps/".into() }
-fn d_obj() -> String { "mymitm".into() }
 fn d_log_off() -> String { "off".into() }
 fn d_log_file() -> PathBuf { "/var/tmp/mymitm.log".into() }
 fn d_cert() -> PathBuf { "/etc/mymitm/leaf.pem".into() }
 fn d_key() -> PathBuf { "/etc/mymitm/leaf.key".into() }
 fn d_preserve() -> bool { true }
+fn d_ws_decode() -> bool { true }
+fn d_raw_dump() -> bool { true }
+fn d_ntlm_dump() -> bool { true }
+fn d_verify_bpf() -> bool { true }
 
 #[derive(Parser, Debug)]
 #[command(version, about = "transparent TLS MITM with source-IP preservation")]
@@ -94,15 +105,35 @@ struct Cli {
     #[arg(long = "file-log-level", env = "MYMITM_FILE_LOG")] file_log_level: Option<String>,
     /// Path to the log file (used only when the file log level is not off).
     #[arg(long = "log-file", env = "MYMITM_LOG_FILE")] log_file: Option<PathBuf>,
-    /// Disable source-IP preservation: dial the upstream with the box's own IP
-    /// instead of the client's. This is standard (non-transparent) proxy
-    /// behavior — the server then sees the box IP, not the client IP. Useful as
-    /// a negative control. Overrides `preserve_src_ip` in the config file.
-    #[arg(long = "no-preserve-src-ip", env = "MYMITM_NO_PRESERVE_SRC_IP", default_value_t = false)]
-    no_preserve_src_ip: bool,
+    /// Source-IP preservation on the upstream leg (`--preserve-src-ip=true|false`).
+    /// True (the default in the config file) dials the upstream with the client's
+    /// IP; false dials with the box's own IP — standard (non-transparent) proxy
+    /// behavior, so the server sees the box IP, not the client IP. Useful as a
+    /// negative control. When given, overrides `preserve_src_ip` in the config
+    /// file; when omitted, the config-file value stands.
+    #[arg(long = "preserve-src-ip", env = "MYMITM_PRESERVE_SRC_IP", action = ArgAction::Set)]
+    preserve_src_ip: Option<bool>,
     /// Reverse any leftover state (stale clsact qdisc / iproute rules) from a
     /// previous unclean exit, then continue startup.
     #[arg(long, default_value_t = false)] cleanup: bool,
+    /// WebSocket decoding (`--ws-decode=true|false`); raw dump is unaffected.
+    /// When given, overrides `ws_decode` in the config file (default true); when
+    /// omitted, the config-file value stands.
+    #[arg(long = "ws-decode", action = ArgAction::Set)] ws_decode: Option<bool>,
+    /// Write the raw per-connection decrypted streams — .c2s/.s2c/.ws.jsonl
+    /// (`--raw-dump=true|false`). Default true; set false to keep only the NTLM
+    /// summary (ntlm.jsonl) and skip the large per-connection files. Overrides
+    /// `raw_dump` in the config file when given.
+    #[arg(long = "raw-dump", action = ArgAction::Set)] raw_dump: Option<bool>,
+    /// Extract the NTLM CHALLENGE_MESSAGE from the decrypted .s2c stream into
+    /// ntlm.jsonl (`--ntlm-dump=true|false`). Default true; overrides `ntlm_dump`
+    /// in the config file when given.
+    #[arg(long = "ntlm-dump", action = ArgAction::Set)] ntlm_dump: Option<bool>,
+    /// Preflight-check that eBPF is usable on this kernel before startup
+    /// (`--verify-bpf-support=true|false`, default true). False skips the probe.
+    /// eBPF data plane only; ignored for `--data-plane iproute`.
+    #[arg(long = "verify-bpf-support", env = "MYMITM_VERIFY_BPF_SUPPORT", action = ArgAction::Set)]
+    verify_bpf_support: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +149,6 @@ pub struct Settings {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub dump_path: PathBuf,
-    pub bpf_obj_name: String,
     pub box_ip: Ipv4Addr,
     pub stdout_log_level: String,
     pub file_log_level: String,
@@ -128,6 +158,10 @@ pub struct Settings {
     pub attach_mode: AttachMode,
     pub preserve_src_ip: bool,
     pub cleanup: bool,
+    pub ws_decode: bool,
+    pub raw_dump: bool,
+    pub ntlm_dump: bool,
+    pub verify_bpf_support: bool,
 }
 
 impl Settings {
@@ -152,7 +186,6 @@ impl Settings {
             cert_path: f.cert_path,
             key_path: f.key_path,
             dump_path: f.dump_path,
-            bpf_obj_name: f.bpf_obj_name,
             box_ip: f.box_ip,
             stdout_log_level: f.stdout_log_level,
             file_log_level: f.file_log_level,
@@ -162,6 +195,10 @@ impl Settings {
             attach_mode: f.attach_mode,
             preserve_src_ip: f.preserve_src_ip,
             cleanup: false,
+            ws_decode: f.ws_decode,
+            raw_dump: f.raw_dump,
+            ntlm_dump: f.ntlm_dump,
+            verify_bpf_support: f.verify_bpf_support,
         })
     }
 
@@ -182,10 +219,14 @@ impl Settings {
         if let Some(v) = cli.stdout_log_level { s.stdout_log_level = v; }
         if let Some(v) = cli.file_log_level { s.file_log_level = v; }
         if let Some(v) = cli.log_file { s.log_file = v; }
-        // The CLI flag is one-way: present => force preservation off. Absent
-        // leaves the config-file value (default true) untouched.
-        if cli.no_preserve_src_ip { s.preserve_src_ip = false; }
+        // Boolean overrides take an explicit true/false; `None` (flag omitted)
+        // leaves the config-file value untouched.
+        if let Some(v) = cli.preserve_src_ip { s.preserve_src_ip = v; }
         s.cleanup = cli.cleanup;
+        if let Some(v) = cli.ws_decode { s.ws_decode = v; }
+        if let Some(v) = cli.raw_dump { s.raw_dump = v; }
+        if let Some(v) = cli.ntlm_dump { s.ntlm_dump = v; }
+        if let Some(v) = cli.verify_bpf_support { s.verify_bpf_support = v; }
         Ok(s)
     }
 
@@ -220,7 +261,6 @@ impl Settings {
             cert_path: PathBuf::from("/x/leaf.pem"),
             key_path: PathBuf::from("/x/leaf.key"),
             dump_path: PathBuf::from("/tmp"),
-            bpf_obj_name: "mymitm".into(),
             box_ip: Ipv4Addr::new(192, 168, 1, 10),
             stdout_log_level: "off".into(),
             file_log_level: "off".into(),
@@ -230,6 +270,10 @@ impl Settings {
             attach_mode: AttachMode::Auto,
             preserve_src_ip: true,
             cleanup: false,
+            ws_decode: true,
+            raw_dump: true,
+            ntlm_dump: true,
+            verify_bpf_support: true,
         }
     }
 }
@@ -283,12 +327,16 @@ mod tests {
     }
 
     #[test]
-    fn cli_no_preserve_flag_parses() {
+    fn cli_preserve_src_ip_flag_parses() {
         use clap::Parser;
         let default = Cli::try_parse_from(["mymitm"]).unwrap();
-        assert!(!default.no_preserve_src_ip, "flag defaults to false (preserve on)");
-        let off = Cli::try_parse_from(["mymitm", "--no-preserve-src-ip"]).unwrap();
-        assert!(off.no_preserve_src_ip, "flag present -> true (preserve off)");
+        assert_eq!(default.preserve_src_ip, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--preserve-src-ip=false"]).unwrap();
+        assert_eq!(off.preserve_src_ip, Some(false), "explicit false overrides");
+        let on = Cli::try_parse_from(["mymitm", "--preserve-src-ip", "true"]).unwrap();
+        assert_eq!(on.preserve_src_ip, Some(true), "explicit true overrides");
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--preserve-src-ip"]).is_err());
     }
 
     #[test]
@@ -386,5 +434,88 @@ mod tests {
         assert!(matches!(c.data_plane, Some(DataPlaneKind::IpRoute)));
         assert!(matches!(c.attach_mode, Some(AttachMode::Tcx)));
         assert!(c.cleanup);
+    }
+
+    #[test]
+    fn ws_decode_defaults_true() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert!(s.ws_decode);
+    }
+
+    #[test]
+    fn ws_decode_can_be_disabled_in_file() {
+        let toml = format!("{}\nws_decode = false", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(!s.ws_decode);
+    }
+
+    #[test]
+    fn cli_ws_decode_flag_parses() {
+        use clap::Parser;
+        let default = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert_eq!(default.ws_decode, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--ws-decode=false"]).unwrap();
+        assert_eq!(off.ws_decode, Some(false), "explicit false overrides");
+        let on = Cli::try_parse_from(["mymitm", "--ws-decode", "true"]).unwrap();
+        assert_eq!(on.ws_decode, Some(true), "explicit true overrides");
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--ws-decode"]).is_err());
+    }
+
+    #[test]
+    fn raw_dump_and_ntlm_dump_default_true() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert!(s.raw_dump);
+        assert!(s.ntlm_dump);
+    }
+
+    #[test]
+    fn raw_dump_and_ntlm_dump_can_be_disabled_in_file() {
+        let toml = format!("{}\nraw_dump = false\nntlm_dump = false", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(!s.raw_dump);
+        assert!(!s.ntlm_dump);
+    }
+
+    #[test]
+    fn cli_raw_dump_and_ntlm_dump_flags_parse() {
+        use clap::Parser;
+        let default = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert_eq!(default.raw_dump, None, "omitted -> leave config value");
+        assert_eq!(default.ntlm_dump, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--raw-dump=false", "--ntlm-dump=false"]).unwrap();
+        assert_eq!(off.raw_dump, Some(false));
+        assert_eq!(off.ntlm_dump, Some(false));
+        let on = Cli::try_parse_from(["mymitm", "--raw-dump", "true", "--ntlm-dump", "true"]).unwrap();
+        assert_eq!(on.raw_dump, Some(true));
+        assert_eq!(on.ntlm_dump, Some(true));
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--raw-dump"]).is_err());
+    }
+
+    #[test]
+    fn verify_bpf_support_defaults_true() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert!(s.verify_bpf_support);
+    }
+
+    #[test]
+    fn verify_bpf_support_can_be_disabled_in_file() {
+        let toml = format!("{}\nverify_bpf_support = false", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(!s.verify_bpf_support);
+    }
+
+    #[test]
+    fn cli_verify_bpf_support_flag_parses() {
+        use clap::Parser;
+        let default = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert_eq!(default.verify_bpf_support, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--verify-bpf-support=false"]).unwrap();
+        assert_eq!(off.verify_bpf_support, Some(false), "explicit false overrides");
+        let on = Cli::try_parse_from(["mymitm", "--verify-bpf-support", "true"]).unwrap();
+        assert_eq!(on.verify_bpf_support, Some(true), "explicit true overrides");
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--verify-bpf-support"]).is_err());
     }
 }

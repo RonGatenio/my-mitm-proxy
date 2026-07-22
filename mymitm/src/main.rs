@@ -3,7 +3,9 @@ mod config;
 mod dataplane;
 mod dump;
 mod iproute;
+mod ntlm;
 mod proxy;
+mod ws;
 
 use std::sync::Arc;
 
@@ -77,7 +79,14 @@ async fn main() -> anyhow::Result<()> {
     // inside proxy::run is safe — the second call is a no-op.
     proxy::ensure_crypto_provider();
 
-    let dumper = Arc::new(dump::Dumper::new(&settings.dump_path)?);
+    let dumper = Arc::new(dump::Dumper::new(
+        &settings.dump_path,
+        dump::DumpOptions {
+            raw_dump: settings.raw_dump,
+            ntlm_dump: settings.ntlm_dump,
+            server_name: settings.server_name.clone(),
+        },
+    )?);
 
     // Build the chosen data plane. The concrete plane holds all kernel state
     // (TCX/tc links, policy routes, rules) and reverses it in its Drop impl.
@@ -91,6 +100,11 @@ async fn main() -> anyhow::Result<()> {
     use crate::dataplane::DataPlane;
     let plane: Arc<dyn DataPlane> = match settings.data_plane {
         config::DataPlaneKind::Ebpf => {
+            // Preflight: confirm eBPF is usable on this kernel and fail fast with a
+            // stage-tagged diagnostic if not (skipped by --verify-bpf-support=false).
+            if settings.verify_bpf_support {
+                bpf::probe_ebpf_support(&settings)?;
+            }
             Arc::new(bpf::BpfPlane::load_and_attach(&settings)?)
         }
         config::DataPlaneKind::IpRoute => {
