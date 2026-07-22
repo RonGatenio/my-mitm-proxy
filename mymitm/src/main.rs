@@ -3,6 +3,7 @@ mod config;
 mod dataplane;
 mod dump;
 mod iproute;
+mod ntlm;
 mod proxy;
 mod ws;
 
@@ -78,7 +79,14 @@ async fn main() -> anyhow::Result<()> {
     // inside proxy::run is safe — the second call is a no-op.
     proxy::ensure_crypto_provider();
 
-    let dumper = Arc::new(dump::Dumper::new(&settings.dump_path)?);
+    let dumper = Arc::new(dump::Dumper::new(
+        &settings.dump_path,
+        dump::DumpOptions {
+            raw_dump: settings.raw_dump,
+            ntlm_dump: settings.ntlm_dump,
+            server_name: settings.server_name.clone(),
+        },
+    )?);
 
     // Build the chosen data plane. The concrete plane holds all kernel state
     // (TCX/tc links, policy routes, rules) and reverses it in its Drop impl.

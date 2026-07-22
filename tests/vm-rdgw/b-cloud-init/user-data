@@ -1,0 +1,44 @@
+#cloud-config
+# Proxy B (Debian 11 / kernel 5.10). NOTE: B has NO internet (both NICs are
+# isolated Hyper-V Internal switches), so nothing here may apt-install. mymitm
+# is a static musl binary with no runtime deps; it and the cert are pushed later
+# by b-deploy.ps1 over SSH on the rdgw-left switch (host 10.20.1.5 -> B 10.20.1.1).
+hostname: rdgw-b
+ssh_pwauth: true
+users:
+  - name: admin
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    lock_passwd: false
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
+chpasswd:
+  expire: false
+  users:
+    - {name: admin, password: "1311", type: text}
+write_files:
+  - path: /etc/sysctl.d/99-mymitm.conf
+    content: |
+      net.ipv4.ip_forward=1
+      # eBPF plane DNATs client flows to a listener on the tun-iface address;
+      # route_localnet lets that local delivery happen. (Set per-iface in runcmd
+      # too, since the iface name isn't final until set-name/rename resolves.)
+      net.ipv4.conf.all.route_localnet=1
+  - path: /etc/systemd/system/mymitm.service
+    content: |
+      [Unit]
+      Description=mymitm transparent TLS proxy (RD Gateway bring-up)
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      # eBPF map creation needs memlock headroom; kernel 5.10 (< 5.11) still charges
+      # BPF maps against RLIMIT_MEMLOCK, and systemd's 64 KiB default fails with EPERM.
+      LimitMEMLOCK=infinity
+      ExecStart=/opt/mymitm/mymitm --config /opt/mymitm/mymitm.toml
+      Restart=no
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - sysctl --system
+  - mkdir -p /opt/mymitm/dumps
+  - systemctl daemon-reload

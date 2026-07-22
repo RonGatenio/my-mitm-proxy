@@ -47,6 +47,10 @@ struct FileCfg {
     /// behavior); the `--preserve-src-ip=false` CLI flag also forces this off.
     #[serde(default = "d_preserve")] preserve_src_ip: bool,
     #[serde(default = "d_ws_decode")] ws_decode: bool,
+    /// Write the raw per-connection decrypted streams (.c2s/.s2c/.ws.jsonl).
+    #[serde(default = "d_raw_dump")] raw_dump: bool,
+    /// Scan the decrypted .s2c stream for the NTLM CHALLENGE -> ntlm.jsonl.
+    #[serde(default = "d_ntlm_dump")] ntlm_dump: bool,
 }
 fn d_port() -> u16 { 443 }
 fn d_tun() -> String { "tun0".into() }
@@ -62,6 +66,8 @@ fn d_cert() -> PathBuf { "/etc/mymitm/leaf.pem".into() }
 fn d_key() -> PathBuf { "/etc/mymitm/leaf.key".into() }
 fn d_preserve() -> bool { true }
 fn d_ws_decode() -> bool { true }
+fn d_raw_dump() -> bool { true }
+fn d_ntlm_dump() -> bool { true }
 
 #[derive(Parser, Debug)]
 #[command(version, about = "transparent TLS MITM with source-IP preservation")]
@@ -111,6 +117,15 @@ struct Cli {
     /// When given, overrides `ws_decode` in the config file (default true); when
     /// omitted, the config-file value stands.
     #[arg(long = "ws-decode", action = ArgAction::Set)] ws_decode: Option<bool>,
+    /// Write the raw per-connection decrypted streams — .c2s/.s2c/.ws.jsonl
+    /// (`--raw-dump=true|false`). Default true; set false to keep only the NTLM
+    /// summary (ntlm.jsonl) and skip the large per-connection files. Overrides
+    /// `raw_dump` in the config file when given.
+    #[arg(long = "raw-dump", action = ArgAction::Set)] raw_dump: Option<bool>,
+    /// Extract the NTLM CHALLENGE_MESSAGE from the decrypted .s2c stream into
+    /// ntlm.jsonl (`--ntlm-dump=true|false`). Default true; overrides `ntlm_dump`
+    /// in the config file when given.
+    #[arg(long = "ntlm-dump", action = ArgAction::Set)] ntlm_dump: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +152,8 @@ pub struct Settings {
     pub preserve_src_ip: bool,
     pub cleanup: bool,
     pub ws_decode: bool,
+    pub raw_dump: bool,
+    pub ntlm_dump: bool,
 }
 
 impl Settings {
@@ -172,6 +189,8 @@ impl Settings {
             preserve_src_ip: f.preserve_src_ip,
             cleanup: false,
             ws_decode: f.ws_decode,
+            raw_dump: f.raw_dump,
+            ntlm_dump: f.ntlm_dump,
         })
     }
 
@@ -197,6 +216,8 @@ impl Settings {
         if let Some(v) = cli.preserve_src_ip { s.preserve_src_ip = v; }
         s.cleanup = cli.cleanup;
         if let Some(v) = cli.ws_decode { s.ws_decode = v; }
+        if let Some(v) = cli.raw_dump { s.raw_dump = v; }
+        if let Some(v) = cli.ntlm_dump { s.ntlm_dump = v; }
         Ok(s)
     }
 
@@ -242,6 +263,8 @@ impl Settings {
             preserve_src_ip: true,
             cleanup: false,
             ws_decode: true,
+            raw_dump: true,
+            ntlm_dump: true,
         }
     }
 }
@@ -428,5 +451,36 @@ mod tests {
         assert_eq!(on.ws_decode, Some(true), "explicit true overrides");
         // A bare flag with no value is rejected (explicit value required).
         assert!(Cli::try_parse_from(["mymitm", "--ws-decode"]).is_err());
+    }
+
+    #[test]
+    fn raw_dump_and_ntlm_dump_default_true() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert!(s.raw_dump);
+        assert!(s.ntlm_dump);
+    }
+
+    #[test]
+    fn raw_dump_and_ntlm_dump_can_be_disabled_in_file() {
+        let toml = format!("{}\nraw_dump = false\nntlm_dump = false", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(!s.raw_dump);
+        assert!(!s.ntlm_dump);
+    }
+
+    #[test]
+    fn cli_raw_dump_and_ntlm_dump_flags_parse() {
+        use clap::Parser;
+        let default = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert_eq!(default.raw_dump, None, "omitted -> leave config value");
+        assert_eq!(default.ntlm_dump, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--raw-dump=false", "--ntlm-dump=false"]).unwrap();
+        assert_eq!(off.raw_dump, Some(false));
+        assert_eq!(off.ntlm_dump, Some(false));
+        let on = Cli::try_parse_from(["mymitm", "--raw-dump", "true", "--ntlm-dump", "true"]).unwrap();
+        assert_eq!(on.raw_dump, Some(true));
+        assert_eq!(on.ntlm_dump, Some(true));
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--raw-dump"]).is_err());
     }
 }
