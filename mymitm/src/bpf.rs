@@ -255,9 +255,8 @@ pub fn probe_ebpf_support(s: &Settings) -> anyhow::Result<()> {
         .try_into()?;
     let used_tc = attach_one(prog, "lo", TcAttachType::Ingress, s.attach_mode).map_err(|e| {
         anyhow::anyhow!(
-            "eBPF unusable [attach]: tc/clsact attach on lo failed: {e}. Kernel likely lacks \
-             CONFIG_NET_CLS_BPF and/or clsact (CONFIG_NET_SCH_INGRESS). Rerun with \
-             --data-plane iproute."
+            "eBPF unusable [attach]: tc/clsact attach on lo failed: {e}. {}",
+            diagnose_attach_failure(&krel)
         )
     })?;
 
@@ -273,6 +272,166 @@ pub fn probe_ebpf_support(s: &Settings) -> anyhow::Result<()> {
         if used_tc { "tc" } else { "tcx" }
     );
     Ok(())
+}
+
+/// What we could determine about a tc feature's kernel module for the *running*
+/// kernel — used to explain an `[attach]` failure accurately instead of asserting
+/// one cause. The probe only observes "attach failed"; these signals let it say
+/// *why*: compiled out vs module-not-installed vs present-but-not-loaded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FeatState {
+    Loaded,          // in /proc/modules
+    BuiltIn,         // modules.builtin, or CONFIG=y
+    ModuleInstalled, // a .ko is installed for this kernel (modules.dep) but not loaded
+    NotInstalled,    // CONFIG=m but no .ko installed for this kernel
+    NotBuilt,        // CONFIG=n
+    Absent,          // not loaded/built-in/installed and CONFIG unreadable
+    Unknown,         // nothing inspectable (e.g. /lib/modules/<rel> missing)
+}
+
+/// Pure classification from gathered signals (no I/O, so it is unit-tested).
+fn classify_feature(
+    loaded: bool,
+    builtin: bool,
+    ko_installed: bool,
+    cfg: Option<char>,
+    moddir_present: bool,
+) -> FeatState {
+    if loaded {
+        return FeatState::Loaded;
+    }
+    if builtin || cfg == Some('y') {
+        return FeatState::BuiltIn;
+    }
+    if cfg == Some('n') {
+        return FeatState::NotBuilt;
+    }
+    if ko_installed {
+        return FeatState::ModuleInstalled;
+    }
+    if cfg == Some('m') {
+        return FeatState::NotInstalled;
+    }
+    if !moddir_present {
+        return FeatState::Unknown;
+    }
+    FeatState::Absent
+}
+
+/// Build the actionable remedy sentence from the two features' states, keyed on
+/// the more informative (worst) of the two. Pure, so it is unit-tested.
+fn attach_remedy(krel: &str, cls: FeatState, sch: FeatState) -> String {
+    use FeatState::*;
+    fn rank(s: FeatState) -> u8 {
+        match s {
+            NotBuilt => 5,
+            NotInstalled => 4,
+            Absent => 3,
+            ModuleInstalled => 2,
+            Unknown => 1,
+            Loaded | BuiltIn => 0,
+        }
+    }
+    let (worst, which) = if rank(cls) >= rank(sch) {
+        (cls, "cls_bpf (CONFIG_NET_CLS_BPF)")
+    } else {
+        (sch, "clsact/sch_ingress (CONFIG_NET_SCH_INGRESS)")
+    };
+    match worst {
+        NotBuilt => format!(
+            "{which} is not built into kernel {krel} (=n). eBPF tc mode is unavailable here — \
+             rerun with --data-plane iproute."
+        ),
+        NotInstalled => format!(
+            "{which} is a module (=m) but no matching .ko is installed for kernel {krel}. \
+             Install the kernel modules (e.g. linux-modules-extra-{krel}) and retry, or rerun \
+             with --data-plane iproute."
+        ),
+        Absent => format!(
+            "{which} is unavailable for kernel {krel} (not built-in, no module .ko found, and \
+             CONFIG unreadable). Install this kernel's modules, or rerun with --data-plane iproute."
+        ),
+        ModuleInstalled => format!(
+            "{which} module exists under /lib/modules/{krel} but did not load (blacklisted or \
+             signature-rejected?). Try 'modprobe cls_bpf sch_ingress', or rerun with \
+             --data-plane iproute."
+        ),
+        Unknown => format!(
+            "could not inspect kernel modules for {krel} (is /lib/modules/{krel} present?). If \
+             tc-BPF is unavailable, rerun with --data-plane iproute."
+        ),
+        Loaded | BuiltIn => format!(
+            "cls_bpf and clsact appear available on kernel {krel}, yet the tc attach was rejected \
+             — possibly a different kernel limitation. Rerun with --data-plane iproute."
+        ),
+    }
+}
+
+fn module_loaded(name: &str) -> bool {
+    std::fs::read_to_string("/proc/modules")
+        .map(|s| s.lines().any(|l| l.split_whitespace().next() == Some(name)))
+        .unwrap_or(false)
+}
+
+fn module_builtin(krel: &str, name: &str) -> bool {
+    std::fs::read_to_string(format!("/lib/modules/{krel}/modules.builtin"))
+        .map(|s| s.lines().any(|l| l.contains(&format!("/{name}.ko"))))
+        .unwrap_or(false)
+}
+
+fn module_ko_installed(krel: &str, name: &str) -> bool {
+    // modules.dep lines look like `kernel/net/sched/cls_bpf.ko: <deps>` (the .ko
+    // may carry a compression suffix, e.g. `.ko.xz`). Match the basename.
+    std::fs::read_to_string(format!("/lib/modules/{krel}/modules.dep"))
+        .map(|s| {
+            s.lines().any(|l| {
+                l.split(':')
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('/')
+                    .next()
+                    .and_then(|f| f.strip_prefix(name))
+                    .is_some_and(|r| r.starts_with(".ko"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// CONFIG_* value ('y'/'m'/'n') from `/boot/config-<krel>` when present, else None.
+/// (`/proc/config.gz` would need a gzip decoder; a distro kernel usually ships
+/// `/boot/config-*`, and when neither exists the module-file signals still apply.)
+fn config_value(krel: &str, symbol: &str) -> Option<char> {
+    let text = std::fs::read_to_string(format!("/boot/config-{krel}")).ok()?;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix(&format!("{symbol}=")) {
+            return v.chars().next();
+        }
+        if line == format!("# {symbol} is not set") {
+            return Some('n');
+        }
+    }
+    None
+}
+
+fn feature_state(krel: &str, module: &str, symbol: &str) -> FeatState {
+    let moddir_present = std::path::Path::new(&format!("/lib/modules/{krel}")).is_dir();
+    classify_feature(
+        module_loaded(module),
+        module_builtin(krel, module),
+        module_ko_installed(krel, module),
+        config_value(krel, symbol),
+        moddir_present,
+    )
+}
+
+/// Best-effort inspection of the running kernel to explain WHY the tc attach
+/// failed, returning a remedy sentence. Never fails (all reads are best-effort);
+/// distinguishes compiled-out (=n) from module-not-installed from
+/// present-but-not-loaded so the hint points at the right fix.
+fn diagnose_attach_failure(krel: &str) -> String {
+    let cls = feature_state(krel, "cls_bpf", "CONFIG_NET_CLS_BPF");
+    let sch = feature_state(krel, "sch_ingress", "CONFIG_NET_SCH_INGRESS");
+    attach_remedy(krel, cls, sch)
 }
 
 /// Attach one classifier honoring the requested mode. Returns `true` if it was
@@ -727,5 +886,37 @@ mod tests {
             "probe must leave no clsact qdisc on lo"
         );
         println!("PROBE_OK");
+    }
+
+    #[test]
+    fn classify_feature_maps_signals() {
+        use FeatState::*;
+        assert_eq!(classify_feature(true, false, false, None, true), Loaded);
+        assert_eq!(classify_feature(false, true, false, None, true), BuiltIn);
+        assert_eq!(classify_feature(false, false, false, Some('y'), true), BuiltIn);
+        assert_eq!(classify_feature(false, false, false, Some('n'), true), NotBuilt);
+        assert_eq!(classify_feature(false, false, true, Some('m'), true), ModuleInstalled);
+        assert_eq!(classify_feature(false, false, true, None, true), ModuleInstalled);
+        assert_eq!(classify_feature(false, false, false, Some('m'), true), NotInstalled);
+        assert_eq!(classify_feature(false, false, false, None, false), Unknown);
+        assert_eq!(classify_feature(false, false, false, None, true), Absent);
+    }
+
+    #[test]
+    fn attach_remedy_picks_actionable_cause() {
+        use FeatState::*;
+        // Compiled out -> point at iproute, and do NOT suggest modprobe.
+        let m = attach_remedy("5.10.0", NotBuilt, ModuleInstalled);
+        assert!(m.contains("not built into kernel 5.10.0"), "{m}");
+        assert!(m.contains("--data-plane iproute"), "{m}");
+        assert!(!m.contains("modprobe"), "compiled-out must not suggest modprobe: {m}");
+        // Present but not loaded (our repro / a blacklist) -> suggest modprobe.
+        let m = attach_remedy("5.10.260", ModuleInstalled, ModuleInstalled);
+        assert!(m.contains("did not load"), "{m}");
+        assert!(m.contains("modprobe"), "{m}");
+        // =m but no .ko for this kernel -> suggest installing the modules package.
+        let m = attach_remedy("5.15.0", NotInstalled, BuiltIn);
+        assert!(m.contains("linux-modules-extra-5.15.0"), "{m}");
+        assert!(m.contains("no matching .ko"), "{m}");
     }
 }
