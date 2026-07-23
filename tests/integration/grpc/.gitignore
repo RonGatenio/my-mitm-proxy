@@ -1,0 +1,6 @@
+# Bootstrapped by run_grpc_netns.sh — not committed.
+.venv/
+__pycache__/
+# Generated from echo.proto at run time (kept in sync with the installed grpcio).
+echo_pb2.py
+echo_pb2_grpc.py

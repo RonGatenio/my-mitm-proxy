@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VM test harness orchestrator. Run as root (needs ip/tap + /dev/kvm).
-#   sudo bash tests/vm/run.sh {up|router|proxy|all|down} \
+#   sudo bash tests/vm/run.sh {up|router|proxy|h2|all|down} \
 #        [--data-plane ebpf|iproute] [--kernel 4.15|5.10|debian11] [--no-preserve] [--keep]
 #
 # --no-preserve launches the proxy with `preserve_src_ip = false` and flips the
@@ -13,6 +13,7 @@ source "$HERE/lib.sh"
 DATA_PLANE=ebpf
 KEEP=0
 NO_PRESERVE=0
+ALPN='["h2", "http/1.1"]'   # proxy ALPN allowlist written into mymitm.toml
 CMD="${1:-}"; shift || true
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -144,6 +145,7 @@ stdout_log_level = "info"
 server_name = "server.test"
 data_plane = "$DATA_PLANE"
 preserve_src_ip = $preserve
+alpn_protocols = $ALPN
 EOF
 }
 
@@ -233,6 +235,89 @@ cmd_proxy() {
   vm_ssh B "sudo systemctl stop mymitm" || true
 }
 
+rebuild_and_deploy() {  # force-rebuild mymitm and (re)start it on B with current $ALPN
+  b_resolve_ifaces
+  info "rebuilding mymitm (release) + deploying to B (alpn=$ALPN)"
+  ( cd "$REPO_ROOT" && cargo build -p mymitm --release ) || fail "cargo build failed"
+  vm_ssh B "sudo mkdir -p /opt/mymitm/dumps && sudo chown -R ubuntu /opt/mymitm"
+  vm_scp B "$BIN" /opt/mymitm/mymitm
+  vm_scp B "$CERT_DIR/leaf.pem" /opt/mymitm/leaf.pem
+  vm_scp B "$CERT_DIR/leaf.key" /opt/mymitm/leaf.key
+  vm_ssh B "chmod +x /opt/mymitm/mymitm"
+  write_b_toml
+  [ "$DATA_PLANE" = ebpf ] && vm_ssh B "sudo sysctl -wq net.ipv4.conf.$B_LEFT_IFACE.route_localnet=1"
+  vm_ssh B "sudo rm -f /opt/mymitm/dumps/*"
+  vm_ssh B "sudo systemctl restart mymitm"
+  local i ok=0
+  for i in $(seq 1 50); do
+    vm_ssh B "sudo journalctl -u mymitm --no-pager -n50 2>/dev/null | grep -q 'proxy listening'" && { ok=1; break; }
+    sleep 0.4
+  done
+  [ "$ok" = 1 ] || { vm_ssh B "sudo journalctl -u mymitm --no-pager -n80"; fail "mymitm never logged 'proxy listening'"; }
+  pass "mymitm deployed + listening on B (data_plane=$DATA_PLANE, alpn=$ALPN)"
+}
+
+# Assert mymitm negotiated $1 on BOTH TLS legs (reads its own log line).
+assert_alpn_both_legs() {  # assert_alpn_both_legs <proto>
+  local want="$1" line
+  line="$(vm_ssh B "sudo journalctl -u mymitm --no-pager | grep 'alpn negotiated' | tail -1")"
+  echo "$line"
+  echo "$line" | grep -q "upstream=$want" && echo "$line" | grep -q "downstream=$want" \
+    || fail "expected ALPN $want on both legs, got: $line"
+}
+
+cmd_h2() {
+  info "h2 conformance: nghttpd on C, h2 client matrix from A through mymitm"
+  rebuild_and_deploy
+  # h2 client tooling on A + trust the CA in the system store (nghttp has no --cacert)
+  vm_ssh A "command -v nghttp >/dev/null 2>&1 || { sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nghttp2-client; }"
+  vm_ssh A "sudo cp /tmp/ca.pem /usr/local/share/ca-certificates/mymitm-ca.crt && sudo update-ca-certificates >/dev/null 2>&1"
+  vm_ssh A "grep -q server.test /etc/hosts || echo '$C_IP server.test' | sudo tee -a /etc/hosts >/dev/null"
+  # h2 server on C:443
+  vm_scp C "$HERE/server/h2_ctl.sh" /opt/tlssrv/h2_ctl.sh
+  vm_ssh C "bash /opt/tlssrv/h2_ctl.sh start" | grep -qx active || fail "(h2) nghttpd did not start on C"
+  pass "h2: nghttpd active on C:443"
+  local origin; origin="$(vm_ssh C "cat /opt/tlssrv/htdocs/big.sha256")"
+
+  # (1) h2 GET negotiates HTTP/2 200
+  local out
+  out="$(vm_ssh A "curl -s -o /dev/null -w '%{http_version} %{http_code}' --http2 --cacert /tmp/ca.pem --resolve server.test:443:$C_IP https://server.test/probe.txt")"
+  echo "h2 GET -> $out"
+  [ "$out" = "2 200" ] || fail "(h2) GET did not negotiate HTTP/2 200 (got '$out')"
+  pass "h2: GET returned HTTP/2 200"
+
+  # (2) 30 MiB transfer byte-exact (many DATA frames + flow control)
+  vm_ssh A "curl -s -o /tmp/big.bin --http2 --cacert /tmp/ca.pem --resolve server.test:443:$C_IP https://server.test/big.bin"
+  local got; got="$(vm_ssh A "sha256sum /tmp/big.bin | cut -d' ' -f1")"
+  echo "origin=$origin got=$got"
+  [ "$origin" = "$got" ] || fail "(h2) 30MiB transfer not byte-exact"
+  pass "h2: 30MiB byte-exact over h2 (flow control OK)"
+
+  # (3) multiplexing: 5 streams on ONE connection
+  local n
+  n="$(vm_ssh A "nghttp -nv https://server.test:443/m1 https://server.test:443/m2 https://server.test:443/m3 https://server.test:443/m4 https://server.test:443/m5 2>&1 | grep -c ':status: 200'")"
+  echo "nghttp 200 streams: $n"
+  [ "$n" = 5 ] || fail "(h2) expected 5 multiplexed 200s, got $n"
+  pass "h2: 5 multiplexed streams on one connection"
+
+  # (3b) HPACK continuity: many sequential requests reusing one connection
+  local seq
+  # -o binds to the FIRST url only; give every url its own -o /dev/null, else curl
+  # streams bodies 2..N to stdout and pollutes the %{http_version} capture.
+  seq="$(vm_ssh A "curl -s --http2 --cacert /tmp/ca.pem --resolve server.test:443:$C_IP -w '%{http_version} ' -o /dev/null https://server.test/m1 -o /dev/null https://server.test/m2 -o /dev/null https://server.test/m3 -o /dev/null https://server.test/m4")"
+  echo "sequential versions: $seq"
+  [ "$seq" = "2 2 2 2 " ] || fail "(h2) sequential requests not all HTTP/2 (got '$seq')"
+  pass "h2: sequential requests reuse one h2 connection (HPACK continuity)"
+
+  # (4) ALPN negotiated h2 on BOTH legs
+  assert_alpn_both_legs h2
+  pass "h2: ALPN negotiated h2 on both legs"
+
+  vm_ssh C "bash /opt/tlssrv/h2_ctl.sh stop" >/dev/null 2>&1 || true   # restore h1 server
+  vm_ssh B "sudo systemctl stop mymitm" || true
+  green "H2 CONFORMANCE PASS (kernel=$B_KERNEL, data_plane=$DATA_PLANE)"
+}
+
 cmd_all() {
   # Tear down on ANY exit — including a fail() mid-phase — unless --keep. Without
   # this a failed run leaves its VMs holding the overlay write-locks and SSH
@@ -254,6 +339,7 @@ case "$CMD" in
   down)   cmd_down;;
   router) cmd_router;;
   proxy)  cmd_proxy;;
+  h2)     cmd_h2;;
   all)    cmd_all;;
-  *)      red "usage: run.sh {up|router|proxy|all|down} [--data-plane ebpf|iproute] [--kernel 4.15|5.10|debian11] [--no-preserve] [--keep]"; exit 2;;
+  *)      red "usage: run.sh {up|router|proxy|h2|all|down} [--data-plane ebpf|iproute] [--kernel 4.15|5.10|debian11] [--no-preserve] [--keep]"; exit 2;;
 esac

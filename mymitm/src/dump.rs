@@ -31,12 +31,18 @@ impl Default for DumpOptions {
 
 pub struct Dumper { dir: PathBuf, opts: DumpOptions }
 
-pub struct ConnDump {
-    pub id: String,
+/// One direction's dump sink. Owns its own file handle so the two pump
+/// directions can write concurrently without sharing a borrow.
+pub struct DirSink { file: Option<File> }
+
+/// Per-connection metadata + index record, plus the lazily-created WebSocket
+/// message log. Held by the pump parent; the two `DirSink`s are handed to the
+/// two direction tasks. `finish` writes the `index.jsonl` line (including the
+/// WebSocket status) after both directions complete.
+pub struct ConnMeta {
+    id: String,
     client: SocketAddr,
     server: SocketAddr,
-    c2s: Option<File>,
-    s2c: Option<File>,
     ws: Option<File>,
     ws_tried: bool,
     ws_path: PathBuf,
@@ -57,7 +63,9 @@ impl Dumper {
         Ok(Dumper { dir: dir.to_path_buf(), opts })
     }
 
-    pub fn open_conn(&self, client: SocketAddr, server: SocketAddr) -> ConnDump {
+    /// Open a connection's dump: returns the metadata handle plus the c2s and
+    /// s2c sinks (in that order).
+    pub fn open_conn(&self, client: SocketAddr, server: SocketAddr) -> (ConnMeta, DirSink, DirSink) {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let id = format!("conn-{n:08}");
         let mk = |suffix: &str| OpenOptions::new().create(true).write(true).truncate(true)
@@ -65,15 +73,13 @@ impl Dumper {
             .map_err(|e| tracing::warn!("dump open {suffix} failed: {e}")).ok();
         // Raw stream files are created only when raw_dump is on; NTLM-only mode
         // leaves them unopened so a real RDP session writes no per-connection bulk.
-        let (c2s, s2c) = if self.opts.raw_dump { (mk("c2s"), mk("s2c")) } else { (None, None) };
-        ConnDump {
-            id: id.clone(),
-            client, server,
-            c2s,
-            s2c,
-            ws: None,
-            ws_tried: false,
-            ws_path: self.dir.join(format!("{id}.ws.jsonl")),
+        let (c2s_file, s2c_file) = if self.opts.raw_dump { (mk("c2s"), mk("s2c")) } else { (None, None) };
+        let c2s = DirSink { file: c2s_file };
+        let s2c = DirSink { file: s2c_file };
+        let ws_path = self.dir.join(format!("{id}.ws.jsonl"));
+        let meta = ConnMeta {
+            id, client, server,
+            ws: None, ws_tried: false, ws_path,
             start: now_iso(),
             ntlm_dump: self.opts.ntlm_dump,
             server_name: self.opts.server_name.clone(),
@@ -81,23 +87,34 @@ impl Dumper {
             ntlm_c2s_buf: Vec::new(),
             ntlm_s2c_buf: Vec::new(),
             ntlm_emitted: false,
+        };
+        (meta, c2s, s2c)
+    }
+}
+
+impl DirSink {
+    pub fn write(&mut self, b: &[u8]) {
+        if let Some(file) = self.file.as_mut() {
+            if let Err(e) = file.write_all(b) { tracing::warn!("dump write failed: {e}"); }
         }
     }
 }
 
-impl ConnDump {
-    pub fn write_c2s(&mut self, b: &[u8]) {
-        write_some(&mut self.c2s, b);
+impl ConnMeta {
+    /// Feed client->server plaintext for NTLM Type-3 capture. Raw stream bytes
+    /// are written by the `DirSink`; this only accumulates the bounded NTLM
+    /// prefix (no-op unless `ntlm_dump` is on and a record hasn't been emitted).
+    pub fn feed_c2s(&mut self, b: &[u8]) {
         ntlm_accumulate(&mut self.ntlm_c2s_buf, b, self.ntlm_dump && !self.ntlm_emitted);
     }
-    pub fn write_s2c(&mut self, b: &[u8]) {
-        write_some(&mut self.s2c, b);
+    /// Feed server->client plaintext for NTLM Type-2 capture, and flush the
+    /// grouped record the moment auth completes: the server's success status
+    /// (101/2xx) answering the client's Type-3 means both halves are now in
+    /// hand — no need to wait for connection close, and no loss if the proxy is
+    /// killed mid-session. Checked on the delivering chunk so the buffer scan
+    /// runs at most once.
+    pub fn feed_s2c(&mut self, b: &[u8]) {
         ntlm_accumulate(&mut self.ntlm_s2c_buf, b, self.ntlm_dump && !self.ntlm_emitted);
-        // Flush the grouped record the moment auth completes: the server's
-        // success status (101/2xx) answering the client's Type-3 means both
-        // halves are now in hand — no need to wait for connection close, and no
-        // loss if the proxy is killed mid-session. Checked on the delivering
-        // chunk so the buffer scan runs at most once.
         if self.ntlm_dump && !self.ntlm_emitted && s2c_saw_success(b) {
             self.emit_ntlm_record(true);
         }
@@ -259,12 +276,6 @@ impl ConnDump {
     }
 }
 
-fn write_some(f: &mut Option<File>, b: &[u8]) {
-    if let Some(file) = f.as_mut() {
-        if let Err(e) = file.write_all(b) { tracing::warn!("dump write failed: {e}"); }
-    }
-}
-
 fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -386,18 +397,18 @@ mod tests {
     fn writes_streams_and_index() {
         let dir = tempfile::tempdir().unwrap();
         let d = Dumper::new(dir.path(), DumpOptions::default()).unwrap();
-        let mut c = d.open_conn(
+        let (meta, mut c2s, mut s2c) = d.open_conn(
             "10.8.0.5:43012".parse::<SocketAddr>().unwrap(),
             "192.168.1.50:443".parse::<SocketAddr>().unwrap());
-        c.write_c2s(b"GET / HTTP/1.1\r\n");
-        c.write_s2c(b"HTTP/1.1 200 OK\r\n");
-        let id = c.id.clone();
-        c.finish(dir.path(), &crate::ws::WsStatus::none());
+        c2s.write(b"GET / HTTP/1.1\r\n");
+        s2c.write(b"HTTP/1.1 200 OK\r\n");
+        let id = meta.id.clone();
+        meta.finish(dir.path(), &WsStatus::none());
 
-        let c2s = std::fs::read(dir.path().join(format!("{id}.c2s"))).unwrap();
-        assert_eq!(c2s, b"GET / HTTP/1.1\r\n");
-        let s2c = std::fs::read(dir.path().join(format!("{id}.s2c"))).unwrap();
-        assert_eq!(s2c, b"HTTP/1.1 200 OK\r\n");
+        let c2s_bytes = std::fs::read(dir.path().join(format!("{id}.c2s"))).unwrap();
+        assert_eq!(c2s_bytes, b"GET / HTTP/1.1\r\n");
+        let s2c_bytes = std::fs::read(dir.path().join(format!("{id}.s2c"))).unwrap();
+        assert_eq!(s2c_bytes, b"HTTP/1.1 200 OK\r\n");
         let idx = std::fs::read_to_string(dir.path().join("index.jsonl")).unwrap();
         assert!(idx.contains("10.8.0.5:43012"));
         assert!(idx.contains("192.168.1.50:443"));
@@ -407,15 +418,15 @@ mod tests {
     fn writes_ws_messages_text_and_binary() {
         let dir = tempfile::tempdir().unwrap();
         let d = Dumper::new(dir.path(), DumpOptions::default()).unwrap();
-        let mut c = d.open_conn(
+        let (mut meta, _c2s, _s2c) = d.open_conn(
             "10.0.0.1:1".parse().unwrap(),
             "10.0.0.2:443".parse().unwrap(),
         );
-        c.write_ws_message(&WsMessage { from_client: true, opcode: Opcode::Text, payload: b"{\"a\":1}".to_vec() });
-        c.write_ws_message(&WsMessage { from_client: false, opcode: Opcode::Binary, payload: vec![0, 159, 146, 150] });
-        let id = c.id.clone();
+        meta.write_ws_message(&WsMessage { from_client: true, opcode: Opcode::Text, payload: b"{\"a\":1}".to_vec() });
+        meta.write_ws_message(&WsMessage { from_client: false, opcode: Opcode::Binary, payload: vec![0, 159, 146, 150] });
+        let id = meta.id.clone();
         let ws = WsStatus { kind: WsKind::Decoded, permessage_deflate: true, message_count: 2, close_code: Some(1000), close_reason: Some("bye".into()), undecodable_reason: None };
-        c.finish(dir.path(), &ws);
+        meta.finish(dir.path(), &ws);
 
         let jsonl = std::fs::read_to_string(dir.path().join(format!("{id}.ws.jsonl"))).unwrap();
         let mut lines = jsonl.lines();
@@ -442,10 +453,10 @@ mod tests {
     fn invalid_utf8_text_falls_back_to_b64() {
         let dir = tempfile::tempdir().unwrap();
         let d = Dumper::new(dir.path(), DumpOptions::default()).unwrap();
-        let mut c = d.open_conn("10.0.0.1:1".parse().unwrap(), "10.0.0.2:443".parse().unwrap());
-        c.write_ws_message(&WsMessage { from_client: true, opcode: Opcode::Text, payload: vec![0xff, 0xfe] });
-        let id = c.id.clone();
-        c.finish(dir.path(), &WsStatus::none());
+        let (mut meta, _c2s, _s2c) = d.open_conn("10.0.0.1:1".parse().unwrap(), "10.0.0.2:443".parse().unwrap());
+        meta.write_ws_message(&WsMessage { from_client: true, opcode: Opcode::Text, payload: vec![0xff, 0xfe] });
+        let id = meta.id.clone();
+        meta.finish(dir.path(), &WsStatus::none());
         let jsonl = std::fs::read_to_string(dir.path().join(format!("{id}.ws.jsonl"))).unwrap();
         let rec: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
         assert!(rec["b64"].is_string());
@@ -458,15 +469,15 @@ mod tests {
         let d = Dumper::new(dir.path(), DumpOptions {
             raw_dump: false, ntlm_dump: true, server_name: Some("gw.rdgw.test".into()),
         }).unwrap();
-        let mut c = d.open_conn(
+        let (mut meta, _c2s, _s2c) = d.open_conn(
             "10.20.1.5:51616".parse().unwrap(),
             "10.20.2.10:443".parse().unwrap());
-        let id = c.id.clone();
+        let id = meta.id.clone();
         // A 401 carrying the MS-NLMP example CHALLENGE_MESSAGE in a WWW-Authenticate: NTLM header.
         let b64 = B64.encode(crate::ntlm::CHALLENGE_MESSAGE_EXAMPLE);
         let s2c = format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {b64}\r\n\r\n");
-        c.write_s2c(s2c.as_bytes());
-        c.finish(dir.path(), &crate::ws::WsStatus::none());
+        meta.feed_s2c(s2c.as_bytes());
+        meta.finish(dir.path(), &crate::ws::WsStatus::none());
 
         // raw streams suppressed
         assert!(!dir.path().join(format!("{id}.c2s")).exists());
@@ -493,11 +504,11 @@ mod tests {
         let d = Dumper::new(dir.path(), DumpOptions {
             raw_dump: false, ntlm_dump: true, server_name: None,
         }).unwrap();
-        let mut c = d.open_conn("10.0.0.1:1".parse().unwrap(), "10.0.0.2:443".parse().unwrap());
+        let (mut meta, _c2s, _s2c) = d.open_conn("10.0.0.1:1".parse().unwrap(), "10.0.0.2:443".parse().unwrap());
         let b64 = B64.encode(crate::ntlm::CHALLENGE_MESSAGE_EXAMPLE);
-        c.write_s2c(format!("HTTP/1.1 401\r\nWWW-Authenticate: NTLM {b64}\r\n\r\n").as_bytes());
-        c.write_s2c(format!("HTTP/1.1 401\r\nWWW-Authenticate: NTLM {b64}\r\n\r\n").as_bytes());
-        c.finish(dir.path(), &crate::ws::WsStatus::none());
+        meta.feed_s2c(format!("HTTP/1.1 401\r\nWWW-Authenticate: NTLM {b64}\r\n\r\n").as_bytes());
+        meta.feed_s2c(format!("HTTP/1.1 401\r\nWWW-Authenticate: NTLM {b64}\r\n\r\n").as_bytes());
+        meta.finish(dir.path(), &crate::ws::WsStatus::none());
         let n = std::fs::read_to_string(dir.path().join("ntlm.jsonl")).unwrap().lines().count();
         assert_eq!(n, 1, "only the first challenge per connection is recorded");
     }
@@ -508,12 +519,12 @@ mod tests {
         let d = Dumper::new(dir.path(), DumpOptions {
             raw_dump: false, ntlm_dump: false, server_name: None,
         }).unwrap();
-        let mut c = d.open_conn("10.0.0.1:1".parse().unwrap(), "10.0.0.2:443".parse().unwrap());
-        let id = c.id.clone();
+        let (mut meta, _c2s, _s2c) = d.open_conn("10.0.0.1:1".parse().unwrap(), "10.0.0.2:443".parse().unwrap());
+        let id = meta.id.clone();
         let b64 = B64.encode(crate::ntlm::CHALLENGE_MESSAGE_EXAMPLE);
-        c.write_c2s(b"GET / HTTP/1.1\r\n\r\n");
-        c.write_s2c(format!("HTTP/1.1 401\r\nWWW-Authenticate: NTLM {b64}\r\n\r\n").as_bytes());
-        c.finish(dir.path(), &crate::ws::WsStatus::none());
+        meta.feed_c2s(b"GET / HTTP/1.1\r\n\r\n");
+        meta.feed_s2c(format!("HTTP/1.1 401\r\nWWW-Authenticate: NTLM {b64}\r\n\r\n").as_bytes());
+        meta.finish(dir.path(), &crate::ws::WsStatus::none());
         assert!(!dir.path().join(format!("{id}.c2s")).exists());
         assert!(!dir.path().join(format!("{id}.s2c")).exists());
         assert!(!dir.path().join("ntlm.jsonl").exists());
@@ -534,10 +545,10 @@ mod tests {
         let d = Dumper::new(dir.path(), DumpOptions {
             raw_dump: false, ntlm_dump: true, server_name: Some("gw.rdgw.test".into()),
         }).unwrap();
-        let mut c = d.open_conn(
+        let (mut meta, _c2s, _s2c) = d.open_conn(
             "10.20.1.5:51616".parse().unwrap(),
             "10.20.2.10:443".parse().unwrap());
-        let id = c.id.clone();
+        let id = meta.id.clone();
 
         let chal_b64 = B64.encode(crate::ntlm::CHALLENGE_MESSAGE_EXAMPLE);
         let auth_b64 = B64.encode(crate::ntlm::AUTHENTICATE_MESSAGE_EXAMPLE);
@@ -548,11 +559,11 @@ mod tests {
             "RDG_OUT_DATA /remoteDesktopGateway/ HTTP/1.1\r\n\
              RDG-User-Id: {uid}\r\n\
              Authorization: NTLM {auth_b64}\r\n\r\n");
-        c.write_c2s(c2s.as_bytes());
+        meta.feed_c2s(c2s.as_bytes());
         // Server: 401 challenge, then 101 (auth accepted).
-        c.write_s2c(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {chal_b64}\r\n\r\n").as_bytes());
-        c.write_s2c(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
-        c.finish(dir.path(), &crate::ws::WsStatus::none());
+        meta.feed_s2c(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {chal_b64}\r\n\r\n").as_bytes());
+        meta.feed_s2c(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
+        meta.finish(dir.path(), &crate::ws::WsStatus::none());
 
         // Exactly one grouped line for the connection — not two.
         let body = std::fs::read_to_string(dir.path().join("ntlm.jsonl")).unwrap();
@@ -591,12 +602,12 @@ mod tests {
         let d = Dumper::new(dir.path(), DumpOptions {
             raw_dump: false, ntlm_dump: true, server_name: None,
         }).unwrap();
-        let mut c = d.open_conn("10.0.0.1:1".parse().unwrap(), "10.0.0.2:443".parse().unwrap());
+        let (mut meta, _c2s, _s2c) = d.open_conn("10.0.0.1:1".parse().unwrap(), "10.0.0.2:443".parse().unwrap());
         let chal_b64 = B64.encode(crate::ntlm::CHALLENGE_MESSAGE_EXAMPLE);
         // A client that never submits credentials: a Type-1 negotiate, no Type-3.
-        c.write_c2s(b"GET /rpc/rpcproxy.dll HTTP/1.1\r\nAuthorization: NTLM TlRMTVNTUAABAAAA\r\n\r\n");
-        c.write_s2c(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {chal_b64}\r\n\r\n").as_bytes());
-        c.finish(dir.path(), &crate::ws::WsStatus::none());
+        meta.feed_c2s(b"GET /rpc/rpcproxy.dll HTTP/1.1\r\nAuthorization: NTLM TlRMTVNTUAABAAAA\r\n\r\n");
+        meta.feed_s2c(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {chal_b64}\r\n\r\n").as_bytes());
+        meta.finish(dir.path(), &crate::ws::WsStatus::none());
 
         let body = std::fs::read_to_string(dir.path().join("ntlm.jsonl")).unwrap();
         assert_eq!(body.lines().count(), 1);
@@ -616,7 +627,7 @@ mod tests {
         let d = Dumper::new(dir.path(), DumpOptions {
             raw_dump: false, ntlm_dump: true, server_name: None,
         }).unwrap();
-        let mut c = d.open_conn(
+        let (mut meta, _c2s, _s2c) = d.open_conn(
             "10.20.1.5:59338".parse().unwrap(),
             "10.20.2.10:443".parse().unwrap());
         let chal_b64 = B64.encode(crate::ntlm::CHALLENGE_MESSAGE_EXAMPLE);
@@ -625,17 +636,17 @@ mod tests {
 
         // Client sends its Type-3 first (the proxy relays c2s before the server's
         // 101 can come back).
-        c.write_c2s(format!(
+        meta.feed_c2s(format!(
             "RDG_OUT_DATA /remoteDesktopGateway/ HTTP/1.1\r\nAuthorization: NTLM {auth_b64}\r\n\r\n"
         ).as_bytes());
         // Server challenge (401): the pair is now in hand, but auth has not yet
         // succeeded, so nothing is flushed.
-        c.write_s2c(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {chal_b64}\r\n\r\n").as_bytes());
+        meta.feed_s2c(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {chal_b64}\r\n\r\n").as_bytes());
         assert!(!ntlm.exists(), "must not flush before the server accepts the credential");
 
         // Server accepts: 101 Switching Protocols -> flush now, WITHOUT finish()
         // (the RDP tunnel connection stays open for the whole session).
-        c.write_s2c(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
+        meta.feed_s2c(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n");
         let body = std::fs::read_to_string(&ntlm).expect("record flushed on auth success");
         assert_eq!(body.lines().count(), 1);
         let rec: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
@@ -647,7 +658,7 @@ mod tests {
         assert_eq!(rec["auth_result"], "success");
 
         // Closing the connection must NOT append a duplicate record.
-        c.finish(dir.path(), &crate::ws::WsStatus::none());
+        meta.finish(dir.path(), &crate::ws::WsStatus::none());
         assert_eq!(
             std::fs::read_to_string(&ntlm).unwrap().lines().count(),
             1,
