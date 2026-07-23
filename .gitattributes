@@ -1,0 +1,7 @@
+# These are executed by bash (often via WSL on Windows dev boxes) and by the
+# Linux CI. They MUST stay LF even when checked out on Windows with
+# core.autocrlf=true — a CRLF checkout makes bash choke on `$'\r'` and mangles
+# heredocs. Force LF on checkout regardless of platform.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.proto text eol=lf

@@ -54,6 +54,11 @@ struct FileCfg {
     /// interfaces (default true). `--verify-bpf-support=false` skips the probe and
     /// goes straight to load+attach. Only consulted for the eBPF data plane.
     #[serde(default = "d_verify_bpf")] verify_bpf_support: bool,
+    /// ALPN protocols the proxy is willing to negotiate, as an allowlist. The
+    /// proxy offers upstream the intersection of this list and what the client
+    /// offered, then presents the server's choice back to the client. Default
+    /// ["h2","http/1.1"]. Set to ["http/1.1"] to force HTTP/1.1; [] disables ALPN.
+    #[serde(default = "d_alpn")] alpn_protocols: Vec<String>,
 }
 fn d_port() -> u16 { 443 }
 fn d_tun() -> String { "tun0".into() }
@@ -71,6 +76,7 @@ fn d_ws_decode() -> bool { true }
 fn d_raw_dump() -> bool { true }
 fn d_ntlm_dump() -> bool { true }
 fn d_verify_bpf() -> bool { true }
+fn d_alpn() -> Vec<String> { vec!["h2".into(), "http/1.1".into()] }
 
 #[derive(Parser, Debug)]
 #[command(version, about = "transparent TLS MITM with source-IP preservation")]
@@ -113,6 +119,10 @@ struct Cli {
     /// file; when omitted, the config-file value stands.
     #[arg(long = "preserve-src-ip", env = "MYMITM_PRESERVE_SRC_IP", action = ArgAction::Set)]
     preserve_src_ip: Option<bool>,
+    /// ALPN allowlist as a comma-separated list (e.g. "h2,http/1.1"). Overrides
+    /// the config file. Use "http/1.1" to force HTTP/1.1 downgrade.
+    #[arg(long = "alpn", env = "MYMITM_ALPN", value_delimiter = ',')]
+    alpn: Option<Vec<String>>,
     /// Reverse any leftover state (stale clsact qdisc / iproute rules) from a
     /// previous unclean exit, then continue startup.
     #[arg(long, default_value_t = false)] cleanup: bool,
@@ -157,6 +167,7 @@ pub struct Settings {
     pub data_plane: DataPlaneKind,
     pub attach_mode: AttachMode,
     pub preserve_src_ip: bool,
+    pub alpn_protocols: Vec<String>,
     pub cleanup: bool,
     pub ws_decode: bool,
     pub raw_dump: bool,
@@ -194,6 +205,7 @@ impl Settings {
             data_plane: f.data_plane,
             attach_mode: f.attach_mode,
             preserve_src_ip: f.preserve_src_ip,
+            alpn_protocols: f.alpn_protocols,
             cleanup: false,
             ws_decode: f.ws_decode,
             raw_dump: f.raw_dump,
@@ -222,6 +234,7 @@ impl Settings {
         // Boolean overrides take an explicit true/false; `None` (flag omitted)
         // leaves the config-file value untouched.
         if let Some(v) = cli.preserve_src_ip { s.preserve_src_ip = v; }
+        if let Some(v) = cli.alpn { s.alpn_protocols = v; }
         s.cleanup = cli.cleanup;
         if let Some(v) = cli.ws_decode { s.ws_decode = v; }
         if let Some(v) = cli.raw_dump { s.raw_dump = v; }
@@ -269,6 +282,7 @@ impl Settings {
             data_plane: DataPlaneKind::Ebpf,
             attach_mode: AttachMode::Auto,
             preserve_src_ip: true,
+            alpn_protocols: vec!["h2".into(), "http/1.1".into()],
             cleanup: false,
             ws_decode: true,
             raw_dump: true,
@@ -517,5 +531,30 @@ mod tests {
         assert_eq!(on.verify_bpf_support, Some(true), "explicit true overrides");
         // A bare flag with no value is rejected (explicit value required).
         assert!(Cli::try_parse_from(["mymitm", "--verify-bpf-support"]).is_err());
+    }
+
+    #[test]
+    fn alpn_defaults_and_toml_override() {
+        // omitted -> [h2, http/1.1]
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert_eq!(s.alpn_protocols, vec!["h2".to_string(), "http/1.1".to_string()]);
+        // explicit single protocol (used to force HTTP/1.1)
+        let toml = format!("{}\nalpn_protocols = [\"http/1.1\"]", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert_eq!(s.alpn_protocols, vec!["http/1.1".to_string()]);
+        // empty list -> ALPN disabled
+        let toml = format!("{}\nalpn_protocols = []", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(s.alpn_protocols.is_empty());
+    }
+
+    #[test]
+    fn cli_alpn_parses_comma_list() {
+        use clap::Parser;
+        let c = Cli::try_parse_from(["mymitm", "--alpn", "h2,http/1.1"]).unwrap();
+        assert_eq!(c.alpn, Some(vec!["h2".to_string(), "http/1.1".to_string()]));
+        // absent -> None (leaves the config/default untouched)
+        let d = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert_eq!(d.alpn, None);
     }
 }
