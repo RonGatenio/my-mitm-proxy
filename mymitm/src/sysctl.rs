@@ -7,6 +7,7 @@
 //! live here so both share exactly one implementation.
 
 /// A sysctl we changed and must restore. `key` is dotted (`net.ipv4.ip_forward`).
+#[derive(Debug)]
 pub(crate) struct SavedSysctl {
     pub(crate) key: String,
     pub(crate) original: String,
@@ -132,6 +133,70 @@ fn plan(changes: Vec<Change>, manage: bool) -> Plan {
     }
 }
 
+use crate::config::Settings;
+
+/// RAII guard: enforces the eBPF plane's sysctl requirements on `acquire`, and
+/// restores whatever it changed on drop.
+pub(crate) struct SysctlGuard {
+    saved: Vec<SavedSysctl>,
+}
+
+impl SysctlGuard {
+    /// Per `s.manage_sysctls`:
+    /// * true  → set any wrong value (saving originals), WARN per change; restore on drop.
+    /// * false → change nothing; `Err` with an actionable message if anything is wrong.
+    pub(crate) fn acquire(s: &Settings) -> anyhow::Result<SysctlGuard> {
+        let saved = compute_and_apply(
+            s.local_ip,
+            &s.tun_iface,
+            s.manage_sysctls,
+            read_sysctl,
+            |k, v| write_sysctl(k, v),
+        )?;
+        Ok(SysctlGuard { saved })
+    }
+}
+
+/// Core of `acquire`, parameterised over the read/write side effects so it is
+/// unit-testable without root. Returns the originals to restore later; on
+/// `manage=false` with outstanding changes it returns `Err` and writes nothing.
+fn compute_and_apply(
+    local_ip: std::net::Ipv4Addr,
+    tun_iface: &str,
+    manage: bool,
+    read: impl Fn(&str) -> Option<String>,
+    mut write: impl FnMut(&str, &str) -> std::io::Result<()>,
+) -> anyhow::Result<Vec<SavedSysctl>> {
+    let changes = match plan(needed_changes(local_ip, tun_iface, read), manage) {
+        Plan::Fail(msg) => anyhow::bail!("{msg}"),
+        Plan::Apply(c) => c,
+    };
+    let mut saved: Vec<SavedSysctl> = Vec::new();
+    for c in &changes {
+        if let Err(e) = write(&c.key, c.want) {
+            // Roll back what we already changed, then fail.
+            for sv in saved.iter().rev() {
+                let _ = write(&sv.key, &sv.original);
+            }
+            anyhow::bail!("set {}={}: {e}", c.key, c.want);
+        }
+        tracing::warn!(
+            "manage-sysctls: set {} {} -> {} ({}); will restore on exit",
+            c.key, c.current, c.want, c.reason
+        );
+        saved.push(SavedSysctl { key: c.key.clone(), original: c.current.clone() });
+    }
+    Ok(saved)
+}
+
+impl Drop for SysctlGuard {
+    fn drop(&mut self) {
+        for sv in self.saved.iter().rev() {
+            let _ = write_sysctl(&sv.key, &sv.original);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +309,44 @@ mod tests {
         assert!(m.contains("sysctl -w net.ipv4.conf.tun0.route_localnet=1"));
         assert!(m.contains("--manage-sysctls"));
         assert!(m.contains("non-loopback"));
+    }
+
+    #[test]
+    fn apply_sets_and_records_when_managed() {
+        use std::cell::RefCell;
+        let writes = RefCell::new(Vec::<(String, String)>::new());
+        let saved = compute_and_apply(LOOPBACK, "tun0", true, reader(&[
+            ("net.ipv4.conf.all.route_localnet", "0"),
+            ("net.ipv4.conf.tun0.route_localnet", "0"),
+            ("net.ipv4.conf.all.rp_filter", "0"),
+            ("net.ipv4.conf.tun0.rp_filter", "0"),
+        ]), |k, v| { writes.borrow_mut().push((k.to_string(), v.to_string())); Ok(()) }).unwrap();
+        assert_eq!(
+            writes.borrow().as_slice(),
+            &[("net.ipv4.conf.tun0.route_localnet".to_string(), "1".to_string())]
+        );
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].key, "net.ipv4.conf.tun0.route_localnet");
+        assert_eq!(saved[0].original, "0");
+    }
+
+    #[test]
+    fn apply_fails_fast_when_unmanaged_and_dirty() {
+        let res = compute_and_apply(LOOPBACK, "tun0", false, reader(&[
+            ("net.ipv4.conf.all.route_localnet", "0"),
+            ("net.ipv4.conf.tun0.route_localnet", "0"),
+            ("net.ipv4.conf.all.rp_filter", "0"),
+            ("net.ipv4.conf.tun0.rp_filter", "0"),
+        ]), |_, _| panic!("must not write when unmanaged"));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("route_localnet"));
+    }
+
+    #[test]
+    fn apply_noop_when_clean_even_if_unmanaged() {
+        let saved =
+            compute_and_apply(LOOPBACK, "tun0", false, reader(OK), |_, _| panic!("no writes"))
+                .unwrap();
+        assert!(saved.is_empty());
     }
 }
