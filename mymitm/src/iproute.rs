@@ -28,6 +28,7 @@ use std::process::Command;
 
 use crate::config::Settings;
 use crate::dataplane::DataPlane;
+use crate::sysctl::{read_sysctl, write_sysctl, SavedSysctl};
 
 // ---------------------------------------------------------------------------
 // Pure rule-spec builder (no side effects, unit-tested without root)
@@ -233,26 +234,6 @@ fn run(prog: &str, args: &[String]) -> std::io::Result<()> {
         ));
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Sysctl helpers
-// ---------------------------------------------------------------------------
-
-/// A sysctl we set and must restore. `key` is in dotted form (`net.ipv4.ip_forward`).
-struct SavedSysctl {
-    key: String,
-    original: String,
-}
-
-fn read_sysctl(key: &str) -> Option<String> {
-    let p = format!("/proc/sys/{}", key.replace('.', "/"));
-    std::fs::read_to_string(p).ok().map(|s| s.trim().to_string())
-}
-
-fn write_sysctl(key: &str, val: &str) -> std::io::Result<()> {
-    let p = format!("/proc/sys/{}", key.replace('.', "/"));
-    std::fs::write(p, val)
 }
 
 // ---------------------------------------------------------------------------
