@@ -46,6 +46,15 @@ dump_path = "/var/tmp/mitm-dumps"
 # control to confirm preservation is what changes the source IP.
 # preserve_src_ip = true
 
+# Manage the kernel sysctls the eBPF data plane needs (default true). When true,
+# mymitm sets net.ipv4.conf.<tun_iface>.route_localnet=1 (only if local_addr is a
+# loopback address) and net.ipv4.conf.{all,<tun_iface>}.rp_filter=0 when they would
+# otherwise silently drop the diverted client traffic, and restores them on exit.
+# Set false — or pass --manage-sysctls=false — to leave sysctls untouched; the proxy
+# then FAILS FAST at startup with the exact commands to run if they are misconfigured.
+# eBPF data plane only (the iproute plane always manages these itself).
+# manage_sysctls = true
+
 # Decode intercepted WebSocket traffic (in addition to the raw byte dump).
 # Default true. Set false — or pass --ws-decode=false — to skip decoding.
 # ws_decode = true
