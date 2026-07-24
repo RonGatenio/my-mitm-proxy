@@ -1,5 +1,5 @@
 //! Shared kernel-sysctl helpers, plus the eBPF data plane's startup sysctl
-//! preflight (added in a later task).
+//! preflight (SysctlGuard).
 //!
 //! Both data planes touch `/proc/sys`: the `iproute` plane as part of its visible
 //! setup, and the `ebpf` plane to fix the two settings that otherwise make it
@@ -348,5 +348,63 @@ mod tests {
             compute_and_apply(LOOPBACK, "tun0", false, reader(OK), |_, _| panic!("no writes"))
                 .unwrap();
         assert!(saved.is_empty());
+    }
+
+    // Rollback: when a LATER write fails after an EARLIER one succeeded,
+    // compute_and_apply restores the already-applied change(s) in reverse and
+    // surfaces the original write error. Uses a counter closure that fails on the
+    // 2nd write. The reader yields 3 changes (route_localnet + both rp_filter).
+    #[test]
+    fn apply_rolls_back_earlier_writes_on_later_failure() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::<(String, String)>::new());
+        let n = RefCell::new(0u32);
+        let res = compute_and_apply(LOOPBACK, "tun0", true, reader(&[
+            ("net.ipv4.conf.all.route_localnet", "0"),
+            ("net.ipv4.conf.tun0.route_localnet", "0"),
+            ("net.ipv4.conf.all.rp_filter", "1"),
+            ("net.ipv4.conf.tun0.rp_filter", "1"),
+        ]), |k, v| {
+            calls.borrow_mut().push((k.to_string(), v.to_string()));
+            let mut c = n.borrow_mut();
+            *c += 1;
+            if *c >= 2 {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "boom"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(res.is_err());
+        let calls = calls.borrow();
+        // 1st write applied tun0.route_localnet=1; 2nd write (all.rp_filter=0) failed;
+        // rollback then restored tun0.route_localnet back to its original "0".
+        assert_eq!(
+            calls[0],
+            ("net.ipv4.conf.tun0.route_localnet".to_string(), "1".to_string())
+        );
+        assert_eq!(
+            calls[1],
+            ("net.ipv4.conf.all.rp_filter".to_string(), "0".to_string())
+        );
+        assert_eq!(
+            calls.last().unwrap(),
+            &("net.ipv4.conf.tun0.route_localnet".to_string(), "0".to_string())
+        );
+    }
+
+    // rp_filter is checked independently of the loopback gate: even for a
+    // non-loopback local_ip (route_localnet skipped), a non-zero rp_filter is flagged.
+    #[test]
+    fn rp_filter_flagged_even_for_non_loopback_local_ip() {
+        let r = reader(&[
+            ("net.ipv4.conf.all.route_localnet", "0"),
+            ("net.ipv4.conf.tun0.route_localnet", "0"),
+            ("net.ipv4.conf.all.rp_filter", "1"),
+            ("net.ipv4.conf.tun0.rp_filter", "0"),
+        ]);
+        let c = needed_changes(REAL, "tun0", r);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].key, "net.ipv4.conf.all.rp_filter");
+        assert_eq!(c[0].want, "0");
     }
 }
