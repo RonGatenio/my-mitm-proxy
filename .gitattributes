@@ -5,3 +5,8 @@
 *.sh    text eol=lf
 *.py    text eol=lf
 *.proto text eol=lf
+
+# VM-harness cloud-init seed files are extensionless but are consumed by the
+# Linux guest (cloud-init / QEMU). Force LF for the same reason as the scripts
+# above: a CRLF checkout corrupts the embedded systemd units and YAML.
+tests/vm/cloud-init/* text eol=lf
