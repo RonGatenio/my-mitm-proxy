@@ -232,6 +232,17 @@ cmd_proxy() {
     pass "phase2: C saw src=$A_IP — preservation ON => server sees the CLIENT IP (data_plane=$DATA_PLANE)"
   fi
 
+  # Collect B's decrypted dumps into the local report folder (no manual fetch).
+  local run_dir; run_dir="$(report_run_dir vm "$DATA_PLANE")"
+  if vm_ssh B "sudo tar czf /tmp/mymitm-dumps.tgz -C /opt/mymitm dumps && sudo chown ubuntu /tmp/mymitm-dumps.tgz" 2>/dev/null; then
+    vm_scp_from B /tmp/mymitm-dumps.tgz "$run_dir/dumps.tgz" \
+      && tar xzf "$run_dir/dumps.tgz" -C "$run_dir" && rm -f "$run_dir/dumps.tgz"
+    { echo "suite=vm"; echo "data_plane=$DATA_PLANE"; echo "date=$(date -u +%FT%TZ)"; } > "$run_dir/meta.txt"
+    pass "phase2: B's dumps collected -> $run_dir"
+  else
+    info "could not archive B's dumps for collection"
+  fi
+
   vm_ssh B "sudo systemctl stop mymitm" || true
 }
 

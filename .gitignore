@@ -10,3 +10,11 @@ k.pem
 # private / local-only (never commit; purged from history)
 oldchat.txt
 docs/superpowers/
+
+# test harness runtime output
+tests/reports/
+/tmp/mymitm-*
+
+# python bytecode
+__pycache__/
+*.pyc

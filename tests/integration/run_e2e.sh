@@ -34,6 +34,7 @@ MODE="${MODE:-ebpf}"
 
 # --- locations -------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"   # shared constants + topo/cert/toml/proxy helpers
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="$REPO_ROOT/target/x86_64-unknown-linux-musl/release/mymitm"
 WORK="$(mktemp -d /tmp/mymitm-e2e.XXXXXX)"
@@ -77,17 +78,7 @@ teardown() {
   sleep 0.5
   [ -n "$PROXY_PID" ] && kill -9 "$PROXY_PID" 2>/dev/null
   [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null
-  ip netns del "$NS_CLI" 2>/dev/null
-  ip netns del "$NS_SRV"  2>/dev/null
-  ip link del "$VROOT" 2>/dev/null
-  ip link del "$VETH0" 2>/dev/null
-  # confirm clean
-  if ip netns list 2>/dev/null | grep -qE "^($NS_CLI|$NS_SRV)\b"; then
-    red "WARNING: leftover netns remain"; ip netns list
-  fi
-  if ip link show "$VROOT" >/dev/null 2>&1 || ip link show "$VETH0" >/dev/null 2>&1; then
-    red "WARNING: leftover veth remain"
-  fi
+  topo_down
 }
 trap teardown EXIT
 
@@ -107,111 +98,17 @@ info "workdir: $WORK"
 info "mode: $MODE"
 
 # Clean any leftovers from a prior aborted run.
-ip netns del "$NS_CLI"  2>/dev/null
-ip netns del "$NS_SRV"  2>/dev/null
-ip link del "$VROOT"  2>/dev/null
-ip link del "$VETH0"  2>/dev/null
+topo_reset
 
 # --- cert ------------------------------------------------------------------
-info "generating leaf cert (CN=server.test)"
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout "$KEY" -out "$CERT" -days 2 \
-  -subj "/CN=server.test" \
-  -addext "subjectAltName=DNS:server.test" >/dev/null 2>&1 \
-  || fail "openssl cert generation failed"
+gen_cert "$CERT" "$KEY"
 
 # --- topology --------------------------------------------------------------
-info "building netns + veth topology"
-ip netns add "$NS_CLI"
-ip netns add "$NS_SRV"
-
-# client veth: root-side VROOT (the tun_iface) <-> VCLI in netns cli
-ip link add "$VROOT" type veth peer name "$VCLI"
-ip link set "$VCLI" netns "$NS_CLI"
-ip addr add 10.8.0.1/24 dev "$VROOT"
-ip link set "$VROOT" up
-# The eBPF DNATs the client flow's destination to the local listener address.
-# A packet that ARRIVES on a real interface destined for a loopback/non-local
-# address is dropped as a "martian" unless route_localnet is enabled for that
-# interface. Set it only for VROOT (the tun_iface) here; the iproute data plane
-# additionally needs it on the egress interface, which it sets itself via sysctl.
-sysctl -wq net.ipv4.conf."$VROOT".route_localnet=1
-ip netns exec "$NS_CLI" ip addr add "$CLIENT_IP/24" dev "$VCLI"
-ip netns exec "$NS_CLI" ip link set "$VCLI" up
-ip netns exec "$NS_CLI" ip link set lo up
-ip netns exec "$NS_CLI" ip route add default via 10.8.0.1
-
-# eBPF multi-client: add a secondary IP (10.8.0.9) to VCLI in the same netns.
-# Both IPs share the same physical veth; all traffic exits via VCLI→VROOT where
-# the eBPF is attached, so both source IPs are intercepted by the single tun_iface.
-# The client script uses --bind-addr to force the source IP per connection.
-if [ "$MODE" = "ebpf" ]; then
-  info "adding secondary client IP $CLIENT2_IP to $VCLI in $NS_CLI"
-  ip netns exec "$NS_CLI" ip addr add "$CLIENT2_IP/24" dev "$VCLI"
-fi
-
-# server veth: root-side VETH0 (egress_iface) <-> VSRV in netns srv
-ip link add "$VETH0" type veth peer name "$VSRV"
-ip link set "$VSRV" netns "$NS_SRV"
-ip addr add "$BOX_IP/24" dev "$VETH0"
-ip link set "$VETH0" up
-ip netns exec "$NS_SRV" ip addr add "$SERVER_IP/24" dev "$VSRV"
-ip netns exec "$NS_SRV" ip link set "$VSRV" up
-ip netns exec "$NS_SRV" ip link set lo up
-# The SNATted upstream packets arrive at the server with source 10.8.0.x, which
-# is OUTSIDE the server's connected 192.168.1.0/24. Route 10.8.0.0/24 back via
-# the box so the reply returns on mmveth0, where the eBPF un-SNATs it.
-ip netns exec "$NS_SRV" ip route add 10.8.0.0/24 via "$BOX_IP"
+topo_up "$MODE"
 
 # --- mymitm config ---------------------------------------------------------
 mkdir -p "$DUMP_DIR"
-
-if [ "$MODE" = "ebpf" ]; then
-  # eBPF multi-client: omit target_client_ip (wildcard/dynamic).
-  # Use local_addr=10.8.0.1 (the VROOT IP) instead of 127.0.0.1 so that the
-  # eBPF DNAT to the listener works for BOTH client IPs without route_localnet
-  # complications: packets are routed to a real local address on VROOT rather
-  # than the loopback, which avoids a WSL kernel quirk that blocks secondary-IP
-  # connections to 127.0.0.1 after a first connection has been established.
-  cat > "$TOML" <<EOF
-# eBPF multi-client mode: no target_client_ip (wildcard)
-target_server_ip = "$SERVER_IP"
-target_server_port = 443
-box_ip = "$BOX_IP"
-cert_path = "$CERT"
-key_path = "$KEY"
-tun_iface = "$VROOT"
-egress_iface = "$VETH0"
-local_addr = "10.8.0.1"
-local_port = 8443
-fwmark = 0x1337
-dump_path = "$DUMP_DIR"
-stdout_log_level = "info"
-server_name = "server.test"
-data_plane = "ebpf"
-EOF
-
-else
-  # iproute mode: single client (cli / 10.8.0.5), data_plane = "iproute".
-  cat > "$TOML" <<EOF
-# iproute data plane mode
-target_server_ip = "$SERVER_IP"
-target_server_port = 443
-box_ip = "$BOX_IP"
-cert_path = "$CERT"
-key_path = "$KEY"
-tun_iface = "$VROOT"
-egress_iface = "$VETH0"
-local_addr = "127.0.0.1"
-local_port = 8443
-fwmark = 0x1337
-dump_path = "$DUMP_DIR"
-stdout_log_level = "info"
-server_name = "server.test"
-data_plane = "iproute"
-EOF
-fi
-
+write_toml "$TOML" "$MODE" "$CERT" "$KEY" "$DUMP_DIR"
 info "wrote config: $TOML"
 
 # --- start fake server in netns srv ---------------------------------------
@@ -227,15 +124,8 @@ green "fake server ready"
 
 # --- start mymitm in root ns ----------------------------------------------
 info "starting mymitm (real release binary) in root ns"
-RUST_LOG=info "$BIN" --config "$TOML" >"$PROXY_LOG" 2>&1 &
-PROXY_PID=$!
-# wait for the proxy loop + listener
-for _ in $(seq 1 100); do
-  grep -q "proxy listening" "$PROXY_LOG" && break
-  if ! kill -0 "$PROXY_PID" 2>/dev/null; then fail "mymitm exited early; log: $(cat "$PROXY_LOG")"; fi
-  sleep 0.1
-done
-grep -q "proxy listening" "$PROXY_LOG" || fail "mymitm never logged 'proxy listening'; log: $(cat "$PROXY_LOG")"
+start_proxy "$TOML" "$PROXY_LOG"
+wait_proxy "$PROXY_LOG" || fail "mymitm did not come up"
 green "mymitm data plane attached + proxy listening"
 
 # --- run client(s) ---------------------------------------------------------

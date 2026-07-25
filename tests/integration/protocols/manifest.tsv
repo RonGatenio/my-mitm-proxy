@@ -1,0 +1,12 @@
+# name	kind	group	class	exp_fwd	exp_dump	exp_level	note
+http1	simple	A	PIPE	ok	ok	2	HTTP/1.1 GET/POST/HEAD baseline
+http1_0	simple	A	PIPE	ok	ok	2	HTTP/1.0 EOF-delimited body
+keepalive	simple	A	PIPE	ok	ok	2	>=3 requests on one connection
+streaming	simple	A	PIPE	ok	ok	2	chunked long-lived incremental delivery
+pump	simple	A	PIPE	ok	ok	1	full-duplex + idle + large reassembly (raw bytes; half-close deferred to P1)
+sse	simple	A	PIPE	ok	ok	2	text/event-stream incremental
+sigv4	simple	F	integrity	ok	ok	2	SigV4 header + presigned survive byte-exact
+pinning	simple	D	positive	ok	ok	2	SPKI pin succeeds (genuine leaf); HSTS in dump
+newconn	custom	E	PIPE	ok	ok	2	fresh SYN after attach is intercepted
+preexisting	custom	E	PIPE	fail	na	0	missed-SYN mid-stream flow reset (documented)
+restart	custom	E	PIPE	fail	na	0	proxy restart drops in-flight conn (documented)
