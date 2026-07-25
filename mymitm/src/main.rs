@@ -6,6 +6,7 @@ mod dump;
 mod iproute;
 mod ntlm;
 mod proxy;
+mod sysctl;
 mod ws;
 
 use std::sync::Arc;

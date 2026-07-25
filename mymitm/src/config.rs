@@ -54,6 +54,13 @@ struct FileCfg {
     /// interfaces (default true). `--verify-bpf-support=false` skips the probe and
     /// goes straight to load+attach. Only consulted for the eBPF data plane.
     #[serde(default = "d_verify_bpf")] verify_bpf_support: bool,
+    /// Manage the kernel sysctls the eBPF data plane needs (default true). When
+    /// true, mymitm sets `route_localnet` (for a loopback `local_addr`) and
+    /// `rp_filter` if they would otherwise silently drop the diverted client
+    /// traffic, remembers the originals, and restores them on exit. When false it
+    /// changes nothing and instead fails fast at startup if they are misconfigured.
+    /// eBPF data plane only; the iproute plane manages these itself regardless.
+    #[serde(default = "d_manage_sysctls")] manage_sysctls: bool,
     /// ALPN protocols the proxy is willing to negotiate, as an allowlist. The
     /// proxy offers upstream the intersection of this list and what the client
     /// offered, then presents the server's choice back to the client. Default
@@ -76,6 +83,7 @@ fn d_ws_decode() -> bool { true }
 fn d_raw_dump() -> bool { true }
 fn d_ntlm_dump() -> bool { true }
 fn d_verify_bpf() -> bool { true }
+fn d_manage_sysctls() -> bool { true }
 fn d_alpn() -> Vec<String> { vec!["h2".into(), "http/1.1".into()] }
 
 #[derive(Parser, Debug)]
@@ -144,6 +152,11 @@ struct Cli {
     /// eBPF data plane only; ignored for `--data-plane iproute`.
     #[arg(long = "verify-bpf-support", env = "MYMITM_VERIFY_BPF_SUPPORT", action = ArgAction::Set)]
     verify_bpf_support: Option<bool>,
+    /// Manage kernel sysctls the eBPF plane needs — route_localnet / rp_filter
+    /// (`--manage-sysctls=true|false`, default true). True sets and restores them
+    /// (with a warning); false fails fast if they are misconfigured. eBPF only.
+    #[arg(long = "manage-sysctls", env = "MYMITM_MANAGE_SYSCTLS", action = ArgAction::Set)]
+    manage_sysctls: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +186,7 @@ pub struct Settings {
     pub raw_dump: bool,
     pub ntlm_dump: bool,
     pub verify_bpf_support: bool,
+    pub manage_sysctls: bool,
 }
 
 impl Settings {
@@ -211,6 +225,7 @@ impl Settings {
             raw_dump: f.raw_dump,
             ntlm_dump: f.ntlm_dump,
             verify_bpf_support: f.verify_bpf_support,
+            manage_sysctls: f.manage_sysctls,
         })
     }
 
@@ -240,6 +255,7 @@ impl Settings {
         if let Some(v) = cli.raw_dump { s.raw_dump = v; }
         if let Some(v) = cli.ntlm_dump { s.ntlm_dump = v; }
         if let Some(v) = cli.verify_bpf_support { s.verify_bpf_support = v; }
+        if let Some(v) = cli.manage_sysctls { s.manage_sysctls = v; }
         Ok(s)
     }
 
@@ -288,6 +304,7 @@ impl Settings {
             raw_dump: true,
             ntlm_dump: true,
             verify_bpf_support: true,
+            manage_sysctls: true,
         }
     }
 }
@@ -531,6 +548,32 @@ mod tests {
         assert_eq!(on.verify_bpf_support, Some(true), "explicit true overrides");
         // A bare flag with no value is rejected (explicit value required).
         assert!(Cli::try_parse_from(["mymitm", "--verify-bpf-support"]).is_err());
+    }
+
+    #[test]
+    fn manage_sysctls_defaults_true() {
+        let s = Settings::from_toml_str(base()).unwrap();
+        assert!(s.manage_sysctls);
+    }
+
+    #[test]
+    fn manage_sysctls_can_be_disabled_in_file() {
+        let toml = format!("{}\nmanage_sysctls = false", base());
+        let s = Settings::from_toml_str(&toml).unwrap();
+        assert!(!s.manage_sysctls);
+    }
+
+    #[test]
+    fn cli_manage_sysctls_flag_parses() {
+        use clap::Parser;
+        let default = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert_eq!(default.manage_sysctls, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--manage-sysctls=false"]).unwrap();
+        assert_eq!(off.manage_sysctls, Some(false), "explicit false overrides");
+        let on = Cli::try_parse_from(["mymitm", "--manage-sysctls", "true"]).unwrap();
+        assert_eq!(on.manage_sysctls, Some(true), "explicit true overrides");
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--manage-sysctls"]).is_err());
     }
 
     #[test]

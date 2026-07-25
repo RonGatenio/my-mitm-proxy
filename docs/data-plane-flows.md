@@ -37,15 +37,21 @@ separate data plane entirely. That gives the three flows this document covers:
 | **How src-IP is preserved** | in-kernel SNAT: `cls_eth_egress` rewrites src `box_ip → client_ip`; `EGRESS`/`UPSTREAM` maps drive it; upstream socket carries `SO_MARK=fwmark` to select the flow | *identical to TCX* | `IP_TRANSPARENT` bind to `client_ip:0` (src is the client's directly); `mangle MARK` on replies + `ip rule fwmark→table` + `local` route re-catch the replies |
 | **Teardown / fail-open** | RAII: dropping the object releases the links, kernel auto-detaches — even on **SIGKILL**. `tc` is never touched | `Drop` detaches the 4 filters + removes the `clsact` qdisc (`tc qdisc del`). Clean exit/SIGTERM only; **SIGKILL leaves the qdisc** → `--cleanup` | `Drop` reverses the 4 rules + restores sysctls. Clean exit/SIGTERM only; **SIGKILL leaves state** → `--cleanup` |
 | **Visibility / stealth** | **config-clean**: nothing in `iptables`/`nft`/`ip rule`/`ip route`; visible only to BPF tooling (`bpftool`, `tc filter show`) | config-clean for netfilter, but adds a **visible `clsact` qdisc + filters** (`tc qdisc/filter show`) | **not stealthy by design**: visible `iptables` (nat + mangle), `ip rule`, `ip route`, and sysctl changes |
-| **Sysctls it sets** | none (see note below) | none | `ip_forward=1`, `rp_filter=0` (all + both ifaces), `route_localnet=1` (both ifaces); each saved & restored |
+| **Sysctls it sets** | route_localnet (loopback `local_addr`) + rp_filter, when `manage_sysctls=true` (default; saved & restored). `=false` → none, fail-fast instead | route_localnet (loopback `local_addr`) + rp_filter, when `manage_sysctls=true` (default; saved & restored). `=false` → none, fail-fast instead | `ip_forward=1`, `rp_filter=0` (all + both ifaces), `route_localnet=1` (both ifaces); each saved & restored |
 
-> **eBPF & sysctls.** The eBPF plane installs *no* sysctls — that is what keeps
-> it config-clean. But when the DNAT target (`local_addr`) is a loopback address
-> (default `127.0.0.1`), a packet arriving on a real interface for a loopback
-> destination is dropped as a *martian* unless `net.ipv4.conf.<tun_iface>.route_localnet=1`
-> is set. With the eBPF plane the operator must set that externally (the test
-> harnesses do — see `tests/vm/run.sh`, `tests/integration/run_e2e.sh` — or use a
-> real local IP as `local_addr` to avoid it). The `iproute` plane sets it itself.
+> **eBPF & sysctls.** By default (`manage_sysctls = true`) the eBPF plane sets the
+> two sysctls it needs and restores them on exit: `net.ipv4.conf.<tun_iface>.route_localnet=1`
+> (only when `local_addr` is a loopback address — otherwise packets DNAT'd to it are
+> martian-dropped) and `net.ipv4.conf.{all,<tun_iface>}.rp_filter=0` (or the client's
+> preserved source is reverse-path dropped). Each change is logged at WARN and reverted
+> on clean exit / SIGTERM. On **SIGKILL** the restore cannot run, so the changes —
+> notably the box-wide `net.ipv4.conf.all.rp_filter=0` — are left in place until reset
+> manually (`sysctl -w ...`); the same caveat as the clsact qdisc on the tc path.
+> Set `manage_sysctls = false` (or `--manage-sysctls=false`) to
+> keep the plane fully config-clean: it then changes nothing and instead **fails fast at
+> startup** with the exact `sysctl` commands to run, or you can point `local_addr` at a
+> non-loopback IP to avoid `route_localnet` entirely. Unlike the iproute plane, eBPF does
+> not touch the egress interface's sysctls (its upstream leg uses the box's real IP).
 
 ---
 
@@ -273,6 +279,7 @@ variable. CLI overrides config.
 |--------|-----------|----------|---------|--------|---------|
 | Data plane | `data_plane` | `--data-plane` | `MYMITM_DATA_PLANE` | `ebpf`, `iproute` | `ebpf` |
 | Attach mode (eBPF only) | `attach_mode` | `--attach-mode` | `MYMITM_ATTACH_MODE` | `auto`, `tcx`, `tc` | `auto` |
+| Manage sysctls (eBPF only) | `manage_sysctls` | `--manage-sysctls` | `MYMITM_MANAGE_SYSCTLS` | `true`, `false` | `true` |
 
 ```toml
 # mymitm.toml
