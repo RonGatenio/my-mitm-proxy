@@ -110,7 +110,7 @@ fn fail_message(changes: &[Change]) -> String {
     let _ = write!(
         m,
         "Fix by ONE of:\n  \
-         (a) drop --manage-sysctls=false to let mymitm set and restore them (default), or\n  \
+         (a) pass --manage-sysctls=true to let mymitm set and restore them, or\n  \
          (b) set them yourself: {}, or\n  \
          (c) set local_addr to a non-loopback IP (removes the route_localnet requirement).",
         sets.join("; ")
@@ -307,7 +307,7 @@ mod tests {
         let m = fail_message(&dirty);
         assert!(m.contains("net.ipv4.conf.tun0.route_localnet is 0, needs 1"));
         assert!(m.contains("sysctl -w net.ipv4.conf.tun0.route_localnet=1"));
-        assert!(m.contains("--manage-sysctls"));
+        assert!(m.contains("--manage-sysctls=true"));
         assert!(m.contains("non-loopback"));
     }
 
