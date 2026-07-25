@@ -44,7 +44,10 @@ separate data plane entirely. That gives the three flows this document covers:
 > (only when `local_addr` is a loopback address — otherwise packets DNAT'd to it are
 > martian-dropped) and `net.ipv4.conf.{all,<tun_iface>}.rp_filter=0` (or the client's
 > preserved source is reverse-path dropped). Each change is logged at WARN and reverted
-> on clean exit / SIGTERM. Set `manage_sysctls = false` (or `--manage-sysctls=false`) to
+> on clean exit / SIGTERM. On **SIGKILL** the restore cannot run, so the changes —
+> notably the box-wide `net.ipv4.conf.all.rp_filter=0` — are left in place until reset
+> manually (`sysctl -w ...`); the same caveat as the clsact qdisc on the tc path.
+> Set `manage_sysctls = false` (or `--manage-sysctls=false`) to
 > keep the plane fully config-clean: it then changes nothing and instead **fails fast at
 > startup** with the exact `sysctl` commands to run, or you can point `local_addr` at a
 > non-loopback IP to avoid `route_localnet` entirely. Unlike the iproute plane, eBPF does
