@@ -92,6 +92,10 @@ pub struct BpfPlane {
     /// EGRESS map: box ephemeral src port (NBO) -> client IP (NBO). Written per
     /// connection just before connect() so cls_eth_egress can SNAT correctly.
     egress_map: Mutex<AyaHashMap<MapData, u16, u32>>,
+    /// Restores any kernel sysctls we changed for this plane (route_localnet /
+    /// rp_filter) when the plane drops. Held purely as an RAII guard.
+    #[allow(dead_code)]
+    _sysctls: crate::sysctl::SysctlGuard,
 }
 
 /// Load the embedded eBPF object into the kernel: raise `RLIMIT_MEMLOCK`, detect
@@ -143,6 +147,13 @@ impl BpfPlane {
     /// Load the embedded object, populate `CONFIG`, init aya-log (best-effort),
     /// and attach all four classifiers (TCX or clsact+tc per `attach_mode`).
     pub fn load_and_attach(s: &Settings) -> anyhow::Result<BpfPlane> {
+        // Preflight the kernel sysctls the eBPF plane depends on (route_localnet /
+        // rp_filter). With manage_sysctls=true this sets+saves them (restored on
+        // drop); with =false it fails fast here if they are misconfigured — before
+        // we load or attach anything. If a later step errors, this guard drops and
+        // restores them automatically.
+        let sysctls = crate::sysctl::SysctlGuard::acquire(s)?;
+
         let mut ebpf = load_object()?;
 
         // aya-log is best-effort: if the eBPF side emits no log map, init returns
@@ -208,6 +219,7 @@ impl BpfPlane {
             fwmark: s.fwmark,
             preserve_src_ip: s.preserve_src_ip,
             egress_map: Mutex::new(egress_map),
+            _sysctls: sysctls,
         })
     }
 }
