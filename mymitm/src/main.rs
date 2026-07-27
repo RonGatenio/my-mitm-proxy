@@ -4,6 +4,7 @@ mod config;
 mod dataplane;
 mod dump;
 mod iproute;
+mod netns;
 mod ntlm;
 mod proxy;
 mod sysctl;
@@ -74,6 +75,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("--cleanup: reversing any leftover data-plane state");
         bpf::cleanup_tc(&settings.tun_iface, &settings.egress_iface);
         iproute::cleanup(&settings);
+        netns::cleanup(&settings);
+    }
+
+    // Namespace mode: plumb the host side, then re-exec ourselves INSIDE the
+    // namespace and supervise that child. Everything below this point runs in
+    // the child (which is invoked with --netns=false). Must come before any
+    // data-plane work, since the child is the one that owns the data plane.
+    if settings.netns {
+        return run_netns_supervisor(&settings).await;
     }
 
     // Ensure the ring CryptoProvider is installed before any TLS use.
@@ -125,6 +135,79 @@ async fn main() -> anyhow::Result<()> {
     // `plane` (and the clone inside proxy::run, which exits at select! end)
     // both drop here → concrete plane Drop tears down all kernel state.
     drop(plane);
+    Ok(())
+}
+
+/// Namespace mode's parent half: build the host-side plumbing, run a copy of
+/// ourselves inside the namespace, and tear the plumbing down when it exits.
+///
+/// The parent deliberately stays in the host namespace. `setns` in-process is
+/// perfectly viable — done from a plain single-threaded `main` before the runtime
+/// starts, there is only one thread to move — so the reason is not thread safety
+/// but **teardown ownership**: the plumbing (veths, policy rules, routing tables)
+/// lives in the HOST namespace, and a process that has moved into the namespace
+/// addresses the namespace's tables instead. Keeping a process out here means
+/// "whoever owns the host state never left the host namespace", which survives
+/// the child panicking, crashing, or being SIGKILLed; only killing this parent
+/// leaks. An in-process variant is possible (spawn a cleanup thread before
+/// `setns`, since threads created earlier stay in the host namespace) and would
+/// buy a single PID — better systemd MAINPID/Restart semantics — at the cost of
+/// more exit paths that can leak.
+///
+/// The child is `ip netns exec <ns> <self> <our argv> --netns=false --tun … `, so
+/// the code inside the namespace is the same, already-validated path that runs
+/// when namespace mode is off — only the interface names differ.
+async fn run_netns_supervisor(settings: &config::Settings) -> anyhow::Result<()> {
+    // Fail fast if this box's FORWARD permission is pinned to interfaces that the
+    // namespace's veths cannot match; starting anyway would blackhole silently.
+    netns::preflight(settings)?;
+
+    let (guard, inner) = netns::NetnsGuard::setup(settings)?;
+
+    let exe = std::env::current_exe()?;
+    let argv: Vec<String> = std::env::args().collect();
+    let child_args = netns::child_argv(&argv, &inner);
+
+    let mut cmd = tokio::process::Command::new("ip");
+    cmd.args(["netns", "exec", guard.ns()]);
+    cmd.arg(&exe);
+    cmd.args(&child_args[1..]); // argv[0] is replaced by the resolved exe path
+    // If this supervisor dies unexpectedly, don't leave the child running with
+    // plumbing that is about to disappear underneath it.
+    cmd.kill_on_drop(true);
+
+    tracing::info!(
+        ns = guard.ns(),
+        tun = %inner.tun_iface,
+        egress = %inner.egress_iface,
+        box_ip = %inner.box_ip,
+        "netns mode: starting the data plane inside the namespace"
+    );
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to run `ip netns exec {}`: {e}", guard.ns()))?;
+
+    let status = tokio::select! {
+        r = child.wait() => r?,
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal; stopping the namespaced data plane");
+            // SIGTERM, not kill: the child's Drop impls must run so the
+            // classifiers detach and the in-namespace sysctls are restored.
+            if let Some(pid) = child.id() {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            }
+            child.wait().await?
+        }
+    };
+
+    // Drop order matters: the child is gone, so nothing is using the veths when
+    // the guard reverses the plumbing.
+    drop(guard);
+
+    if !status.success() {
+        anyhow::bail!("namespaced data plane exited with {status}");
+    }
     Ok(())
 }
 
