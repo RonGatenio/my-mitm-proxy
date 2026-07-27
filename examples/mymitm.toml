@@ -55,6 +55,27 @@ dump_path = "/var/tmp/mitm-dumps"
 # eBPF data plane only (the iproute plane always manages these itself).
 # manage_sysctls = true
 
+# Run the data plane inside a network namespace (default true).
+#
+# Interception turns ONE forwarded flow into TWO locally-terminated ones: the
+# client's SYN is rewritten to local_addr:local_port and delivered via INPUT, and
+# the proxy dials the server itself so that leg leaves via OUTPUT. A box whose
+# firewall only permits "FORWARD -> server" drops both, in EITHER data plane.
+# In namespace mode both legs are FORWARDed through a veth pair instead, so a box
+# that already permits the forward needs no firewall change at all. mymitm builds
+# the namespace, the two veth pairs and the policy routes itself, runs the data
+# plane inside as a supervised child, and reverses all of it on exit.
+#
+# Requires (a startup preflight checks these and fails fast otherwise):
+#   - net.ipv4.ip_forward=1 on the host, and
+#   - the FORWARD permission for the server NOT pinned to -i/-o interfaces
+#     (a rule like "-i tun0 -o eth0 -d <server> -j ACCEPT" cannot match the
+#     namespace's veths; make it destination-only, or set netns = false).
+#
+# Set false — or pass --netns=false — to run directly on tun_iface/egress_iface.
+# You then have to permit the two locally-terminated legs yourself.
+# netns = true
+
 # Decode intercepted WebSocket traffic (in addition to the raw byte dump).
 # Default true. Set false — or pass --ws-decode=false — to skip decoding.
 # ws_decode = true

@@ -270,6 +270,129 @@ iproute there (a limitation of that test kernel, not the proxy — a real distro
 
 ---
 
+## Namespace mode (`netns`, default true) — orthogonal to the data plane
+
+`netns` is a **third, independent** knob: it applies to *both* data planes and
+changes **where** the plane runs, not what it does.
+
+### The problem it solves
+
+Interception turns **one FORWARDed flow into two locally-terminated ones**:
+
+| | Without the proxy | With the proxy (either plane) |
+|---|---|---|
+| client → server | routing: *not local* → **FORWARD** | dst rewritten to `local_addr:local_port` → routing: *local* → **INPUT** |
+| box → server | — | new socket, locally generated → **OUTPUT** |
+| replies | FORWARD | INPUT/OUTPUT as `ESTABLISHED` |
+
+So on a box whose firewall permits only `FORWARD -d <server> --dport <port>`,
+**FORWARD is never traversed for the intercepted port** and both legs are dropped
+by the INPUT/OUTPUT policies. This is chain traversal, not anything
+plane-specific — which is why it breaks `ebpf` and `iproute` identically.
+
+### The mechanism
+
+Both legs become *forwarded* traffic again from the host's point of view:
+
+```mermaid
+flowchart LR
+  A["client<br/>client_ip"]
+  C["server<br/>server_ip:port"]
+  subgraph HOST["host netns (firewall lives here)"]
+    F1["FORWARD<br/>-i tun_iface -o mmc0"]
+    F2["FORWARD<br/>-i mmu0 -o egress_iface"]
+  end
+  subgraph NS["netns 'mitm' (empty chains, ip_forward=0)"]
+    L["data plane + listener<br/>tun=mmc1, egress=mmu1<br/>box_ip=169.254.8.2"]
+  end
+  A -- "dst=server_ip:port" --> F1 --> L
+  L -- "dst=server_ip:port" --> F2 --> C
+```
+
+The destination is **still the real server** for the whole time the packet is in
+the host's stack — the rewrite to `local_addr:local_port` happens *inside* the
+namespace, where the chains are empty. So the box's existing forward permission
+matches **both** legs and **no firewall rule has to change**. Measured on kernel
+4.15: the `FORWARD -d <server> --dport 443 -j ACCEPT` counter shows exactly **two
+accepted SYNs per session**, one per leg.
+
+Because `net.ipv4.conf.*` is namespaced, the `route_localnet` / `rp_filter`
+changes from `manage_sysctls` land **inside** the namespace and never touch the
+box — which also retires the box-wide `conf.all.rp_filter=0` caveat noted above.
+
+### What mymitm does
+
+The parent process plumbs the host side, then re-execs itself
+(`ip netns exec <ns> <self> … --netns=false --tun mmc1 --egress mmu1 --box-ip …`)
+and supervises that child. The parent deliberately **stays in the host
+namespace**: only a process still there can delete the veths, policy rules and
+routing tables at teardown, and `setns` moves a single *thread*, which is not
+safe underneath a multi-threaded tokio runtime. The child therefore runs the
+exact same code path as `netns = false` — only the interface names differ.
+
+| | Value |
+|---|---|
+| Namespace | `mitm` |
+| Client leg (→ child's `tun_iface`) | `mmc0` (host, 169.254.7.1/30) ↔ `mmc1` (ns, 169.254.7.2/30) |
+| Upstream leg (→ child's `egress_iface`, `box_ip`) | `mmu0` (host, 169.254.8.1/30) ↔ `mmu1` (ns, **169.254.8.2**) |
+| Steer in | `ip rule prio 31000+mask iif <tun_iface> to <server> lookup 300+mask` |
+| Steer back | `ip rule prio 32000+mask iif <egress_iface> from <server> lookup 400+mask` |
+| Host sysctls | `conf.{mmc0,mmu0}.rp_filter=2` — our own veths only |
+
+Two details worth knowing:
+
+- **Why two veth pairs, not one.** With a single pair (`tun_iface ==
+  egress_iface`) all four classifiers share two hooks, and tc runs them in `pref`
+  order under `direct-action`, where the **first program to return `TC_ACT_OK`
+  ends the chain**. On ingress `cls_eth_ingress` takes the lower pref, accepts
+  every client packet (it only matches replies *from* the server), and
+  `cls_tun_ingress` never runs — nothing is rewritten. Measured on 4.15: the flow
+  was routed straight through the namespace to the server **un-intercepted**,
+  while the client still saw a healthy HTTP 200. Two pairs give each hook exactly
+  one program — the arrangement the product already validates on real interfaces.
+- **`ip_forward=0` inside the namespace.** If interception ever misses, the packet
+  is **dropped** rather than quietly forwarded to the server in the clear. Fail
+  closed, not fail open. (The `iproute` plane sets `ip_forward=1` itself during
+  setup and restores it on exit, so it does not get this guarantee; it does not
+  need forwarding here either.)
+- `rp_filter=2` (loose), not `0`: the kernel takes `MAX(conf.all, conf.<iface>)`,
+  so **2 loosens even when a hardened box has `conf.all.rp_filter=1`** — no
+  box-wide change required.
+
+### Requirements, and the preflight
+
+Namespace mode needs, all of which a forwarding box already has:
+
+- `net.ipv4.ip_forward=1` on the host;
+- `FORWARD` accepting NEW to `<server>:<port>` **without** an `-i`/`-o` match;
+- `FORWARD` accepting `ESTABLISHED,RELATED` (both return paths).
+
+The middle one is the trap: a rule like
+`-A FORWARD -i tun0 -o eth0 -d <server> -j ACCEPT` permits the flow **today** but
+cannot match once the legs become `-o mmc0` / `-i mmu0`. A startup **preflight**
+(`netns::diagnose`) checks both conditions against `iptables -S FORWARD` and
+**fails fast** with the offending rule and three remedies, rather than starting
+into a silent blackhole. Check yours with `iptables -S FORWARD`.
+
+With `netns = false` you run directly on `tun_iface`/`egress_iface` as before,
+and must permit the two locally-terminated legs yourself:
+
+```bash
+# client leg (both planes)
+iptables -I INPUT  -i $TUN -p tcp -m tcp -d $LOCAL_ADDR --dport $LOCAL_PORT -j ACCEPT
+# upstream leg — eBPF carries SO_MARK=fwmark; iproute does NOT, and its source is
+# the SPOOFED client IP, so do not match on -s <box_ip> there.
+iptables -I OUTPUT -o $EGRESS -p tcp -m tcp -m mark --mark $FWMARK -d $SERVER --dport $PORT -j ACCEPT  # ebpf
+iptables -I OUTPUT -o $EGRESS -p tcp -m tcp -d $SERVER --dport $PORT -j ACCEPT                          # iproute
+```
+
+Validated end to end by `tests/vm/validate-netns.sh` on kernel 4.15, both planes:
+a default-DROP firewall (forward → server only, ssh/openvpn in, ntp/logs out)
+**blocks** the proxy on the host legs, and with `netns = true` traffic flows again
+with the ruleset **byte-for-byte unchanged**, the client's source IP still
+preserved, decrypted bytes still dumped, and every trace of the plumbing removed
+on exit.
+
 ## How to select
 
 Both knobs are settable via the TOML config, a CLI flag, or an environment
@@ -280,6 +403,7 @@ variable. CLI overrides config.
 | Data plane | `data_plane` | `--data-plane` | `MYMITM_DATA_PLANE` | `ebpf`, `iproute` | `ebpf` |
 | Attach mode (eBPF only) | `attach_mode` | `--attach-mode` | `MYMITM_ATTACH_MODE` | `auto`, `tcx`, `tc` | `auto` |
 | Manage sysctls (eBPF only) | `manage_sysctls` | `--manage-sysctls` | `MYMITM_MANAGE_SYSCTLS` | `true`, `false` | `true` |
+| Namespace mode | `netns` | `--netns` | `MYMITM_NETNS` | `true`, `false` | `true` |
 
 ```toml
 # mymitm.toml
@@ -318,6 +442,9 @@ iproute rules) from a previous unclean exit, then continues startup.
 | `mymitm-ebpf/src/main.rs` | kernel classifiers `cls_tun_*` / `cls_eth_*` and the `EGRESS`/`UPSTREAM` map logic |
 | `mymitm-common/src/lib.rs` | `classify_tun` / `classify_eth`, `Config`, `Rewrite`, map key/value types & capacities |
 | `mymitm/src/iproute.rs` | iproute plane: `build_ruleset` (the 4 rules), `setup`, sysctls, `upstream_socket`, `Drop`, `cleanup` |
+| `mymitm/src/netns.rs` | namespace mode: `build_plumbing` (pure spec), `NetnsGuard` (RAII), `diagnose`/`preflight`, `child_argv`, `cleanup` |
+| `tests/vm/validate-netns.sh` | default-DROP-firewall validation: reproduces the block, then proves the recipe and `--netns=true` both fix it without touching the firewall |
+| `tests/vm/netns/netns-recipe.sh` | the same plumbing as a standalone operator recipe (what `netns.rs` automates) |
 | `mymitm/src/config.rs` | `DataPlaneKind` / `AttachMode` enums, defaults, config + CLI wiring |
 | `tests/vm/README.md` | 3-VM kernel-4.15 / 5.10 validation matrix (why iproute is skipped on the lvh 5.10 test kernel) |
 | `examples/mymitm.toml` | annotated sample config |
