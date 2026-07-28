@@ -80,7 +80,9 @@ dump_path = "/var/tmp/mitm-dumps"
 # The steer into the namespace is narrowed to TCP target_server_port, so other
 # traffic to the same address (e.g. an RD Gateway's UDP 3391 transport) keeps
 # being forwarded normally instead of dying inside the namespace. That narrowing
-# needs kernel >= 4.17; on an older kernel mymitm warns and steers everything.
+# needs kernel >= 4.17. mymitm does not probe for that (it adds nothing to your box
+# just to test it): it attempts the scoped rule and, if the kernel rejects it, falls
+# back to steering everything to the server and WARNs about what that costs.
 #
 # Set false — or pass --netns=false — to run directly on tun_iface/egress_iface.
 # You then have to permit the two locally-terminated legs yourself.

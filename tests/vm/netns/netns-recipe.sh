@@ -118,52 +118,70 @@ SERVER="${2:-}"; PORT="${3:-}"; CIF="${4:-}"; EIF="${5:-}"
 # UDP 3391 transport, and an unscoped steer blackholes the latter.
 #
 # L4 selectors in routing rules need kernel >= 4.17 AND an iproute2 that speaks
-# the syntax. Probe with a throwaway rule instead of parsing `uname -r`, because
-# both failures look identical from here. Must run for `down` too: `ip rule del`
-# only matches a rule spelled exactly the same way it was added.
-L4_PROBE="priority 30999 iif lo to 127.0.0.1 ipproto tcp dport 1 lookup 253"
+# the syntax. Mirroring the product, there is NO probe: the scoped rule is simply
+# attempted (see `try_steer` below) and the unscoped one used if it is rejected,
+# so nothing is added to the host purely to interrogate it. For `down` both
+# spellings are deleted -- `ip rule del` only matches a rule spelled exactly the
+# way it was added, and we do not know which one a past `up` used.
+L4_IN="ipproto tcp dport $PORT"
+L4_BACK="ipproto tcp sport $PORT"
+
+# die <message> -- every mutating step is checked. Without this the script's exit
+# status is that of its closing `echo`, so a failed `ip`/`sysctl` was silently
+# reported as success and the caller's `|| fail ...` guard could never fire.
+die() { echo "netns-recipe: $*" >&2; exit 1; }
+
+# try_steer <direction> <selectors> <table> -- the scoped rule, falling back to
+# the unscoped one only when the kernel rejects the selectors.
+#   $1 = "to"|"from" clause already assembled by the caller (word-split on purpose)
 # shellcheck disable=SC2086
-if ip rule add $L4_PROBE 2>/dev/null; then
-  ip rule del $L4_PROBE 2>/dev/null
-  L4_IN="ipproto tcp dport $PORT"
-  L4_BACK="ipproto tcp sport $PORT"
-else
-  [ "$cmd" = up ] && echo "warning: routing rules lack L4 selectors (kernel < 4.17);" \
-    "ALL traffic to $SERVER enters the namespace and anything that is not TCP/$PORT" \
-    "is dropped there rather than forwarded" >&2
-  L4_IN=""
-  L4_BACK=""
-fi
+try_steer() {
+  prio="$1"; iif="$2"; dir="$3"; sel="$4"; tbl="$5"
+  if ip rule add priority "$prio" iif "$iif" $dir "$SERVER" $sel lookup "$tbl" 2>/dev/null; then
+    return 0
+  fi
+  ip rule add priority "$prio" iif "$iif" $dir "$SERVER" lookup "$tbl" \
+    || die "ip rule add (priority $prio) failed in both the scoped and unscoped form"
+  echo "warning: routing rules lack L4 selectors (kernel < 4.17); ALL traffic to $SERVER" \
+    "enters the namespace and anything that is not TCP/$PORT is dropped there rather" \
+    "than forwarded" >&2
+}
 
 if [ "$cmd" = up ]; then
   [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] \
-    || { echo "net.ipv4.ip_forward is 0 -- the box is not forwarding; refusing" >&2; exit 1; }
+    || die "net.ipv4.ip_forward is 0 -- the box is not forwarding; refusing"
 
   # --- namespace + the two veth pairs -------------------------------------
-  ip netns add "$NS"
-  ip link add "$VC_H" type veth peer name "$VC_N"
-  ip link add "$VU_H" type veth peer name "$VU_N"
-  ip link set "$VC_N" netns "$NS"
-  ip link set "$VU_N" netns "$NS"
+  ip netns add "$NS" || die "ip netns add $NS failed"
+  ip link add "$VC_H" type veth peer name "$VC_N" || die "creating the client veth pair failed"
+  ip link add "$VU_H" type veth peer name "$VU_N" || die "creating the upstream veth pair failed"
+  ip link set "$VC_N" netns "$NS" || die "moving $VC_N into $NS failed"
+  ip link set "$VU_N" netns "$NS" || die "moving $VU_N into $NS failed"
 
-  ip addr add "$CH_ADDR/$PFX" dev "$VC_H"; ip link set "$VC_H" up
-  ip addr add "$UH_ADDR/$PFX" dev "$VU_H"; ip link set "$VU_H" up
+  ip addr add "$CH_ADDR/$PFX" dev "$VC_H" || die "addressing $VC_H failed"
+  ip link set "$VC_H" up || die "bringing $VC_H up failed"
+  ip addr add "$UH_ADDR/$PFX" dev "$VU_H" || die "addressing $VU_H failed"
+  ip link set "$VU_H" up || die "bringing $VU_H up failed"
 
-  ip netns exec "$NS" ip link set lo up
-  ip netns exec "$NS" ip addr add "$CN_ADDR/$PFX" dev "$VC_N"
-  ip netns exec "$NS" ip addr add "$UN_ADDR/$PFX" dev "$VU_N"
-  ip netns exec "$NS" ip link set "$VC_N" up
-  ip netns exec "$NS" ip link set "$VU_N" up
+  ip netns exec "$NS" ip link set lo up || die "lo up inside $NS failed"
+  ip netns exec "$NS" ip addr add "$CN_ADDR/$PFX" dev "$VC_N" || die "addressing $VC_N failed"
+  ip netns exec "$NS" ip addr add "$UN_ADDR/$PFX" dev "$VU_N" || die "addressing $VU_N failed"
+  ip netns exec "$NS" ip link set "$VC_N" up || die "bringing $VC_N up failed"
+  ip netns exec "$NS" ip link set "$VU_N" up || die "bringing $VU_N up failed"
 
   # Inside: the upstream leg is the only traffic addressed to the server, so a
   # /32 sends it out the upstream veth; everything else (the listener's replies,
   # whatever the client's address happens to be) takes the default out the
   # client veth. No policy routing needed, and no need to know the client prefix.
-  ip netns exec "$NS" ip route add "$SERVER/32" via "$UH_ADDR" dev "$VU_N"
-  ip netns exec "$NS" ip route add default via "$CH_ADDR" dev "$VC_N"
+  ip netns exec "$NS" ip route add "$SERVER/32" via "$UH_ADDR" dev "$VU_N" || die "in-ns route to $SERVER failed"
+  ip netns exec "$NS" ip route add default via "$CH_ADDR" dev "$VC_N" || die "in-ns default route failed"
   # Fail closed: a packet that was NOT rewritten to the listener must die here
   # rather than be forwarded on to the server unintercepted.
-  ip netns exec "$NS" sysctl -wq net.ipv4.ip_forward=0
+  # This is the fail-closed guarantee, so a silent failure here would turn the
+  # namespace fail-OPEN: unrewritten packets would be forwarded on in the clear.
+  ip netns exec "$NS" sysctl -wq net.ipv4.ip_forward=0 || die "could not set ip_forward=0 inside $NS"
+  ns_fwd="$(ip netns exec "$NS" cat /proc/sys/net/ipv4/ip_forward)"
+  [ "$ns_fwd" = 0 ] || die "ip_forward is '$ns_fwd' inside $NS, want 0 -- refusing to run fail-open"
 
   # --- steer the client's flow into the namespace -------------------------
   # Scoped by INGRESS interface on purpose. A plain `ip route add <server>/32
@@ -172,19 +190,17 @@ if [ "$cmd" = up ]; then
   # rp_filter off on a real interface. Keeping the steer in a policy table
   # leaves the MAIN route to the server untouched, so the egress iface's
   # reverse path stays symmetric and needs no sysctl change at all.
-  ip route add "$SERVER/32" via "$CN_ADDR" dev "$VC_H" table "$T_IN"
-  # shellcheck disable=SC2086  # $L4_IN must word-split into separate arguments
-  ip rule add priority "$P_IN" iif "$CIF" to "$SERVER" $L4_IN lookup "$T_IN"
+  ip route add "$SERVER/32" via "$CN_ADDR" dev "$VC_H" table "$T_IN" || die "steer route (table $T_IN) failed"
+  try_steer "$P_IN" "$CIF" to "$L4_IN" "$T_IN"
 
   # --- steer the server's replies into the namespace ----------------------
   # With source-IP preservation the reply's destination is the CLIENT's IP, so
   # the main table would send it back out to the real client. Match on
   # (arrived on the egress iface, came from the server) and hand it to the
   # namespace's UPSTREAM leg, where cls_eth_ingress un-SNATs it.
-  ip route add default via "$UN_ADDR" dev "$VU_H" table "$T_BACK"
+  ip route add default via "$UN_ADDR" dev "$VU_H" table "$T_BACK" || die "reply route (table $T_BACK) failed"
   # The reply direction of the same flow, so the port selector is the SOURCE port.
-  # shellcheck disable=SC2086
-  ip rule add priority "$P_BACK" iif "$EIF" from "$SERVER" $L4_BACK lookup "$T_BACK"
+  try_steer "$P_BACK" "$EIF" from "$L4_BACK" "$T_BACK"
 
   # --- reverse-path filtering on OUR veths only ---------------------------
   # Each host-side veth receives traffic whose source the main table associates
@@ -193,8 +209,8 @@ if [ "$cmd" = up ]; then
   # client, main says the client iface). Loose mode accepts both. Note 2 > 1:
   # the kernel takes MAX(conf.all, conf.<iface>), so setting 2 here LOOSENS even
   # on a hardened box with conf.all.rp_filter=1 -- no box-wide change required.
-  sysctl -wq "net.ipv4.conf.$VC_H.rp_filter=2"
-  sysctl -wq "net.ipv4.conf.$VU_H.rp_filter=2"
+  sysctl -wq "net.ipv4.conf.$VC_H.rp_filter=2" || die "rp_filter=2 on $VC_H failed"
+  sysctl -wq "net.ipv4.conf.$VU_H.rp_filter=2" || die "rp_filter=2 on $VU_H failed"
 
   echo "netns '$NS' up:"
   echo "  client leg  : $VC_H($CH_ADDR) <-> $VC_N($CN_ADDR)   -> tun_iface=$VC_N"
@@ -220,5 +236,16 @@ else
   ip netns del "$NS" 2>/dev/null
   ip link del "$VC_H" 2>/dev/null
   ip link del "$VU_H" 2>/dev/null
+
+  # Each delete above tolerates already-absent state, so their exit statuses say
+  # nothing. VERIFY instead -- and exit non-zero if anything survived, so the
+  # caller's `|| fail` is a real guard rather than decoration.
+  left=""
+  ip netns list 2>/dev/null | grep -qw "$NS"        && left="$left namespace:$NS"
+  ip link show "$VC_H" >/dev/null 2>&1              && left="$left veth:$VC_H"
+  ip link show "$VU_H" >/dev/null 2>&1              && left="$left veth:$VU_H"
+  ip rule show 2>/dev/null | grep -q "lookup $T_IN"   && left="$left rule->$T_IN"
+  ip rule show 2>/dev/null | grep -q "lookup $T_BACK" && left="$left rule->$T_BACK"
+  [ -z "$left" ] || die "teardown left state behind:$left"
   echo "netns '$NS' down (rules, tables, veths, namespace removed)"
 fi

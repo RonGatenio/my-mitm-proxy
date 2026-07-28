@@ -157,6 +157,11 @@ async fn main() -> anyhow::Result<()> {
 /// The child is `ip netns exec <ns> <self> <our argv> --netns=false --tun … `, so
 /// the code inside the namespace is the same, already-validated path that runs
 /// when namespace mode is off — only the interface names differ.
+/// How long the supervised child gets to exit on SIGTERM before it is SIGKILLed.
+/// Comfortably inside systemd's default `TimeoutStopSec=90s`, so the escalation is
+/// ours and the guard's teardown always runs.
+const CHILD_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn run_netns_supervisor(settings: &config::Settings) -> anyhow::Result<()> {
     // Fail fast if this box's FORWARD permission is pinned to interfaces that the
     // namespace's veths cannot match; starting anyway would blackhole silently.
@@ -197,7 +202,25 @@ async fn run_netns_supervisor(settings: &config::Settings) -> anyhow::Result<()>
             if let Some(pid) = child.id() {
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
             }
-            child.wait().await?
+            // Bounded. An unbounded wait here is a trap: a child that ignores
+            // SIGTERM or wedges on shutdown keeps this parent alive until the
+            // service manager's own timeout SIGKILLs *us*, and then the guard's
+            // Drop never runs — leaving the steer rules installed and the box
+            // blackholed until someone runs --cleanup. Escalating ourselves keeps
+            // teardown in the hands of the process that owns the host state.
+            match tokio::time::timeout(CHILD_STOP_GRACE, child.wait()).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    tracing::warn!(
+                        secs = CHILD_STOP_GRACE.as_secs(),
+                        "the namespaced data plane did not exit after SIGTERM; sending SIGKILL so \
+                         the host plumbing is still torn down (in-namespace state goes with the \
+                         namespace)"
+                    );
+                    child.start_kill()?;
+                    child.wait().await?
+                }
+            }
         }
     };
 

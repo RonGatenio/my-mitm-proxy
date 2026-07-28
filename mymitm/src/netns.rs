@@ -45,17 +45,30 @@
 //!
 //! The namespace also runs with `ip_forward=0`: if interception ever misses, the
 //! packet is DROPPED rather than quietly forwarded to the server in the clear.
-//! Fail closed, not fail open.
+//! Fail closed, not fail open — **on the eBPF plane**. The `iproute` plane sets
+//! `net.ipv4.ip_forward=1` for itself during setup ([`crate::iproute`]), and inside
+//! the namespace that overwrites the 0 set here, so that plane does not get this
+//! guarantee. `tests/vm/validate-netns.sh` asserts each plane's actual behaviour
+//! rather than the more flattering one.
 //!
 //! ## Requirements on the host firewall
 //!
-//! - `FORWARD` accepts NEW to `<server>:<port>` **without** an `-i`/`-o` match —
-//!   a rule pinned to `-i tun0 -o eth0` will not match `-o vc_h` / `-i vu_h`.
-//! - `FORWARD` accepts `ESTABLISHED,RELATED` (both return paths).
 //! - `net.ipv4.ip_forward=1` on the host.
+//! - The forward path accepts NEW to `<server>:<port>` **without** an `-i`/`-o`
+//!   match — a rule pinned to `-i tun0 -o eth0` will not match `-o vc_h` /
+//!   `-i vu_h`. The pin can also be inherited: a rule reachable only through
+//!   `-A FORWARD -i tun0 -o eth0 -j <chain>` is just as unusable, even though the
+//!   rule itself carries no interface match.
+//! - If that accept is scoped to a source subnet, `preserve_src_ip` left on.
+//! - The forward path accepts `ESTABLISHED,RELATED` (both return paths).
 //!
-//! [`preflight`] checks these and fails fast with the exact diagnosis rather
-//! than letting the proxy start into a silent blackhole.
+//! [`preflight`] **fails fast** on the first three: no forwarding, an
+//! interface-pinned permission, or a source-scoped permission with preservation
+//! off. The `ESTABLISHED,RELATED` requirement is **not** checked — it holds on
+//! every box that forwards anything at all, and a conntrack-state parser would
+//! add a false-positive surface for no gain. When it finds no permission at all
+//! and the forward path looks restrictive it warns rather than refusing, because
+//! "I could not find one" is not "there is none".
 
 use std::net::Ipv4Addr;
 use std::process::Command;
@@ -112,9 +125,12 @@ const T_IN_BASE: u32 = 300;
 const T_BACK_BASE: u32 = 400;
 const P_IN_BASE: u32 = 31_000;
 const P_BACK_BASE: u32 = 32_000;
-/// Priority for the throwaway rule [`probe_l4_rule_support`] adds and deletes.
-/// Below both bases so it cannot collide with a live steer.
-const P_PROBE: u32 = 30_999;
+
+/// WARN text for the pre-4.17 fallback, on both steer rules.
+const L4_FALLBACK_WHY: &str = "this kernel's routing rules do not support L4 selectors (needs >= 4.17), \
+     so the steer could not be narrowed to the server's TCP port. ALL traffic to the server now \
+     enters the namespace, and anything the classifiers do not rewrite (e.g. an RD Gateway's UDP \
+     3391 transport) is dropped there rather than forwarded.";
 
 /// The settings the child process must run with: the namespace-side interfaces
 /// and the box IP the upstream socket binds inside the namespace.
@@ -133,18 +149,61 @@ pub struct InnerCfg {
 /// individually is meaningful — deleting the namespace or a veth already removes
 /// everything configured *inside* or *on* it, so most steps have no separate
 /// inverse).
+///
+/// `alt` is a second spelling to try if the primary one fails, with its own
+/// inverse. Used for the steer rules, whose L4 selectors need kernel ≥ 4.17: the
+/// scoped form is attempted and the unscoped form is the fallback. Attempting the
+/// real rule is deliberate — mymitm must not add and delete a throwaway rule just
+/// to interrogate the kernel, and the failure that matters is the failure of the
+/// rule we actually want, not of a stand-in for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub prog: &'static str,
     pub args: Vec<String>,
     pub undo: Option<Vec<String>>,
+    pub alt: Option<AltStep>,
+}
+
+/// The fallback spelling of a [`Step`], with the inverse that matches *it*.
+/// `ip rule del` must match the added rule exactly, so the undo cannot be shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AltStep {
+    pub args: Vec<String>,
+    pub undo: Option<Vec<String>>,
+    /// Logged at WARN when the fallback is taken, naming the consequence.
+    pub why: &'static str,
+}
+
+fn owned(args: &[&str]) -> Vec<String> {
+    args.iter().map(|s| s.to_string()).collect()
 }
 
 fn step(prog: &'static str, args: &[&str], undo: Option<&[&str]>) -> Step {
+    Step { prog, args: owned(args), undo: undo.map(owned), alt: None }
+}
+
+/// One steer rule: `base` + L4 `selectors` + `lookup <table>`, with the same rule
+/// minus the selectors as its fallback. Each spelling gets the matching `del`,
+/// built from its own argv so the two can never drift apart.
+fn steer_step(base: &[&str], selectors: &[&str], table: &str) -> Step {
+    let add = |extra: &[&str]| -> Vec<String> {
+        let mut v: Vec<&str> = base.to_vec();
+        v.extend_from_slice(extra);
+        v.extend_from_slice(&["lookup", table]);
+        owned(&v)
+    };
+    let del = |add: &[String]| -> Vec<String> {
+        let mut v = add.to_vec();
+        v[1] = "del".to_string();
+        v
+    };
+    let scoped = add(selectors);
+    let unscoped = add(&[]);
     Step {
-        prog,
-        args: args.iter().map(|s| s.to_string()).collect(),
-        undo: undo.map(|u| u.iter().map(|s| s.to_string()).collect()),
+        prog: "ip",
+        undo: Some(del(&scoped)),
+        args: scoped,
+        alt: Some(AltStep { undo: Some(del(&unscoped)), args: unscoped, why: L4_FALLBACK_WHY }),
     }
 }
 
@@ -165,17 +224,21 @@ pub struct Plumbing {
 
 /// Build the plumbing spec without executing anything.
 ///
-/// `l4_steer` selects whether the two steer rules carry `ipproto tcp` +
-/// `dport`/`sport` selectors. They are what keeps non-TCP and other-port traffic
-/// to the same server OUT of the namespace — which matters because the namespace
-/// runs with `ip_forward=0`, so anything steered in that the classifiers do not
-/// rewrite is dropped. An RD Gateway is the motivating case: it serves the tunnel
-/// on TCP 443 and an optional UDP transport on 3391, and an unscoped steer would
-/// blackhole the latter. FIB-rule L4 selectors need kernel ≥ 4.17 (and an
-/// iproute2 that speaks the syntax), so callers pass the result of
-/// [`probe_l4_rule_support`]; on an older kernel the unscoped form is used and
-/// only TCP `server_port` survives.
-pub fn build_plumbing(cfg: &Settings, l4_steer: bool) -> Plumbing {
+/// The two steer rules carry `ipproto tcp` + `dport`/`sport` selectors, with the
+/// unscoped spelling as each one's [`AltStep`]. Those selectors are what keeps
+/// non-TCP and other-port traffic to the same server OUT of the namespace — which
+/// matters because the namespace runs with `ip_forward=0`, so anything steered in
+/// that the classifiers do not rewrite is dropped. An RD Gateway is the motivating
+/// case: it serves the tunnel on TCP 443 and an optional UDP transport on 3391,
+/// and an unscoped steer would blackhole the latter.
+///
+/// FIB-rule L4 selectors need kernel ≥ 4.17 and an iproute2 that speaks the
+/// syntax. Rather than probe for that — which would mean adding and deleting a
+/// throwaway rule on the host, i.e. mutating state that is none of our business —
+/// the scoped rule is simply attempted and the unscoped one used if it is
+/// rejected. Both failure modes surface identically as a non-zero `ip rule add`,
+/// which is exactly what the fallback keys on.
+pub fn build_plumbing(cfg: &Settings) -> Plumbing {
     let n = Names::default();
     let mask = cfg.fwmark & 0xff;
     let (t_in, t_back) = (T_IN_BASE + mask, T_BACK_BASE + mask);
@@ -264,19 +327,13 @@ pub fn build_plumbing(cfg: &Settings, l4_steer: bool) -> Plumbing {
         &["route", "add", &server32, "via", &cn, "dev", &n.vc_h, "table", &t_in_s],
         Some(&["route", "flush", "table", &t_in_s]),
     ));
-    // Scoped to TCP <server_port> when the kernel can: everything else addressed
-    // to the server (the RD Gateway's UDP 3391 transport, ICMP) then stays on the
-    // main table and is forwarded normally, instead of entering a namespace that
-    // will not rewrite it and cannot forward it.
-    let mut r_in: Vec<&str> =
+    // Scoped to TCP <server_port>: everything else addressed to the server (the RD
+    // Gateway's UDP 3391 transport, ICMP) then stays on the main table and is
+    // forwarded normally, instead of entering a namespace that will not rewrite it
+    // and cannot forward it. Pre-4.17 falls back to the unscoped spelling.
+    let base_in: Vec<&str> =
         vec!["rule", "add", "priority", &p_in_s, "iif", &cfg.tun_iface, "to", &server];
-    if l4_steer {
-        r_in.extend_from_slice(&["ipproto", "tcp", "dport", &port]);
-    }
-    r_in.extend_from_slice(&["lookup", &t_in_s]);
-    let mut r_in_del = r_in.clone();
-    r_in_del[1] = "del";
-    steps.push(step("ip", &r_in, Some(&r_in_del)));
+    steps.push(steer_step(&base_in, &["ipproto", "tcp", "dport", &port], &t_in_s));
 
     // --- steer the server's replies into the namespace --------------------
     // With source-IP preservation the reply's destination is the CLIENT's IP, so
@@ -291,15 +348,9 @@ pub fn build_plumbing(cfg: &Settings, l4_steer: bool) -> Plumbing {
     // The reply direction of the same flow, so the port selector is the SOURCE
     // port here. Not steering the server's ICMP costs nothing: the classifiers
     // only rewrite TCP, so ICMP steered into the namespace was dropped anyway.
-    let mut r_back: Vec<&str> =
+    let base_back: Vec<&str> =
         vec!["rule", "add", "priority", &p_back_s, "iif", &cfg.egress_iface, "from", &server];
-    if l4_steer {
-        r_back.extend_from_slice(&["ipproto", "tcp", "sport", &port]);
-    }
-    r_back.extend_from_slice(&["lookup", &t_back_s]);
-    let mut r_back_del = r_back.clone();
-    r_back_del[1] = "del";
-    steps.push(step("ip", &r_back, Some(&r_back_del)));
+    steps.push(steer_step(&base_back, &["ipproto", "tcp", "sport", &port], &t_back_s));
 
     // Each host-side veth receives traffic whose source the main table
     // associates with a different interface: the client-leg veth sees the
@@ -362,7 +413,10 @@ pub struct Diagnosis {
 /// A candidate ACCEPT: forward-reachable, and addressed to the server.
 struct Candidate {
     rule: String,
-    pins_iface: bool,
+    /// The rule whose `-i`/`-o` stops this permission matching our veths — the
+    /// candidate itself, or the jump that is the only way into its chain. `None`
+    /// when nothing on the path pins an interface.
+    pin_rule: Option<String>,
     src: Option<(Ipv4Addr, u8)>,
 }
 
@@ -431,7 +485,7 @@ fn parse_cidr(s: &str) -> Option<(Ipv4Addr, u8)> {
 /// A `-j TARGET` is a chain jump exactly when the dump also appends to `TARGET`,
 /// which needs no list of built-in verdicts to stay correct. A jumped-to chain
 /// with no rules of its own can hold no ACCEPT, so missing it is harmless.
-fn forward_reachable_chains(rules: &str) -> std::collections::BTreeSet<String> {
+fn forward_reachable_chains(rules: &str) -> ForwardReach {
     let mut appended: std::collections::BTreeSet<&str> = Default::default();
     for line in rules.lines() {
         if let Some(rest) = line.trim().strip_prefix("-A ") {
@@ -440,23 +494,45 @@ fn forward_reachable_chains(rules: &str) -> std::collections::BTreeSet<String> {
             }
         }
     }
-    let mut reach: std::collections::BTreeSet<String> = Default::default();
-    reach.insert("FORWARD".to_string());
+
+    // Two closures over the same graph. `unpinned` follows only jumps whose own
+    // rule carries no -i/-o, so it answers the question that actually matters:
+    // which chains can a packet on OUR veths reach? `pinned_via` records, for a
+    // chain reachable only through a pinned jump, one such jump — so an accept
+    // found there can be reported with the rule that needs changing.
+    let mut unpinned: std::collections::BTreeSet<String> = Default::default();
+    let mut pinned_via: std::collections::BTreeMap<String, String> = Default::default();
+    unpinned.insert("FORWARD".to_string());
     loop {
         let mut grew = false;
         for line in rules.lines() {
-            let Some(rest) = line.trim().strip_prefix("-A ") else { continue };
+            let l = line.trim();
+            let Some(rest) = l.strip_prefix("-A ") else { continue };
             let toks: Vec<&str> = rest.split_whitespace().collect();
             let Some(chain) = toks.first() else { continue };
-            if !reach.contains(*chain) {
+            // Where a packet in this chain could have come from.
+            let from_unpinned = unpinned.contains(*chain);
+            let inherited = pinned_via.get(*chain).cloned();
+            if !from_unpinned && inherited.is_none() {
                 continue;
             }
+            let jump_pins = pins_iface(&toks);
             for w in toks.windows(2) {
-                if (w[0] == "-j" || w[0] == "-g")
-                    && appended.contains(w[1])
-                    && reach.insert(w[1].to_string())
-                {
-                    grew = true;
+                if !(w[0] == "-j" || w[0] == "-g") || !appended.contains(w[1]) {
+                    continue;
+                }
+                if from_unpinned && !jump_pins {
+                    if unpinned.insert(w[1].to_string()) {
+                        grew = true;
+                    }
+                } else {
+                    // Either this jump pins interfaces, or we only got here
+                    // through one that did. Record the pin as inherited.
+                    let witness = if jump_pins { l.to_string() } else { inherited.clone().unwrap() };
+                    if !unpinned.contains(w[1]) && !pinned_via.contains_key(w[1]) {
+                        pinned_via.insert(w[1].to_string(), witness);
+                        grew = true;
+                    }
                 }
             }
         }
@@ -464,7 +540,35 @@ fn forward_reachable_chains(rules: &str) -> std::collections::BTreeSet<String> {
             break;
         }
     }
-    reach
+    // A chain that turned out to be unpinned-reachable is not pin-limited, even if
+    // some other path to it was pinned.
+    pinned_via.retain(|c, _| !unpinned.contains(c));
+    ForwardReach { unpinned, pinned_via }
+}
+
+/// The forward path's chain closure, split by whether a packet on the namespace's
+/// veths can actually get there.
+#[derive(Debug, Default)]
+struct ForwardReach {
+    /// Reachable from `FORWARD` without crossing any `-i`/`-o` match.
+    unpinned: std::collections::BTreeSet<String>,
+    /// Reachable only through a jump that pins interfaces -> the jump rule.
+    pinned_via: std::collections::BTreeMap<String, String>,
+}
+
+impl ForwardReach {
+    /// Reachable at all, by either kind of path.
+    fn any(&self, chain: &str) -> bool {
+        self.unpinned.contains(chain) || self.pinned_via.contains_key(chain)
+    }
+}
+
+/// Does this rule restrict which interfaces it matches? In namespace mode the legs
+/// traverse FORWARD as `-o <vc_h>` / `-i <vu_h>`, so any `-i`/`-o` naming something
+/// else cannot match. Both the short and long option spellings count.
+fn pins_iface(toks: &[&str]) -> bool {
+    toks.iter()
+        .any(|t| matches!(*t, "-i" | "-o" | "--in-interface" | "--out-interface"))
 }
 
 /// Does this ruleset look like it would drop what it does not explicitly permit?
@@ -472,7 +576,7 @@ fn forward_reachable_chains(rules: &str) -> std::collections::BTreeSet<String> {
 /// heuristic is appropriate: a restrictive FORWARD policy, or a reachable
 /// catch-all DROP/REJECT (which is how ufw closes the chain while leaving the
 /// policy at ACCEPT).
-fn forward_looks_restrictive(rules: &str, reach: &std::collections::BTreeSet<String>) -> bool {
+fn forward_looks_restrictive(rules: &str, reach: &ForwardReach) -> bool {
     for line in rules.lines() {
         let l = line.trim();
         if l == "-P FORWARD DROP" || l == "-P FORWARD REJECT" {
@@ -481,7 +585,7 @@ fn forward_looks_restrictive(rules: &str, reach: &std::collections::BTreeSet<Str
         let Some(rest) = l.strip_prefix("-A ") else { continue };
         let toks: Vec<&str> = rest.split_whitespace().collect();
         let Some(chain) = toks.first() else { continue };
-        if !reach.contains(*chain) {
+        if !reach.any(chain) {
             continue;
         }
         let terminal = toks
@@ -534,17 +638,21 @@ pub fn diagnose(
         let Some(rest) = l.strip_prefix("-A ") else { continue };
         let toks: Vec<&str> = rest.split_whitespace().collect();
         let Some(chain) = toks.first() else { continue };
-        if !reach.contains(*chain) {
+        if !reach.any(chain) {
             continue;
         }
         if !toks.windows(2).any(|w| w[0] == "-j" && w[1] == "ACCEPT") {
             continue;
         }
         // Must be addressed TO the server: a `-s <server>` accept is the reply
-        // direction, not the permission the client leg needs. Negated matches
+        // direction, not the permission the client leg needs. A `-d` covering the
+        // server counts whatever its prefix length — a `-d 10.0.0.0/8` accept does
+        // permit our flow, and (more importantly) an interface-pinned one must
+        // still be recognised so it can be reported as a blocker. Negated matches
         // (`! -d`) are not permissions for this destination either.
         let dst_is_server = toks.windows(2).any(|w| {
-            w[0] == "-d" && parse_cidr(w[1]).map(|(ip, len)| ip == server && len == 32).unwrap_or(false)
+            w[0] == "-d"
+                && parse_cidr(w[1]).map(|(net, len)| cidr_contains(net, len, server)).unwrap_or(false)
         });
         if !dst_is_server || toks.contains(&"!") || !permits_tcp_port(&toks, server_port) {
             continue;
@@ -553,9 +661,17 @@ pub fn diagnose(
             .windows(2)
             .find(|w| w[0] == "-s")
             .and_then(|w| parse_cidr(w[1]));
+        // Pinned by its own -i/-o, or by the only jump that leads to its chain.
+        // The inherited case is invisible in the rule text, which is exactly why
+        // it has to come from the closure and not from the tokens.
+        let inherited_pin = reach.pinned_via.get(*chain);
         candidates.push(Candidate {
             rule: l.to_string(),
-            pins_iface: toks.iter().any(|t| *t == "-i" || *t == "-o"),
+            pin_rule: if pins_iface(&toks) {
+                Some(l.to_string())
+            } else {
+                inherited_pin.cloned()
+            },
             src,
         });
     }
@@ -563,8 +679,8 @@ pub fn diagnose(
     let mut pinned: Option<String> = None;
     let mut needs_pres: Option<String> = None;
     for c in candidates {
-        if c.pins_iface {
-            pinned.get_or_insert(c.rule);
+        if let Some(pin) = c.pin_rule {
+            pinned.get_or_insert(pin);
             continue;
         }
         match c.src {
@@ -630,11 +746,16 @@ pub fn blocker_message(b: &Blocker, names: &Names) -> String {
             "netns mode cannot use this box's FORWARD permission because it is pinned to specific \
              interfaces:\n  {rule}\nIn netns mode the two legs traverse FORWARD as \
              `-o {vc_h}` (client leg) and `-i {vu_h}` (upstream leg), which that rule will not \
-             match — the proxy would start and then silently blackhole. Fix by ONE of:\n  \
+             match — the proxy would start and then silently blackhole. (If the rule above is a \
+             `-j <chain>` jump, the permission itself is inside that chain and is unusable because \
+             the only way into it is pinned.) Fix by ONE of:\n  \
              (a) drop the -i/-o match from that rule so it matches on destination alone \
              (under ufw: replace `ufw route allow in on X out on Y to <server> …` with \
              `ufw route allow to <server> port <port> proto tcp`), or\n  \
-             (b) add `-o {vc_h}` / `-i {vu_h}` companions to it, or\n  \
+             (b) add a second, unpinned copy of the permission — one matching on destination \
+             alone. Adding `-o {vc_h}` / `-i {vu_h}` variants of the pinned rule works too, but \
+             note that BOTH legs need one: the client leg is `-o {vc_h}` and the upstream leg is \
+             `-i {vu_h}`, so a single companion is not enough, or\n  \
              (c) pass --netns=false and instead permit the two locally-terminated legs \
              (INPUT to the listener, OUTPUT to the server).",
             rule = rule,
@@ -656,26 +777,6 @@ pub fn blocker_message(b: &Blocker, names: &Names) -> String {
     }
 }
 
-/// Whether this kernel's FIB rules accept L4 selectors (`ipproto`, `dport`), so
-/// the steer can be narrowed to TCP `server_port`. Added in 4.17.
-///
-/// Probed rather than derived from `uname`, because iproute2 has to speak the
-/// syntax too and both failures look identical from here: `ip rule add` exits
-/// non-zero. The probe rule matches nothing real and is deleted immediately.
-pub fn probe_l4_rule_support() -> bool {
-    let p = P_PROBE.to_string();
-    let add: Vec<String> = ["rule", "add", "priority", &p, "iif", "lo", "to", "127.0.0.1",
-                            "ipproto", "tcp", "dport", "1", "lookup", "253"]
-        .iter().map(|s| s.to_string()).collect();
-    if run("ip", &add).is_err() {
-        return false;
-    }
-    let mut del = add.clone();
-    del[1] = "del".to_string();
-    let _ = run("ip", &del);
-    true
-}
-
 /// Run the preflight against the live host. Fails fast rather than starting into
 /// a silent blackhole.
 pub fn preflight(cfg: &Settings) -> anyhow::Result<()> {
@@ -686,12 +787,39 @@ pub fn preflight(cfg: &Settings) -> anyhow::Result<()> {
     // The WHOLE filter table, not just FORWARD: on any box with a firewall
     // frontend the forward permission lives in a jumped-to chain (ufw keeps it in
     // `ufw-user-forward`, and FORWARD itself holds only jumps).
-    // A box with no iptables at all is fine — treat an unreadable ruleset as empty.
-    let rules = Command::new("iptables")
-        .arg("-S")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
+    //
+    // A box with genuinely no iptables is fine — there is no ruleset to conflict
+    // with. But "could not read the ruleset" is NOT the same fact as "the ruleset
+    // is empty", and conflating them turns the one check whose job is to fail
+    // closed into a silent fail-open (a lost xtables lock, a missing binary, an
+    // nft-only box). Say so out loud instead.
+    let rules = match Command::new("iptables").arg("-S").output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            tracing::warn!(
+                status = %o.status,
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "netns preflight: `iptables -S` failed, so this box's forward permissions could NOT \
+                 be checked. Namespace mode needs the forward path to permit both legs to/from the \
+                 real server address; if the proxy accepts connections and then hangs, that ruleset \
+                 is the first place to look."
+            );
+            String::new()
+        }
+        Err(e) => {
+            // ENOENT here is the ordinary "no iptables installed" case.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                tracing::debug!("netns preflight: no iptables binary; no ruleset to check");
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    "netns preflight: could not run `iptables -S`, so forward permissions were NOT \
+                     checked"
+                );
+            }
+            String::new()
+        }
+    };
 
     let d = diagnose(
         ip_forward,
@@ -752,36 +880,62 @@ pub struct NetnsGuard {
     plumbing: Plumbing,
     /// How many steps were applied, so a mid-apply failure unwinds exactly.
     applied: usize,
+    /// Per step, whether its [`AltStep`] spelling is the one that took — so the
+    /// undo matches the argv that was actually run. `ip rule del` is exact.
+    used_alt: Vec<bool>,
 }
 
 impl NetnsGuard {
     /// Apply the plumbing. On any failure, reverses everything already applied
     /// before returning `Err` — never leaves a half-built namespace.
     pub fn setup(cfg: &Settings) -> anyhow::Result<(NetnsGuard, InnerCfg)> {
+        // The names are fixed, so two instances cannot coexist — and `cleanup`
+        // below would delete a live one's namespace and veths out from under it.
+        // Refuse instead of clobbering.
+        if let Some(pids) = namespace_in_use() {
+            anyhow::bail!(
+                "network namespace `{ns}` already has processes in it (pids: {pids}). Another mymitm \
+                 is probably running — namespace mode uses fixed names, so two instances cannot \
+                 share a box. Stop that one first, or run with --cleanup if it is a leftover.",
+                ns = Names::default().ns,
+            );
+        }
         // A previous unclean exit leaves the namespace and veths behind, and
         // `ip netns add` would then fail on the very first step. Clear first.
         cleanup(cfg);
 
-        let l4_steer = probe_l4_rule_support();
-        if !l4_steer {
-            tracing::warn!(
-                "this kernel's routing rules do not support L4 selectors (needs >= 4.17), so the \
-                 steer cannot be narrowed to TCP {}. ALL traffic from {} to {} enters the \
-                 namespace, and anything the classifiers do not rewrite (e.g. an RD Gateway's UDP \
-                 3391 transport) is dropped there rather than forwarded.",
-                cfg.server_port, cfg.tun_iface, cfg.server_ip
-            );
-        }
-        let plumbing = build_plumbing(cfg, l4_steer);
+        let plumbing = build_plumbing(cfg);
         let inner = plumbing.inner.clone();
-        let mut guard = NetnsGuard { plumbing, applied: 0 };
+        let n_steps = plumbing.steps.len();
+        let mut guard = NetnsGuard { plumbing, applied: 0, used_alt: vec![false; n_steps] };
 
-        for i in 0..guard.plumbing.steps.len() {
+        for i in 0..n_steps {
             let s = &guard.plumbing.steps[i];
             if let Err(e) = run(s.prog, &s.args) {
-                let failed = format!("{} {}", s.prog, s.args.join(" "));
-                guard.revert();
-                return Err(anyhow::anyhow!("netns setup failed at `{failed}`: {e}"));
+                // A fallback spelling exists: the primary failing is expected on
+                // some kernels, so try it before treating this as fatal.
+                match &s.alt {
+                    Some(alt) => {
+                        let prog = s.prog;
+                        let alt_args = alt.args.clone();
+                        let why = alt.why;
+                        if let Err(e2) = run(prog, &alt_args) {
+                            let failed = format!("{prog} {}", alt_args.join(" "));
+                            guard.revert();
+                            return Err(anyhow::anyhow!(
+                                "netns setup failed at `{failed}`: {e2} (the preferred spelling also \
+                                 failed: {e})"
+                            ));
+                        }
+                        tracing::warn!("{why}");
+                        guard.used_alt[i] = true;
+                    }
+                    None => {
+                        let failed = format!("{} {}", s.prog, s.args.join(" "));
+                        guard.revert();
+                        return Err(anyhow::anyhow!("netns setup failed at `{failed}`: {e}"));
+                    }
+                }
             }
             guard.applied = i + 1;
         }
@@ -819,11 +973,38 @@ impl NetnsGuard {
     /// ignored so one stuck step cannot strand the rest.
     fn revert(&mut self) {
         for i in (0..self.applied).rev() {
-            if let Some(undo) = self.plumbing.steps[i].undo.clone() {
-                let _ = run(self.plumbing.steps[i].prog, &undo);
+            let s = &self.plumbing.steps[i];
+            // Undo the spelling that actually took: `ip rule del` matches exactly,
+            // so the primary's inverse would silently fail on a fallback rule.
+            let undo = if self.used_alt[i] {
+                s.alt.as_ref().and_then(|a| a.undo.clone())
+            } else {
+                s.undo.clone()
+            };
+            if let Some(undo) = undo {
+                let _ = run(s.prog, &undo);
             }
         }
         self.applied = 0;
+    }
+}
+
+/// PIDs inside the namespace, if it exists and is not empty. `ip netns pids` lists
+/// them; an absent namespace or an empty one both mean "free to use".
+fn namespace_in_use() -> Option<String> {
+    let out = Command::new("ip")
+        .args(["netns", "pids", &Names::default().ns])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // no such namespace
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let pids: Vec<&str> = stdout.split_whitespace().collect();
+    if pids.is_empty() {
+        None
+    } else {
+        Some(pids.join(", "))
     }
 }
 
@@ -837,24 +1018,19 @@ impl Drop for NetnsGuard {
 /// Best-effort reverse of leftovers from an unclean exit. Safe to call when
 /// nothing is installed — every failure is ignored.
 pub fn cleanup(cfg: &Settings) {
-    // Both steer forms: whichever this kernel supports today, a leftover rule
-    // could have been added in either shape (a kernel upgrade between runs, or a
-    // `--cleanup` invoked on a different box). `ip rule del` must match the rule
-    // exactly, so try both rather than probe and guess.
-    for l4_steer in [true, false] {
-        let p = build_plumbing(cfg, l4_steer);
-        for s in p.steps.iter().rev() {
-            if let Some(undo) = &s.undo {
-                let _ = run(s.prog, undo);
-            }
+    let p = build_plumbing(cfg);
+    for s in p.steps.iter().rev() {
+        // BOTH spellings of every step that has two: a leftover rule could have
+        // been added in either shape (a kernel upgrade between runs, or a
+        // `--cleanup` invoked on a different box than the one that plumbed it).
+        // `ip rule del` must match exactly, so try each rather than guess.
+        if let Some(undo) = &s.undo {
+            let _ = run(s.prog, undo);
+        }
+        if let Some(undo) = s.alt.as_ref().and_then(|a| a.undo.as_ref()) {
+            let _ = run(s.prog, undo);
         }
     }
-    // The probe's throwaway rule, in case a previous run died between add and del.
-    let p = P_PROBE.to_string();
-    let del: Vec<String> = ["rule", "del", "priority", &p, "iif", "lo", "to", "127.0.0.1",
-                            "ipproto", "tcp", "dport", "1", "lookup", "253"]
-        .iter().map(|s| s.to_string()).collect();
-    let _ = run("ip", &del);
 }
 
 /// The argv for the supervised child: our own argv with namespace mode turned
@@ -891,7 +1067,7 @@ mod tests {
 
     #[test]
     fn inner_cfg_points_at_the_namespace_side_of_each_veth() {
-        let p = build_plumbing(&settings(), true);
+        let p = build_plumbing(&settings());
         // tun and egress MUST differ: one program per tc hook. A shared
         // interface lets the lower-pref classifier end the chain first.
         assert_eq!(p.inner.tun_iface, "mmc1");
@@ -902,7 +1078,7 @@ mod tests {
 
     #[test]
     fn tables_and_priorities_derive_from_fwmark() {
-        let p = build_plumbing(&settings(), true);
+        let p = build_plumbing(&settings());
         // 0x1337 & 0xff = 0x37 = 55
         assert_eq!(p.t_in, 300 + 55);
         assert_eq!(p.t_back, 400 + 55);
@@ -917,7 +1093,7 @@ mod tests {
 
     #[test]
     fn namespace_is_created_first_and_removed_last() {
-        let p = build_plumbing(&settings(), true);
+        let p = build_plumbing(&settings());
         let first = &p.steps[0];
         assert_eq!(first.prog, "ip");
         assert_eq!(first.args[..3], ["netns", "add", "mitm"]);
@@ -926,7 +1102,7 @@ mod tests {
 
     #[test]
     fn namespace_fails_closed_on_forwarding() {
-        let p = build_plumbing(&settings(), true);
+        let p = build_plumbing(&settings());
         // An un-rewritten packet must be dropped inside the namespace, not
         // forwarded on to the server in the clear.
         assert!(
@@ -937,7 +1113,7 @@ mod tests {
 
     #[test]
     fn steer_rules_are_scoped_by_ingress_interface() {
-        let p = build_plumbing(&settings(), true);
+        let p = build_plumbing(&settings());
         let rules: Vec<&Step> = p.steps.iter().filter(|s| s.args.first().map(|a| a == "rule").unwrap_or(false)).collect();
         assert_eq!(rules.len(), 2, "one steer in, one steer back");
         // Inbound: from the tun iface, to the server.
@@ -950,11 +1126,18 @@ mod tests {
         assert!(b.contains(&"from".to_string()) && b.contains(&"10.10.2.10".to_string()));
     }
 
+    /// The two steer rules, in plumbing order (client leg, then reply leg).
+    fn steer_rules(p: &Plumbing) -> Vec<&Step> {
+        p.steps
+            .iter()
+            .filter(|s| s.args.first().map(|a| a == "rule").unwrap_or(false))
+            .collect()
+    }
+
     #[test]
-    fn steer_rules_are_scoped_to_tcp_server_port_when_supported() {
-        let p = build_plumbing(&settings(), true);
-        let rules: Vec<&Step> =
-            p.steps.iter().filter(|s| s.args.first().map(|a| a == "rule").unwrap_or(false)).collect();
+    fn steer_rules_are_scoped_to_tcp_server_port() {
+        let p = build_plumbing(&settings());
+        let rules = steer_rules(&p);
         let joined = |s: &Step| s.args.join(" ");
         // Client leg: the server is the DESTINATION, so dport.
         assert!(joined(rules[0]).contains("ipproto tcp dport 443"), "{}", joined(rules[0]));
@@ -969,19 +1152,45 @@ mod tests {
     }
 
     #[test]
-    fn steer_rules_fall_back_to_unscoped_without_l4_selectors() {
-        // Pre-4.17 kernels reject `ipproto`/`dport` in a routing rule; the steer
-        // then catches everything to the server, which is what the operator is
-        // warned about at startup.
-        let p = build_plumbing(&settings(), false);
-        let rules: Vec<&Step> =
-            p.steps.iter().filter(|s| s.args.first().map(|a| a == "rule").unwrap_or(false)).collect();
+    fn steer_rules_carry_an_unscoped_fallback_with_its_own_exact_inverse() {
+        // Pre-4.17 kernels reject `ipproto`/`dport` in a routing rule. There is no
+        // probe: the scoped rule is attempted and this is what gets used if it
+        // fails, so it must be a complete, self-consistent rule — including an undo
+        // that matches ITS argv, since `ip rule del` is exact and the primary's
+        // undo would silently fail to remove a fallback rule.
+        let p = build_plumbing(&settings());
+        let rules = steer_rules(&p);
         assert_eq!(rules.len(), 2);
         for r in &rules {
-            let j = r.args.join(" ");
-            assert!(!j.contains("ipproto"), "must not emit an L4 selector: {j}");
-            let undo = r.undo.as_ref().unwrap();
-            assert_eq!(undo[2..], r.args[2..]);
+            let alt = r.alt.as_ref().expect("every steer rule needs a fallback");
+            let j = alt.args.join(" ");
+            assert!(!j.contains("ipproto"), "the fallback must carry no L4 selector: {j}");
+            assert!(!j.contains("dport") && !j.contains("sport"), "{j}");
+            // Still a complete rule: same selectors otherwise, same table.
+            assert_eq!(alt.args[0], "rule");
+            assert_eq!(alt.args[1], "add");
+            assert!(alt.args.contains(&"lookup".to_string()), "{j}");
+            let undo = alt.undo.as_ref().expect("the fallback needs its own inverse");
+            assert_eq!(undo[1], "del");
+            assert_eq!(undo[2..], alt.args[2..], "the fallback's undo must match the fallback");
+            // And it must NOT be interchangeable with the primary's undo.
+            assert_ne!(
+                r.undo.as_ref().unwrap(),
+                undo,
+                "the two spellings need distinct inverses or one of them leaks"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_steer_rules_have_a_fallback() {
+        // A fallback means "failing is expected here". Anywhere else, a failure is
+        // a real failure and must abort the setup, not be silently retried.
+        let p = build_plumbing(&settings());
+        for s in &p.steps {
+            if s.alt.is_some() {
+                assert_eq!(s.args.first().map(String::as_str), Some("rule"), "{:?}", s.args);
+            }
         }
     }
 
@@ -989,7 +1198,7 @@ mod tests {
     fn steer_port_follows_the_configured_server_port() {
         let mut s = settings();
         s.server_port = 3389;
-        let p = build_plumbing(&s, true);
+        let p = build_plumbing(&s);
         let rules: Vec<&Step> =
             p.steps.iter().filter(|st| st.args.first().map(|a| a == "rule").unwrap_or(false)).collect();
         assert!(rules[0].args.join(" ").contains("dport 3389"));
@@ -998,7 +1207,7 @@ mod tests {
 
     #[test]
     fn every_rule_and_table_step_has_an_exact_inverse() {
-        let p = build_plumbing(&settings(), true);
+        let p = build_plumbing(&settings());
         for s in &p.steps {
             let is_rule = s.args.first().map(|a| a == "rule").unwrap_or(false);
             let is_table_route = s.args.iter().any(|a| a == "table");
@@ -1014,7 +1223,7 @@ mod tests {
 
     #[test]
     fn host_sysctls_loosen_rp_filter_on_our_veths_only() {
-        let p = build_plumbing(&settings(), true);
+        let p = build_plumbing(&settings());
         assert_eq!(p.host_sysctls.len(), 2);
         for (key, want) in &p.host_sysctls {
             // 2 (loose), not 0: MAX(conf.all, conf.<iface>) means 2 wins over a
@@ -1289,6 +1498,131 @@ mod tests {
     }
 
     #[test]
+    fn preflight_rejects_a_permission_whose_chain_is_reached_only_by_a_pinned_jump() {
+        // The pin is on the JUMP, not on the accept. Zone-based frontends
+        // (firewalld, shorewall) are built this way, and the accept inside the zone
+        // chain looks destination-only when read on its own — so crediting it
+        // means logging "both legs will match" and then blackholing completely.
+        let rules = "-P FORWARD DROP\n\
+                     -A FORWARD -i tun0 -o eth0 -j zone_vpn_fwd\n\
+                     -A zone_vpn_fwd -d 10.10.2.10/32 -p tcp -m tcp --dport 443 -j ACCEPT\n";
+        match dx(true, rules).blocker {
+            Some(Blocker::ForwardPinnedToIfaces(r)) => {
+                assert!(r.contains("-i tun0 -o eth0"), "must name the pinned jump: {r}");
+            }
+            other => panic!("expected an inherited-pin blocker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_credits_a_permission_reached_through_an_unpinned_jump_chain() {
+        // The mirror image, and the case that must keep working: ufw's own shape,
+        // where FORWARD jumps carry no interface match. Two hops deep, to exercise
+        // the closure's fixed point rather than a single pass.
+        let rules = "-P FORWARD DROP\n\
+                     -A FORWARD -j ufw-before-forward\n\
+                     -A ufw-before-forward -j ufw-user-forward\n\
+                     -A ufw-user-forward -j deep-zone\n\
+                     -A deep-zone -d 10.10.2.10/32 -p tcp -m tcp --dport 443 -j ACCEPT\n";
+        let d = dx(true, rules);
+        assert_eq!(d.blocker, None);
+        assert!(
+            d.confirmed_by.as_deref().unwrap_or("").contains("deep-zone"),
+            "must follow three jumps to find it: {:?}",
+            d.confirmed_by
+        );
+    }
+
+    #[test]
+    fn preflight_prefers_an_unpinned_path_when_a_chain_has_both() {
+        // Reached via a pinned jump AND an unpinned one: a packet on our veths can
+        // still get there, so this box is fine and must not be refused.
+        let rules = "-P FORWARD DROP\n\
+                     -A FORWARD -i tun0 -o eth0 -j shared_fwd\n\
+                     -A FORWARD -j shared_fwd\n\
+                     -A shared_fwd -d 10.10.2.10/32 -p tcp -m tcp --dport 443 -j ACCEPT\n";
+        let d = dx(true, rules);
+        assert_eq!(d.blocker, None, "an unpinned path exists; do not refuse");
+        assert!(d.confirmed_by.is_some());
+    }
+
+    #[test]
+    fn preflight_rejects_a_pinned_permission_addressed_to_a_subnet() {
+        // `-d <subnet>` covering the server is a real permission for our flow, so a
+        // pinned one has to be caught. Requiring /32 here used to let this through
+        // as neither confirmed nor blocked — i.e. a warning, then a blackhole.
+        let rules = "-P FORWARD DROP\n\
+                     -A FORWARD -i tun0 -o eth0 -d 10.10.2.0/24 -p tcp -m tcp --dport 443 -j ACCEPT\n";
+        match dx(true, rules).blocker {
+            Some(Blocker::ForwardPinnedToIfaces(r)) => assert!(r.contains("10.10.2.0/24"), "{r}"),
+            other => panic!("expected a pinning blocker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_credits_a_permission_addressed_to_a_covering_subnet() {
+        for spelling in ["-d 10.10.2.0/24", "-d 10.0.0.0/8", "-d 0.0.0.0/0"] {
+            let rules = format!("-P FORWARD DROP\n-A FORWARD {spelling} -p tcp --dport 443 -j ACCEPT\n");
+            assert!(
+                dx(true, &rules).confirmed_by.is_some(),
+                "a -d covering the server permits our flow: {spelling}"
+            );
+        }
+        // ...but a subnet that excludes the server still confirms nothing.
+        let elsewhere = "-P FORWARD DROP\n-A FORWARD -d 192.168.0.0/16 -p tcp --dport 443 -j ACCEPT\n";
+        assert_eq!(dx(true, elsewhere).confirmed_by, None);
+    }
+
+    #[test]
+    fn preflight_recognises_the_long_interface_option_spellings() {
+        // iptables-save emits -i/-o, but a hand-written rule or a restore file may
+        // use the long forms, and missing them means missing the blocker.
+        for pin in ["--in-interface tun0", "--out-interface eth0"] {
+            let rules =
+                format!("-P FORWARD DROP\n-A FORWARD {pin} -d 10.10.2.10/32 -p tcp --dport 443 -j ACCEPT\n");
+            assert!(
+                matches!(dx(true, &rules).blocker, Some(Blocker::ForwardPinnedToIfaces(_))),
+                "must treat `{pin}` as a pin"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_only_credits_an_accept() {
+        // A DROP or REJECT to the server is emphatically not a permission. Without
+        // the -j ACCEPT check this would be logged as "both legs will match".
+        for verdict in ["DROP", "REJECT", "LOG", "RETURN"] {
+            let rules =
+                format!("-P FORWARD DROP\n-A FORWARD -d 10.10.2.10/32 -p tcp --dport 443 -j {verdict}\n");
+            assert_eq!(dx(true, &rules).confirmed_by, None, "-j {verdict} is not a permission");
+        }
+    }
+
+    #[test]
+    fn preflight_warns_on_a_catch_all_drop_even_when_the_policy_is_accept() {
+        // ufw's shape: policy left at ACCEPT, the chain closed with a terminal
+        // DROP. Warning here is the whole reason the restrictive heuristic looks at
+        // reachable rules and not just at `-P`.
+        let rules = "-P FORWARD ACCEPT\n\
+                     -A FORWARD -j my-fwd\n\
+                     -A my-fwd -d 10.9.9.9/32 -j ACCEPT\n\
+                     -A my-fwd -j DROP\n";
+        let d = dx(true, rules);
+        assert_eq!(d.confirmed_by, None);
+        assert!(d.unconfirmed_but_restrictive, "a reachable catch-all DROP is restrictive");
+
+        // A DROP narrowed to some other flow is not a catch-all, so no warning.
+        let narrowed = "-P FORWARD ACCEPT\n\
+                        -A FORWARD -j my-fwd\n\
+                        -A my-fwd -d 10.9.9.9/32 -j DROP\n";
+        assert!(!dx(true, narrowed).unconfirmed_but_restrictive);
+
+        // And a catch-all DROP in a chain nothing forwards into says nothing.
+        let unreachable = "-P FORWARD ACCEPT\n-A INPUT -j in-only\n-A in-only -j DROP\n";
+        assert!(!dx(true, unreachable).unconfirmed_but_restrictive);
+    }
+
+    #[test]
     fn preflight_rejects_a_pinned_ufw_route_rule() {
         let rules = UFW.replace(UFW_OPEN_443, UFW_PINNED_443);
         assert!(rules != UFW, "the fixture line to pin must exist verbatim");
@@ -1367,14 +1701,21 @@ mod tests {
     #[test]
     fn preflight_matches_addresses_with_and_without_a_prefix_length() {
         // ufw writes `-d 10.10.2.10`; a live `iptables -S` prints the same rule
-        // back as `-d 10.10.2.10/32`. Both must be recognised, and a /24 that
-        // merely CONTAINS the server must not be (it is not a rule for this host).
+        // back as `-d 10.10.2.10/32`. Both must be recognised.
+        //
+        // A wider `-d` that CONTAINS the server counts too — see
+        // preflight_credits_a_permission_addressed_to_a_covering_subnet. This
+        // deliberately reversed an earlier "a /24 is not a rule for this host":
+        // `-d 10.10.2.0/24 --dport 443 -j ACCEPT` plainly does permit our flow, and
+        // treating it as no rule at all meant an interface-pinned one produced
+        // neither a confirmation nor a blocker — just a warning, then a blackhole.
         for spelling in ["-d 10.10.2.10", "-d 10.10.2.10/32"] {
             let rules = format!("-P FORWARD DROP\n-A FORWARD {spelling} -p tcp --dport 443 -j ACCEPT\n");
             assert!(dx(true, &rules).confirmed_by.is_some(), "should confirm: {spelling}");
         }
-        let wide = "-P FORWARD DROP\n-A FORWARD -d 10.10.2.0/24 -p tcp --dport 443 -j ACCEPT\n";
-        assert_eq!(dx(true, wide).confirmed_by, None, "a /24 is not a rule for this host");
+        // A prefix that excludes the server is still not our rule.
+        let elsewhere = "-P FORWARD DROP\n-A FORWARD -d 10.10.3.0/24 -p tcp --dport 443 -j ACCEPT\n";
+        assert_eq!(dx(true, elsewhere).confirmed_by, None, "a /24 without the server is not our rule");
     }
 
     #[test]

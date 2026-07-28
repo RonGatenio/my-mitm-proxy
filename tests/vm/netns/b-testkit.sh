@@ -26,7 +26,24 @@ FWGUARD=/run/mm.fwguard    # watchdog cancel flag (see fw-up)
 #     ":INPUT ACCEPT [34:4611]" even WITHOUT -c, so every packet through the box
 #     changes them; hashing them raw makes "the firewall was modified" fire on
 #     nothing more than a ping.
-fw_norm() { iptables-save | grep -v '^#' | sed 's/\[[0-9]*:[0-9]*\]/[0:0]/g'; }
+# Restricted to the three tables the test cares about: `iptables-save` emits a
+# *table section only for tables whose MODULE is loaded, so a module appearing
+# mid-run (the iproute plane loading nat/mangle, a *raw showing up) adds a whole
+# section and the digest moves with no rule change -- reported as "the firewall
+# CHANGED". Asking for each table by name loads and prints all three every time.
+#
+# One table PER CALL: `iptables-save -t filter -t nat -t mangle` exits 0 but honors
+# only the LAST -t, so it silently dumps mangle alone. (Caught by the *filter floor
+# in fw-hash, which is why that floor exists.)
+fw_norm() {
+  _d=""
+  for _t in filter nat mangle; do
+    _o="$(iptables-save -t "$_t")" || return 1
+    _d="$_d$_o
+"
+  done
+  printf '%s' "$_d" | grep -v '^#' | sed 's/\[[0-9]*:[0-9]*\]/[0:0]/g'
+}
 
 cmd="${1:-}"; shift 2>/dev/null || true
 
@@ -98,8 +115,9 @@ EOF
   fi
   # Verify the profile really took, so a silent partial apply can't be mistaken
   # for a valid "the firewall blocks it" result.
-  iptables -S | grep -q "^-P INPUT DROP"  || { echo "fw-up: INPUT policy is not DROP" >&2; exit 1; }
-  iptables -S | grep -q "^-P OUTPUT DROP" || { echo "fw-up: OUTPUT policy is not DROP" >&2; exit 1; }
+  iptables -S | grep -q "^-P INPUT DROP"   || { echo "fw-up: INPUT policy is not DROP" >&2; exit 1; }
+  iptables -S | grep -q "^-P OUTPUT DROP"  || { echo "fw-up: OUTPUT policy is not DROP" >&2; exit 1; }
+  iptables -S | grep -q "^-P FORWARD DROP" || { echo "fw-up: FORWARD policy is not DROP" >&2; exit 1; }
   iptables -S | grep -q -- "-A FORWARD -d $SERVER/32 -p tcp -m tcp --dport $PORT -j ACCEPT" \
     || { echo "fw-up: the permitted-forward rule is missing" >&2; iptables -S FORWARD >&2; exit 1; }
   echo "fw-up: default-DROP profile applied (forward -> $SERVER:$PORT only); saved previous to $FWSAVE"
@@ -196,8 +214,15 @@ fw-ufw-install)
 fw-dump) iptables -S ;;
 
 # Does this kernel + iproute2 accept L4 selectors on a routing rule (>= 4.17)?
-# The same throwaway add/delete the product does in netns::probe_l4_rule_support,
-# so the harness gates its UDP expectation on exactly what the proxy will decide.
+# The harness needs to know whether to EXPECT UDP to the server to keep flowing,
+# and this is the only honest way to find out.
+#
+# The product deliberately has no such probe: it must not add and delete a
+# throwaway rule on a customer's box just to interrogate the kernel, so it attempts
+# the scoped steer rule and falls back if that is rejected. This is a throwaway
+# QEMU guest that the validator has already firewalled, so the same objection does
+# not apply -- but keep the two in sync, since the harness's expectation is only
+# meaningful if it predicts what the product will do.
 # Both failure modes -- old kernel, old iproute2 -- look identical from here.
 l4-probe)
   P="priority 30998 iif lo to 127.0.0.1 ipproto tcp dport 1 lookup 253"
@@ -220,7 +245,14 @@ fw-down)
   echo "fw-down: ruleset restored from $FWSAVE"
   ;;
 
-fw-hash) fw_norm | sha256sum | cut -d' ' -f1 ;;
+# A digest with a FLOOR. `iptables-save` failing, missing, or printing nothing
+# would otherwise hash to the constant sha256 of the empty string, and every
+# "firewall byte-for-byte unchanged" assertion would agree while measuring nothing.
+fw-hash)
+  d="$(fw_norm)" || { echo "fw-hash: iptables-save failed" >&2; exit 1; }
+  echo "$d" | grep -q '^\*filter'     || { echo "fw-hash: refusing to hash a dump with no *filter table (got $(echo "$d" | grep -c .) lines)" >&2; exit 1; }
+  echo "$d" | sha256sum | cut -d' ' -f1
+  ;;
 fw-show) fw_norm ;;
 
 mm-start)
@@ -248,7 +280,10 @@ mm-stop)
   echo "mm-stop: done"
   ;;
 
-mm-log) cat "$LOG" 2>/dev/null ;;
+# "Print the log" must succeed when there is no log yet -- an absent log is an
+# answer (nothing has run), not an error, and callers use this command's status to
+# tell whether the testkit itself is working.
+mm-log) cat "$LOG" 2>/dev/null || true ;;
 mm-alive) pgrep -f '/opt/mymitm/mymitm --config' >/dev/null 2>&1 && echo yes || echo no ;;
 
 *) echo "usage: $0 {fw-up|fw-up-ufw|fw-ufw-install|fw-down|fw-hash|fw-show|fw-dump|l4-probe|mm-start|mm-stop|mm-log|mm-alive} ..." >&2; exit 2;;

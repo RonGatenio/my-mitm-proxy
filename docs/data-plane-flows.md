@@ -364,11 +364,15 @@ Two details worth knowing:
   tunnel on TCP 443 *and* an optional UDP transport on 3391, and an unscoped
   `to <server>` steer would pull the UDP into the namespace and blackhole it.
   With the selectors, UDP 3391 (and ICMP) stay on the main table and are
-  forwarded normally, un-intercepted. FIB-rule L4 selectors need **kernel ≥
-  4.17**; `probe_l4_rule_support` adds and deletes a throwaway rule at startup to
-  find out (iproute2 has to speak the syntax too, and both failures look the
-  same), and on an older kernel falls back to the unscoped form with a WARN
-  naming the consequence. Not steering the server's ICMP costs nothing: the
+  forwarded normally, un-intercepted. FIB-rule L4 selectors need **kernel ≥ 4.17**
+  and an iproute2 that speaks the syntax. There is **no probe** for that:
+  `build_plumbing` emits the scoped rule with the unscoped one as its fallback
+  (`Step::alt`), and if `ip rule add` rejects the selectors the fallback is used
+  and a WARN names the consequence. Attempting the real rule is the point —
+  mymitm must not add and delete a throwaway rule on the host just to interrogate
+  the kernel, and the failure that matters is the failure of the rule we actually
+  want, not of a stand-in. Each spelling carries its own inverse, because
+  `ip rule del` matches exactly. Not steering the server's ICMP costs nothing: the
   classifiers only rewrite TCP, so ICMP steered in was dropped anyway.
 
 ### Requirements, and the preflight
@@ -388,7 +392,14 @@ blackhole:
   permits the flow **today** but cannot match once the legs become `-o mmc0` /
   `-i mmu0`. Under ufw that is the difference between `ufw route allow to
   <server> port 443 proto tcp` (fine) and `ufw route allow in on tun0 out on eth0
-  …` (fatal).
+  …` (fatal). The pin can also be **inherited from the path**: if the only way
+  into the chain holding the permission is `-A FORWARD -i tun0 -o eth0 -j <chain>`,
+  then the accept inside it is equally unusable even though its own text carries no
+  interface match. Zone-based frontends (firewalld, shorewall) are built exactly
+  that way, so reachability is computed as "which chains can a packet on *our*
+  veths get to", not "which chains are jumped to at all" — otherwise the accept
+  reads as destination-only and gets confirmed, and the box blackholes with the
+  preflight having said it was fine.
 - **Source scoping without preservation.** `ufw route allow from <vpn_subnet> to
   <server> …` renders `-s <vpn_subnet> …`, which the client leg matches either
   way — but the upstream leg only carries a source in that subnet while
@@ -441,9 +452,28 @@ was previously assumed rather than observed:
   `ufw-user-input`**, which is what breaks `netns = false` on such a box (not a
   missing allow);
 - **UDP 3391 still reaches the server** with `netns = true`, i.e. the L4-scoped
-  steer took only TCP `<server_port>`. Gated on the same runtime probe the product
-  uses: on a pre-4.17 kernel the steer is unscoped and that UDP is *expected* to
-  be blackholed, so the check reports the fallback instead of asserting a bug.
+  steer took only TCP `<server_port>`. On a pre-4.17 kernel the steer is unscoped
+  and that UDP is *expected* to be blackholed, so the harness probes what the
+  product will do and reports the fallback instead of asserting a bug. A control
+  run — firewall up, nothing else in play — confirms the datagram forwards plainly
+  first, so a later failure cannot be misread as the steer when it is the profile
+  or the probe.
+
+Two things that check is only meaningful **because** they are asserted alongside
+it, both of which it silently depended on before:
+
+- **the namespace's `ip_forward`.** With forwarding *on* inside the namespace, an
+  unscoped steer would pull UDP 3391 in and forward it out to the server anyway —
+  so the datagram would arrive and the check would pass while claiming the steer
+  was scoped. The validator asserts `0` on the eBPF plane (fail closed) and `1` on
+  the iproute plane, which sets it for itself; on that plane it says outright that
+  the UDP result is not decisive about scoping.
+- **`rp_filter`.** The validator sets `conf.all.rp_filter=1` before any proxy runs.
+  mymitm only ever writes `0` there, and Debian's default is already `0`, so on the
+  exact target this was built for the "host sysctls untouched" assertion could not
+  have failed whatever the product did. With `all=1` it has teeth, and it
+  simultaneously exercises the design claim that a per-veth `2` loosens without any
+  box-wide change (the kernel takes `MAX(conf.all, conf.<iface>)`).
 
 The `UFW` fixture in `netns.rs`'s tests is this run's verbatim `iptables -S`
 output, so the unit tests and the live box parse the same bytes.

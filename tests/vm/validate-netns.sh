@@ -111,23 +111,47 @@ setup_b() {
               sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables" \
       || fail "B: apt-get install iptables failed (guest needs outbound network)"
   fi
-  vm_ssh B "sudo mkdir -p /opt/mymitm/dumps && sudo chown -R ubuntu /opt/mymitm"
-  vm_scp B "$BIN"                      /opt/mymitm/mymitm
-  vm_scp B "$CERT_DIR/leaf.pem"        /opt/mymitm/leaf.pem
-  vm_scp B "$CERT_DIR/leaf.key"        /opt/mymitm/leaf.key
-  vm_scp B "$HERE/netns/b-testkit.sh"  /opt/mymitm/b-testkit.sh
-  vm_scp B "$HERE/netns/netns-recipe.sh" /opt/mymitm/netns-recipe.sh
+  # Every copy and normalization below is checked. Unchecked, a failed CRLF strip
+  # surfaces much later as an opaque `sh` error inside the testkit -- and a broken
+  # testkit is exactly what makes a probe return garbage, which used to skip
+  # assertions silently rather than fail.
+  vm_ssh B "sudo mkdir -p /opt/mymitm/dumps && sudo chown -R ubuntu /opt/mymitm" \
+    || fail "B: could not prepare /opt/mymitm"
+  vm_scp B "$BIN"                        /opt/mymitm/mymitm       || fail "B: copying the binary failed"
+  vm_scp B "$CERT_DIR/leaf.pem"          /opt/mymitm/leaf.pem     || fail "B: copying leaf.pem failed"
+  vm_scp B "$CERT_DIR/leaf.key"          /opt/mymitm/leaf.key     || fail "B: copying leaf.key failed"
+  vm_scp B "$HERE/netns/b-testkit.sh"    /opt/mymitm/b-testkit.sh || fail "B: copying the testkit failed"
+  vm_scp B "$HERE/netns/netns-recipe.sh" /opt/mymitm/netns-recipe.sh || fail "B: copying the recipe failed"
   # Files authored on a Windows checkout can arrive CRLF; /bin/sh then dies on
   # `set: pipefail: invalid option name`-style errors. Normalize in place.
-  vm_ssh B "sudo sed -i 's/\r\$//' $TK $RECIPE && chmod +x /opt/mymitm/mymitm"
+  vm_ssh B "sudo sed -i 's/\r\$//' $TK $RECIPE && chmod +x /opt/mymitm/mymitm" \
+    || fail "B: normalizing the guest scripts failed"
+  # Prove the testkit actually runs before anything depends on its output.
+  vm_ssh B "sudo sh $TK mm-log >/dev/null" || fail "B: the testkit is not executable ($TK)"
   # The UDP steer check needs a sender on A and a sink on C. Python because it is
   # the only interpreter both are guaranteed to have.
   if [ "$FW_PROFILE" = ufw ]; then
-    vm_scp A "$HERE/netns/udp-probe.py" "$UDP_PROBE"
-    vm_scp C "$HERE/netns/udp-probe.py" "$UDP_PROBE"
-    vm_ssh A "sed -i 's/\r\$//' $UDP_PROBE"
-    vm_ssh C "sed -i 's/\r\$//' $UDP_PROBE"
+    for vm in A C; do
+      vm_scp "$vm" "$HERE/netns/udp-probe.py" "$UDP_PROBE" || fail "$vm: copying the UDP probe failed"
+      vm_ssh "$vm" "sed -i 's/\r\$//' $UDP_PROBE"          || fail "$vm: normalizing the UDP probe failed"
+      vm_ssh "$vm" "python3 $UDP_PROBE 2>&1 | grep -q udp-probe" \
+        || fail "$vm: python3 cannot run the UDP probe -- the UDP check would report a harness fault as a steer regression"
+    done
   fi
+}
+
+# fw_digest <label> -- the live ruleset's digest, or fail. `tk fw-hash` exits
+# non-zero when it cannot produce one, and `$(...)` swallows that: an empty FW_REF
+# then compared equal to an empty FW_NOW and the headline invariant of this whole
+# validator passed while measuring nothing. Demand a sha256.
+fw_digest() {
+  local h
+  h="$(tk fw-hash)" || die "($1) fw-hash failed on B -- cannot verify the firewall is unchanged"
+  case "$h" in
+    [0-9a-f][0-9a-f]*) [ "${#h}" = 64 ] || die "($1) fw-hash returned '$h', not a sha256" ;;
+    *) die "($1) fw-hash returned '$h', not a sha256 -- refusing to compare a non-digest" ;;
+  esac
+  echo "$h"
 }
 
 # --- firewall profile ------------------------------------------------------
@@ -179,18 +203,75 @@ ufw_ruleset_checks() {
     || die "no 'ufw deny from $CLIENT_SUBNET' DROP in ufw-user-input"
   pass "(ufw) 'deny from $CLIENT_SUBNET' is an explicit DROP in ufw-user-input -- the rule that kills netns=false"
 
-  printf '%s\n' "$dump" | grep -qE -- "^-A ufw-user-forward .*--dport $UDP_PORT .*-j ACCEPT" \
-    || die "no ufw-user-forward ACCEPT for the UDP $UDP_PORT transport"
+  printf '%s\n' "$dump" | grep -qE -- "^-A ufw-user-forward .*-d $C_IP(/32)? .*-p udp .*--dport $UDP_PORT .*-j ACCEPT" \
+    || die "no ufw-user-forward ACCEPT for UDP $UDP_PORT to $C_IP (a TCP rule for that port, or a UDP rule to some other host, must not satisfy this)"
   pass "(ufw) UDP $UDP_PORT to $C_IP is permitted too, so the steer can be checked for swallowing it"
 }
 
+# --- does the namespace fail closed? --------------------------------------
+# `ip_forward=0` inside the namespace is a security guarantee: a packet the
+# classifiers did not rewrite DIES there instead of being forwarded on to the
+# server in the clear. It is also the premise that makes the UDP check decisive --
+# the namespace holds `<server>/32 via <upstream veth>`, so with forwarding ON an
+# UNSCOPED steer would pull UDP $UDP_PORT in and forward it to C anyway.
+#
+# It holds for the eBPF plane only. The iproute plane sets net.ipv4.ip_forward=1
+# for itself during setup (mymitm/src/iproute.rs), and inside a namespace that
+# overwrites the 0 the plumbing just set -- so that plane is fail-OPEN here.
+# Asserting the real behaviour of each plane keeps the difference on the record
+# instead of buried.
+# assert_no_plumbing <label> -- nothing of the namespace topology survives.
+# Every check is written so an ssh failure FAILS rather than reading as "clean":
+# `${x:-0}` on an empty result from a dead guest used to mean "no leftover state".
+assert_no_plumbing() {
+  local left_rules
+  left_rules="$(vm_ssh B "ip rule show | grep -cE 'lookup (3|4)[0-9][0-9]' || true")" \
+    || die "($1) could not read ip rules from B"
+  case "$left_rules" in
+    ''|*[!0-9]*) die "($1) unreadable ip-rule count from B ('$left_rules')" ;;
+    0) ;;
+    *) vm_ssh B "ip rule show"; die "($1) $left_rules netns ip rule(s) left behind" ;;
+  esac
+  for v in mmc0 mmu0; do
+    vm_ssh B "ip link show $v >/dev/null 2>&1" && die "($1) veth $v left behind" || true
+  done
+  # (P) used to claim "no namespace" in its message without ever checking it, and a
+  # leaked one was then silently absorbed by the product's own cleanup in (X).
+  vm_ssh B "sudo ip netns list | grep -qw mitm" && die "($1) namespace 'mitm' left behind" || true
+  pass "($1) netns plumbing fully removed (no ip rules, no veth, no namespace)"
+}
+
+assert_ns_forwarding() {
+  v="$(ns_sysctl ip_forward)"
+  case "$PLANE" in
+    ebpf) want=0 ;;
+    *)    want=1 ;;   # the iproute plane sets it for itself; see above
+  esac
+  [ "$v" = "$want" ]     || die "($1) in-netns ip_forward is '$v', expected $want for the $PLANE plane"
+  if [ "$want" = 0 ]; then
+    pass "($1) namespace fails closed (in-netns ip_forward=0): an unrewritten packet dies rather than leaking onward"
+  else
+    info "($1) NOTE: in-netns ip_forward=1 -- the $PLANE plane sets it for itself, so the namespace does NOT fail closed on this plane, and the UDP check below is not decisive about steer scoping"
+  fi
+}
+
 # --- UDP steer check -------------------------------------------------------
-# udp_flows <marker> -> 0 if a datagram sent A -> C:$UDP_PORT arrives.
+# udp_flows <marker> -> 0 arrived · 1 did not arrive · 2 the listener never started
+# The distinction matters: reporting a broken probe as "the steer is swallowing
+# non-TCP traffic" is how a harness bug gets recorded as a product regression.
 udp_flows() {
   local i
-  vm_ssh C "rm -f $UDP_SINK; nohup setsid python3 $UDP_PROBE listen $UDP_PORT $UDP_SINK >/dev/null 2>&1 </dev/null & sleep 0.5" \
-    || return 1
-  vm_ssh A "python3 $UDP_PROBE send $C_IP $UDP_PORT '$1'" || return 1
+  vm_ssh C "rm -f $UDP_SINK $UDP_SINK.ready; nohup setsid python3 $UDP_PROBE listen $UDP_PORT $UDP_SINK >/dev/null 2>&1 </dev/null & sleep 0.2" \
+    || return 2
+  # The probe touches <sink>.ready only after bind() succeeds, so this separates
+  # "no listener" from "no datagram". Backgrounding it means the ssh exit status is
+  # the backgrounding shell's, never the listener's -- so it cannot be used here.
+  for i in $(seq 1 20); do
+    vm_ssh C "test -f $UDP_SINK.ready" && break
+    sleep 0.25
+  done
+  vm_ssh C "test -f $UDP_SINK.ready" || return 2
+  vm_ssh A "python3 $UDP_PROBE send $C_IP $UDP_PORT '$1'" || return 2
   for i in $(seq 1 10); do
     vm_ssh C "grep -q '$1' $UDP_SINK 2>/dev/null" && return 0
     sleep 0.5
@@ -211,9 +292,12 @@ check_udp() {
     info "($1) skipping the UDP $UDP_PORT check: this kernel's routing rules take no L4 selectors, so the steer is unscoped and UDP to $C_IP is EXPECTED to be blackholed in the namespace"
     return 0
   fi
-  udp_flows "$2" \
-    || die "($1) UDP $UDP_PORT to $C_IP did not reach C -- the steer is swallowing non-TCP traffic (regression of the L4-scoped ip rule)"
-  pass "($1) UDP $UDP_PORT still reaches C: the steer took only TCP $PORT"
+  udp_flows "$2"
+  case $? in
+    0) pass "($1) UDP $UDP_PORT still reaches C: the steer took only TCP $PORT" ;;
+    1) die "($1) UDP $UDP_PORT to $C_IP did not reach C -- the steer is swallowing non-TCP traffic (regression of the L4-scoped ip rule)" ;;
+    *) die "($1) the UDP probe never came up on C, so nothing was measured -- this is a HARNESS failure, not a steer regression (check $UDP_PROBE reached C and python3 can run it)" ;;
+  esac
 }
 
 # write_toml <host|nsrecipe|product> <plane>
@@ -262,16 +346,71 @@ curl_try() {
   vm_ssh A "curl -s --max-time 8 -o - -w '\nHTTP:%{http_code}\n' --cacert /tmp/ca.pem https://$C_IP$1" 2>&1
 }
 
-host_sysctl() { vm_ssh B "cat /proc/sys/net/ipv4/$1 2>/dev/null || echo NA"; }
+# A sysctl read that cannot silently degenerate. The old version echoed "NA" on an
+# unreadable path, and "NA == NA" then made the whole invariant a no-op.
+host_sysctl() {
+  local v
+  v="$(vm_ssh B "cat /proc/sys/net/ipv4/$1 2>/dev/null")"
+  case "$v" in
+    ''|*[!0-9]*) fail "cannot read host sysctl net.ipv4.$1 on B (got '$v') -- the invariant that depends on it would be meaningless" ;;
+  esac
+  echo "$v"
+}
+ns_sysctl() { vm_ssh B "sudo ip netns exec mitm cat /proc/sys/net/ipv4/$1 2>/dev/null || echo NA"; }
+
+# intercepted <label> <marker> <log>
+#   Demand evidence the PROXY terminated this connection. An HTTP 200 alone proves
+#   nothing: the first version of the netns topology returned 200 with the flow
+#   routed straight THROUGH the namespace to the server, never touching the proxy.
+#   NB: match the address on its own -- tracing writes ANSI colour escapes between
+#   a field name, its '=' and the value, so a literal "peer=<ip>" never matches.
+intercepted() {
+  local label="$1" marker="$2" log="$3"
+  echo "$log" | grep -q "alpn negotiated" \
+    || { echo "$log"; die "($label) HTTP 200 but the proxy logged NO connection -- the traffic BYPASSED the proxy"; }
+  echo "$log" | grep "alpn negotiated" | grep -q "$A_IP" \
+    || { echo "$log"; die "($label) proxy handled a connection, but not one from $A_IP"; }
+  # Ties THIS request to actual decryption, not merely "a connection happened".
+  sleep 0.5   # the dump is written as the flow closes; don't race it
+  vm_ssh B "sudo grep -rl '$marker' /opt/mymitm/dumps/" >/dev/null 2>&1 \
+    || { vm_ssh B "sudo ls -la /opt/mymitm/dumps/"; die "($label) decrypted marker $marker not found in any B dump"; }
+}
 
 setup_b
 
-# Gate the UDP expectation on what the PRODUCT will decide, probed the same way
-# netns::probe_l4_rule_support does. On a pre-4.17 kernel the steer falls back to
-# the unscoped form and UDP 3391 is legitimately blackholed; asserting otherwise
-# there would be asserting a bug.
+# Gate the UDP expectation on what the PRODUCT will decide. The product itself does
+# NOT probe -- it attempts the scoped steer rule and falls back if the kernel
+# rejects it, precisely so it adds nothing to a customer's box just to interrogate
+# it. This is a throwaway guest, so the harness may probe to form an expectation.
+# On a pre-4.17 kernel the fallback is taken and UDP 3391 is legitimately
+# blackholed; asserting otherwise there would be asserting a bug.
 L4_OK="$(tk l4-probe)"
+# Trusting this string blindly would let any ssh hiccup silently disable both UDP
+# assertions while printing "this kernel takes no L4 selectors" -- a claim the
+# harness would not have established. Only the two known answers are acceptable.
+case "$L4_OK" in
+  yes|no) ;;
+  *) fail "l4-probe returned '$L4_OK' (expected yes|no); refusing to guess whether to expect UDP $UDP_PORT to flow" ;;
+esac
 info "B routing rules take L4 selectors (ipproto/dport, needs >= 4.17): $L4_OK"
+
+# Reference values for the "host sysctls untouched" invariant, captured BEFORE any
+# proxy has run. Captured per-plane after phase (S) they were worthless: (S) runs
+# the eBPF plane with manage_sysctls on, which manages exactly conf.all.rp_filter
+# and conf.<tun>.{rp_filter,route_localnet} -- so a leak from (S) became the
+# reference and every later comparison passed.
+#
+# conf.all.rp_filter is then deliberately set to 1: mymitm only ever writes 0
+# there, and Debian's default is already 0, so on the very target this validator
+# was built for the assertion could not fail whatever the product did. Setting 1
+# gives it teeth AND exercises the design claim that a per-veth 2 loosens without
+# any box-wide change (the kernel takes MAX(conf.all, conf.<iface>)).
+vm_ssh B "sudo sysctl -wq net.ipv4.conf.all.rp_filter=1" \
+  || fail "could not set conf.all.rp_filter=1 on B (needed to give the sysctl invariant teeth)"
+ALL_RPF_REF="$(host_sysctl conf/all/rp_filter)"
+LEFT_RLN_REF="$(host_sysctl "conf/$LEFT/route_localnet")"
+[ "$ALL_RPF_REF" = 1 ] || fail "conf.all.rp_filter is '$ALL_RPF_REF' after setting it to 1"
+info "host sysctl refs (pre-proxy): all.rp_filter=$ALL_RPF_REF $LEFT.route_localnet=$LEFT_RLN_REF"
 
 # ===========================================================================
 # Per-plane run
@@ -290,17 +429,18 @@ for PLANE in $PLANES; do
   out="$(curl_try "$MARK-sanity")"
   echo "curl A->C: $out"
   echo "$out" | grep -q "HTTP:200" || die "($PLANE/S) baseline failed with no firewall -- fix the setup before blaming the firewall"
-  pass "($PLANE/S) baseline OK without a firewall"
+  # The SAME interception gate as (P) and (X). Without it, an un-attached data
+  # plane still returns 200 here by plain forwarding, "baseline OK" is printed, and
+  # (R) then blames the firewall PROFILE for what is really a broken data plane.
+  intercepted "$PLANE/S" "$MARK-sanity" "$(vm_ssh B "sudo sh $TK mm-log")"
+  pass "($PLANE/S) baseline OK without a firewall, and the proxy really intercepted it"
   tk mm-stop >/dev/null
 
   # --- firewall ON ----------------------------------------------------------
   info "=== ($PLANE) applying the testers' default-DROP firewall on B (profile: $FW_PROFILE) ==="
   fw_up
-  FW_REF="$(tk fw-hash)"
+  FW_REF="$(fw_digest "$PLANE ref")"
   info "firewall digest: $FW_REF"
-  ALL_RPF_REF="$(host_sysctl conf/all/rp_filter)"
-  LEFT_RLN_REF="$(host_sysctl "conf/$LEFT/route_localnet")"
-  info "host sysctl refs: all.rp_filter=$ALL_RPF_REF $LEFT.route_localnet=$LEFT_RLN_REF"
 
   # Control for the UDP checks in (P) and (X): with the firewall up but nothing
   # else in play, UDP $UDP_PORT must already reach C by plain forwarding. Without
@@ -323,7 +463,12 @@ for PLANE in $PLANES; do
     diag; tk fw-down >/dev/null
     fail "($PLANE/R) traffic FLOWED with the default-DROP firewall -- the repro is invalid, the profile is not blocking"
   fi
-  pass "($PLANE/R) reproduced the report: firewall ON + host legs => blocked (proxy healthy, no traffic)"
+  # "not 200" alone credits ANY interception bug as "the report reproduced". The
+  # client leg is dropped at INPUT, so the proxy must have logged no connection at
+  # all -- if it did, the flow reached it and something else broke.
+  jR="$(vm_ssh B "sudo sh $TK mm-log")"
+  echo "$jR" | grep -q "alpn negotiated"     && { echo "$jR"; diag; tk fw-down >/dev/null; fail "($PLANE/R) the proxy DID terminate a connection, so the firewall is not what blocked the flow -- this is not the reported failure"; } || true
+  pass "($PLANE/R) reproduced the report: firewall ON + host legs => blocked (proxy healthy, saw no connection)"
   tk mm-stop >/dev/null
 
   # --- (P) the fix: same firewall, proxy in a netns -------------------------
@@ -341,8 +486,11 @@ for PLANE in $PLANES; do
     fail "($PLANE/P) proxy never listened inside the netns"
   fi
 
-  # The four classifiers share one interface here (tun_iface == egress_iface).
-  # Surface the attach path so a partial attach is visible, not silent.
+  # (P) runs on mmc1/mmu1 -- TWO veth pairs, one program per tc hook. That is the
+  # whole point of the recipe: with a single pair all four classifiers share two
+  # hooks, cls_eth_ingress wins the pref order and ends the chain, and nothing is
+  # DNAT'd (the original false pass). Surface the attach path so a partial attach
+  # is visible rather than silent.
   echo "----- B: attach / sysctl lines (P) -----"
   vm_ssh B "sudo sh $TK mm-log" | grep -Ei "attach|manage-sysctls|listening|probe" || true
   echo "----------------------------------------"
@@ -356,34 +504,23 @@ for PLANE in $PLANES; do
   fi
   pass "($PLANE/P) traffic flows through the netns with the firewall untouched"
 
-  # ANTI-FALSE-PASS GATE. An HTTP 200 alone proves nothing about interception:
-  # the first version of this topology returned 200 with the flow routed straight
-  # THROUGH the namespace to the server, never touching the proxy (one veth pair
-  # => cls_eth_ingress won the tc pref order and ended the chain before
-  # cls_tun_ingress could DNAT). Demand evidence that the proxy itself
-  # terminated the connection.
-  # NB: match the address on its own. tracing writes ANSI colour escapes between
-  # the field name, the '=' and the value, so a literal "peer=<ip>" never matches.
   jP="$(vm_ssh B "sudo sh $TK mm-log")"
-  echo "$jP" | grep -q "alpn negotiated" \
-    || { echo "$jP"; die "($PLANE/P) HTTP 200 but the proxy logged NO connection -- the traffic BYPASSED the proxy"; }
-  echo "$jP" | grep "alpn negotiated" | grep -q "$A_IP" \
-    || { echo "$jP"; die "($PLANE/P) proxy handled a connection, but not one from $A_IP"; }
-  pass "($PLANE/P) the proxy really terminated the connection (alpn negotiated, peer=$A_IP)"
+  intercepted "$PLANE/P" "$MARK-netns" "$jP"
+  pass "($PLANE/P) the proxy really terminated the connection (alpn negotiated, peer=$A_IP) and decrypted it"
 
   # source-IP preservation still intact end to end
   log="$(vm_ssh C "cat /var/log/tls_server.log")"
   echo "C tls_server.log: $log"
   echo "$log" | grep -q "^$A_IP "       || die "($PLANE/P) C did not log the preserved client IP $A_IP"
   echo "$log" | grep -q "^$B_RIGHT_IP " && die "($PLANE/P) C saw the box IP $B_RIGHT_IP (source not preserved)" || true
-  vm_ssh B "sudo grep -rl '$MARK-netns' /opt/mymitm/dumps/" >/dev/null 2>&1 \
-    || { vm_ssh B "sudo ls -la /opt/mymitm/dumps/"; die "($PLANE/P) decrypted marker not found in any B dump"; }
-  pass "($PLANE/P) C saw preserved src=$A_IP; decrypted bytes in B's dump"
+  echo "$log" | grep -q "^$NS_BOX " && die "($PLANE/P) C saw the namespace address $NS_BOX (source not preserved)" || true
+  pass "($PLANE/P) C saw preserved src=$A_IP"
 
+  assert_ns_forwarding "$PLANE/P"
   check_udp "$PLANE/P" "$MARK-udp-netns"
 
   # --- invariants ----------------------------------------------------------
-  FW_NOW="$(tk fw-hash)"
+  FW_NOW="$(fw_digest "$PLANE/P")"
   [ "$FW_NOW" = "$FW_REF" ] \
     || { vm_ssh B "sudo sh $TK fw-show"; die "($PLANE/P) the firewall CHANGED ($FW_REF -> $FW_NOW); the whole point is that it must not"; }
   pass "($PLANE/P) firewall ruleset byte-for-byte unchanged ($FW_NOW)"
@@ -402,16 +539,20 @@ for PLANE in $PLANES; do
     || die "($PLANE/P) in-netns $NS_TUN.route_localnet is '$ns_rln', want 1 (manage_sysctls should have set it inside the netns)"
   pass "($PLANE/P) in-netns $NS_TUN.route_localnet=1 -- the sysctl fix applied inside the namespace"
 
+  # The design claim, asserted rather than assumed: rp_filter is loosened to 2 on
+  # OUR veths only, and that is enough even though conf.all is hardened to 1,
+  # because the kernel takes MAX(conf.all, conf.<iface>).
+  for v in mmc0 mmu0; do
+    got="$(host_sysctl "conf/$v/rp_filter")"
+    [ "$got" = 2 ] || die "($PLANE/P) $v.rp_filter is '$got', want 2 (loose) -- with conf.all=1 the return path would be martian-dropped"
+  done
+  pass "($PLANE/P) rp_filter=2 on mmc0+mmu0 only, with conf.all.rp_filter=1 untouched"
+
   # --- teardown -----------------------------------------------------------
   tk mm-stop >/dev/null
   vm_ssh B "sudo sh $RECIPE down $C_IP $PORT $LEFT $RIGHT" >/dev/null \
     || fail "($PLANE) netns-recipe down failed"
-  left_rules="$(vm_ssh B "ip rule show | grep -cE 'lookup (3|4)[0-9][0-9]' || true")"
-  [ "${left_rules:-0}" = 0 ] || { vm_ssh B "ip rule show"; fail "($PLANE) netns ip rules left behind"; }
-  for v in mmc0 mmu0; do
-    vm_ssh B "ip link show $v >/dev/null 2>&1" && fail "($PLANE) veth $v left behind" || true
-  done
-  pass "($PLANE) netns plumbing fully removed (no ip rules, no veth, no namespace)"
+  assert_no_plumbing "$PLANE/P"
 
   # === (X) the product's own --netns=true ==================================
   # (P) proved the topology using the hand-written recipe. This proves the
@@ -441,17 +582,17 @@ for PLANE in $PLANES; do
   echo "curl A->C: $out"
   echo "$out" | grep -q "HTTP:200" || die "($PLANE/X) curl A->C failed under --netns=true"
   jX="$(vm_ssh B "sudo sh $TK mm-log")"
-  echo "$jX" | grep -q "alpn negotiated" \
-    || { echo "$jX"; die "($PLANE/X) HTTP 200 but the proxy logged NO connection -- traffic BYPASSED the proxy"; }
-  echo "$jX" | grep "alpn negotiated" | grep -q "$A_IP" \
-    || { echo "$jX"; die "($PLANE/X) proxy handled a connection, but not one from $A_IP"; }
+  intercepted "$PLANE/X" "$MARK-product" "$jX"
   log="$(vm_ssh C "cat /var/log/tls_server.log")"
   echo "C tls_server.log: $log"
   echo "$log" | grep -q "^$A_IP " || die "($PLANE/X) C did not log the preserved client IP $A_IP"
-  vm_ssh B "sudo grep -rl '$MARK-product' /opt/mymitm/dumps/" >/dev/null 2>&1 \
-    || { vm_ssh B "sudo ls -la /opt/mymitm/dumps/"; die "($PLANE/X) decrypted marker not found in any B dump"; }
+  # The same negative check (P) makes. Under --netns=true the failure value is the
+  # namespace's own address, so name both.
+  echo "$log" | grep -q "^$B_RIGHT_IP " && die "($PLANE/X) C saw the box IP $B_RIGHT_IP (source not preserved)" || true
+  echo "$log" | grep -q "^$NS_BOX " && die "($PLANE/X) C saw the namespace address $NS_BOX (source not preserved)" || true
   pass "($PLANE/X) --netns=true: intercepted end to end, src=$A_IP preserved, bytes dumped"
 
+  assert_ns_forwarding "$PLANE/X"
   check_udp "$PLANE/X" "$MARK-udp-product"
 
   # (X) is the only phase that runs the product's own preflight -- it lives in the
@@ -469,7 +610,7 @@ for PLANE in $PLANES; do
     pass "($PLANE/X) the preflight found the permission inside ufw-user-forward on a LIVE ufw box (two jumps below FORWARD)"
   fi
 
-  FW_NOW="$(tk fw-hash)"
+  FW_NOW="$(fw_digest "$PLANE/X")"
   [ "$FW_NOW" = "$FW_REF" ] \
     || { vm_ssh B "sudo sh $TK fw-show"; die "($PLANE/X) the firewall CHANGED under --netns=true ($FW_REF -> $FW_NOW)"; }
   pass "($PLANE/X) firewall ruleset unchanged by --netns=true"
@@ -477,16 +618,11 @@ for PLANE in $PLANES; do
   # RAII: the supervisor must remove every trace of its own plumbing on exit.
   tk mm-stop >/dev/null
   sleep 2
-  vm_ssh B "sudo ip netns list | grep -qw mitm" && die "($PLANE/X) namespace left behind after stop" || true
-  for v in mmc0 mmu0; do
-    vm_ssh B "ip link show $v >/dev/null 2>&1" && die "($PLANE/X) veth $v left behind after stop" || true
-  done
-  x_rules="$(vm_ssh B "ip rule show | grep -cE 'lookup (3|4)[0-9][0-9]' || true")"
-  [ "${x_rules:-0}" = 0 ] || { vm_ssh B "ip rule show"; die "($PLANE/X) netns ip rules left behind after stop"; }
+  assert_no_plumbing "$PLANE/X after stop"
   ALL_RPF_NOW="$(host_sysctl conf/all/rp_filter)"
   [ "$ALL_RPF_NOW" = "$ALL_RPF_REF" ] \
     || die "($PLANE/X) HOST conf.all.rp_filter changed ($ALL_RPF_REF -> $ALL_RPF_NOW)"
-  pass "($PLANE/X) RAII teardown: namespace, veths, policy rules gone; host sysctls untouched"
+  pass "($PLANE/X) RAII teardown complete; host sysctls untouched too"
 
   tk fw-down >/dev/null || fail "($PLANE) fw-down failed"
 done
@@ -501,7 +637,12 @@ green "   (X) same firewall, UNCHANGED: mymitm --netns=true does its own plumbin
 green "       intercepts end to end, and reverses everything on exit"
 if [ "$FW_PROFILE" = ufw ]; then
 green "   ufw: the permission lives two jumps below FORWARD and the preflight found"
-green "        it there; 'deny from $CLIENT_SUBNET' is a real INPUT DROP; and UDP"
-green "        $UDP_PORT still reaches C (L4 steer selectors: $L4_OK)"
+green "        it there; 'deny from $CLIENT_SUBNET' is a real INPUT DROP"
+if [ "$L4_OK" = yes ]; then
+green "        UDP $UDP_PORT still reaches C: the steer took only TCP $PORT"
+else
+green "        UDP $UDP_PORT: NOT CHECKED -- this kernel has no L4 routing selectors,"
+green "        so the steer is unscoped and that traffic is expected to be dropped"
+fi
 fi
 green "================================================================"

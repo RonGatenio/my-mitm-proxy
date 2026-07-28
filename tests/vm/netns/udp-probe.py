@@ -12,7 +12,11 @@ Python because it is the one interpreter both A and C are guaranteed to have
 (C already runs the test TLS server on it); nc/socat are not installed.
 
     udp-probe.py listen <port> <outfile>   write the first datagram's payload
-                                           to <outfile>, then exit
+                                           to <outfile>, then exit. Creates
+                                           <outfile>.ready once bound, so a
+                                           caller that backgrounds this can tell
+                                           "not listening yet" from "no datagram"
+                                           (the shell's exit status cannot).
     udp-probe.py send <ip> <port> <text>   send <text> as a datagram
 """
 import socket
@@ -27,6 +31,10 @@ def main(argv):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", port))
+        # Bound and listening. Only now is a missing datagram evidence about the
+        # network rather than about this process.
+        with open(out + ".ready", "w") as f:
+            f.write("%d\n" % port)
         s.settimeout(LISTEN_TIMEOUT)
         try:
             data, _ = s.recvfrom(4096)
