@@ -2,7 +2,10 @@
 # Guest-side helper for tests/vm/validate-netns.sh. Runs ON B (the proxy box).
 #
 #   fw-up <server_ip> <server_port>   model the testers' firewall (default DROP)
-#   fw-down                           restore the ruleset saved by fw-up
+#   fw-up-ufw <srv> <port> <subnet>   the same box via REAL ufw (CTRL=<iface> opt)
+#   fw-ufw-install                    apt-get install ufw (ships disabled)
+#   fw-dump                           `iptables -S`, as the preflight reads it
+#   fw-down                           restore the ruleset saved by either fw-up
 #   fw-hash                           stable digest of the live ruleset (no counters)
 #   fw-show                           print the live ruleset
 #   mm-start <plain|netns> <cfg>      launch mymitm (netns => inside 'mitm')
@@ -101,9 +104,101 @@ EOF
   echo "fw-up: default-DROP profile applied (forward -> $SERVER:$PORT only); saved previous to $FWSAVE"
   ;;
 
+# ---------------------------------------------------------------------------
+# The same box, but expressed through REAL ufw instead of a hand-written
+# ruleset -- because that is what the testers run, and because a fixture of
+# what ufw "probably" emits is not evidence. Applies verbatim:
+#
+#   ufw allow in on <ctrl> to <ctrl_ip> port 22 proto tcp   (mgmt NIC == their eth1)
+#   ufw allow in on <ctrl> to <ctrl_ip> port 1194 proto udp
+#   ufw deny from <client_subnet>                           (their vpn_subnet)
+#   ufw route allow from <client_subnet> to <server> port <port> proto tcp
+#   ufw route allow from <client_subnet> to <server> port 3391 proto udp
+#
+# with default deny incoming / deny routed / allow outgoing, which are ufw's
+# own defaults (DEFAULT_OUTPUT_POLICY is ACCEPT -- verified, not assumed).
+# ---------------------------------------------------------------------------
+fw-up-ufw)
+  SERVER="${1:?server ip}"; PORT="${2:?server port}"; VPN="${3:?client subnet}"
+  command -v ufw >/dev/null 2>&1 || { echo "fw-up-ufw: ufw not installed (run fw-ufw-install)" >&2; exit 1; }
+  iptables-save > "$FWSAVE" || exit 1
+
+  # Same watchdog as fw-up, plus `ufw disable` -- restoring the saved ruleset
+  # alone would leave ufw believing it is still enabled and re-applying on boot.
+  touch "$FWGUARD"
+  setsid sh -c 'i=0; while [ $i -lt 180 ]; do [ -f '"$FWGUARD"' ] || exit 0; sleep 5; i=$((i+1)); done; ufw --force disable; iptables-restore < '"$FWSAVE" \
+    >/dev/null 2>&1 </dev/null &
+
+  # Start from a known state: reset backs up any existing user rules and
+  # disables ufw, so this is repeatable across runs.
+  ufw --force reset >/dev/null 2>&1
+
+  # ssh FIRST and *statelessly*, before enabling. ufw's own INPUT path accepts
+  # RELATED,ESTABLISHED (before.rules), but the ssh session carrying these very
+  # commands has no conntrack entry yet on a box that had no conntrack rules --
+  # exactly the mid-stream case that orphaned the session the first time this
+  # test was attempted. A ufw user rule is a stateless ACCEPT, so it is immune.
+  # Cannot affect the result: the proxy's legs are never port 22.
+  ufw allow 22/tcp >/dev/null
+
+  ufw default deny incoming  >/dev/null
+  ufw default allow outgoing >/dev/null
+  ufw default deny routed    >/dev/null
+
+  # The tester box's rules. CTRL is the management NIC, standing in for eth1.
+  if [ -n "${CTRL:-}" ]; then
+    CTRL_IP="$(ip -4 -o addr show dev "$CTRL" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+    [ -n "$CTRL_IP" ] && ufw allow in on "$CTRL" to "$CTRL_IP" port 22 proto tcp >/dev/null
+    [ -n "$CTRL_IP" ] && ufw allow in on "$CTRL" to "$CTRL_IP" port 1194 proto udp >/dev/null
+  fi
+  ufw deny from "$VPN" >/dev/null
+  ufw route allow from "$VPN" to "$SERVER" port "$PORT" proto tcp >/dev/null
+  ufw route allow from "$VPN" to "$SERVER" port 3391 proto udp >/dev/null
+
+  ufw --force enable >/dev/null 2>&1
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "fw-up-ufw: ufw enable failed ($rc); rolling back" >&2
+    ufw --force disable >/dev/null 2>&1; iptables-restore < "$FWSAVE"; rm -f "$FWGUARD"; exit 1
+  fi
+
+  # ufw does NOT manage ip_forward (its sysctl.conf sets accept_redirects,
+  # icmp_* and log_martians only), so a router keeps whatever it had. Assert it,
+  # since netns mode requires it and a silent 0 would look like a proxy bug.
+  [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] \
+    || { echo "fw-up-ufw: ip_forward is 0 after enabling ufw" >&2; exit 1; }
+
+  # Verify the profile really took: the permission must exist, in the chain we
+  # expect, WITHOUT an -i/-o pin (that is the whole premise of the test).
+  fwd="$(iptables -S ufw-user-forward 2>/dev/null)"
+  echo "$fwd" | grep -q -- "-d $SERVER/32 .*--dport $PORT .*-j ACCEPT" \
+    || { echo "fw-up-ufw: no ufw-user-forward permission for $SERVER:$PORT" >&2; echo "$fwd" >&2; exit 1; }
+  echo "$fwd" | grep -- "--dport $PORT " | grep -qE ' -(i|o) ' \
+    && { echo "fw-up-ufw: the permission is interface-pinned; this profile must not be" >&2; exit 1; }
+  iptables -S ufw-user-input | grep -q -- "-s $VPN -j DROP" \
+    || { echo "fw-up-ufw: the 'deny from $VPN' INPUT rule is missing" >&2; exit 1; }
+  echo "fw-up-ufw: real ufw enabled (route allow $VPN -> $SERVER:$PORT tcp + 3391 udp); saved previous to $FWSAVE"
+  ;;
+
+fw-ufw-install)
+  command -v ufw >/dev/null 2>&1 && { echo "fw-ufw-install: already present ($(ufw version 2>/dev/null | head -1))"; exit 0; }
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq >/dev/null 2>&1
+  # ufw ships with ENABLED=no, so installing it does not firewall the box.
+  apt-get install -y -qq --no-install-recommends ufw >/dev/null 2>&1 \
+    || { echo "fw-ufw-install: apt-get install ufw failed" >&2; exit 1; }
+  echo "fw-ufw-install: $(ufw version 2>/dev/null | head -1)"
+  ;;
+
+# The live ruleset as the preflight sees it, for diffing against the unit-test
+# fixture in mymitm/src/netns.rs. `iptables -S` == exactly what preflight() reads.
+fw-dump) iptables -S ;;
+
 fw-down)
   [ -f "$FWSAVE" ] || { echo "no saved ruleset at $FWSAVE" >&2; exit 1; }
   rm -f "$FWGUARD"                     # cancel the watchdog
+  # Harmless when ufw was never enabled; required when it was, or it re-applies.
+  command -v ufw >/dev/null 2>&1 && ufw --force disable >/dev/null 2>&1
   iptables-restore < "$FWSAVE" || exit 1
   echo "fw-down: ruleset restored from $FWSAVE"
   ;;
@@ -139,5 +234,5 @@ mm-stop)
 mm-log) cat "$LOG" 2>/dev/null ;;
 mm-alive) pgrep -f '/opt/mymitm/mymitm --config' >/dev/null 2>&1 && echo yes || echo no ;;
 
-*) echo "usage: $0 {fw-up|fw-down|fw-hash|fw-show|mm-start|mm-stop|mm-log|mm-alive} ..." >&2; exit 2;;
+*) echo "usage: $0 {fw-up|fw-up-ufw|fw-ufw-install|fw-down|fw-hash|fw-show|fw-dump|mm-start|mm-stop|mm-log|mm-alive} ..." >&2; exit 2;;
 esac
