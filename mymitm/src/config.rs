@@ -61,6 +61,14 @@ struct FileCfg {
     /// changes nothing and instead fails fast at startup if they are misconfigured.
     /// eBPF data plane only; the iproute plane manages these itself regardless.
     #[serde(default = "d_manage_sysctls")] manage_sysctls: bool,
+    /// Run the data plane inside a network namespace (default true). Interception
+    /// turns one FORWARDed flow into two locally-terminated ones (INPUT for the
+    /// client leg, OUTPUT for the upstream leg), which a default-DROP host
+    /// firewall drops in either data plane. In namespace mode both legs are
+    /// FORWARDed through a veth pair instead, so a box that already permits
+    /// `FORWARD -> server` needs no firewall change at all. Set false to run
+    /// directly on `tun_iface`/`egress_iface` as before.
+    #[serde(default = "d_netns")] netns: bool,
     /// ALPN protocols the proxy is willing to negotiate, as an allowlist. The
     /// proxy offers upstream the intersection of this list and what the client
     /// offered, then presents the server's choice back to the client. Default
@@ -84,6 +92,7 @@ fn d_raw_dump() -> bool { true }
 fn d_ntlm_dump() -> bool { true }
 fn d_verify_bpf() -> bool { true }
 fn d_manage_sysctls() -> bool { true }
+fn d_netns() -> bool { true }
 fn d_alpn() -> Vec<String> { vec!["h2".into(), "http/1.1".into()] }
 
 #[derive(Parser, Debug)]
@@ -102,10 +111,15 @@ struct Cli {
     #[arg(long, env = "MYMITM_KEY")] key: Option<PathBuf>,
     /// Override the decrypted-traffic dump directory
     #[arg(long = "dump-path", env = "MYMITM_DUMP")] dump_path: Option<PathBuf>,
+    // `tun`, `egress`, `netns` and `box-ip` each carry `overrides_with = <self>`,
+    // which lets them be repeated with the LAST occurrence winning. Namespace mode
+    // builds its child's command line by appending these four to its own argv
+    // (see netns::child_argv); without self-override clap rejects the repeat with
+    // an ArgumentConflict whenever the operator already passed one of them.
     /// Override tun interface
-    #[arg(long, env = "MYMITM_TUN")] tun: Option<String>,
+    #[arg(long, env = "MYMITM_TUN", overrides_with = "tun")] tun: Option<String>,
     /// Override egress interface
-    #[arg(long, env = "MYMITM_EGRESS")] egress: Option<String>,
+    #[arg(long, env = "MYMITM_EGRESS", overrides_with = "egress")] egress: Option<String>,
     /// Override data plane
     #[arg(long, value_enum, env = "MYMITM_DATA_PLANE")] data_plane: Option<DataPlaneKind>,
     /// Override attach mode (eBPF only)
@@ -157,6 +171,15 @@ struct Cli {
     /// (with a warning); false fails fast if they are misconfigured. eBPF only.
     #[arg(long = "manage-sysctls", env = "MYMITM_MANAGE_SYSCTLS", action = ArgAction::Set)]
     manage_sysctls: Option<bool>,
+    /// Run the data plane inside a network namespace (`--netns=true|false`,
+    /// default true) so both legs stay FORWARDed and a default-DROP host firewall
+    /// needs no change. False runs directly on the host interfaces.
+    #[arg(long = "netns", env = "MYMITM_NETNS", action = ArgAction::Set, overrides_with = "netns")]
+    netns: Option<bool>,
+    /// Override the box IP the upstream socket binds. Namespace mode sets this
+    /// for its supervised child (to the namespace side of the upstream veth); it
+    /// is also useful on a multi-homed box.
+    #[arg(long = "box-ip", env = "MYMITM_BOX_IP", overrides_with = "box_ip")] box_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +210,7 @@ pub struct Settings {
     pub ntlm_dump: bool,
     pub verify_bpf_support: bool,
     pub manage_sysctls: bool,
+    pub netns: bool,
 }
 
 impl Settings {
@@ -226,6 +250,7 @@ impl Settings {
             ntlm_dump: f.ntlm_dump,
             verify_bpf_support: f.verify_bpf_support,
             manage_sysctls: f.manage_sysctls,
+            netns: f.netns,
         })
     }
 
@@ -256,6 +281,8 @@ impl Settings {
         if let Some(v) = cli.ntlm_dump { s.ntlm_dump = v; }
         if let Some(v) = cli.verify_bpf_support { s.verify_bpf_support = v; }
         if let Some(v) = cli.manage_sysctls { s.manage_sysctls = v; }
+        if let Some(v) = cli.netns { s.netns = v; }
+        if let Some(v) = cli.box_ip { s.box_ip = v; }
         Ok(s)
     }
 
@@ -305,6 +332,7 @@ impl Settings {
             ntlm_dump: true,
             verify_bpf_support: true,
             manage_sysctls: true,
+            netns: true,
         }
     }
 }
@@ -574,6 +602,58 @@ mod tests {
         assert_eq!(on.manage_sysctls, Some(true), "explicit true overrides");
         // A bare flag with no value is rejected (explicit value required).
         assert!(Cli::try_parse_from(["mymitm", "--manage-sysctls"]).is_err());
+    }
+
+    #[test]
+    fn netns_defaults_true() {
+        // Namespace mode is the shipping default: it is what makes interception
+        // work on a box whose firewall only permits FORWARD -> server.
+        assert!(Settings::from_toml_str(base()).unwrap().netns);
+    }
+
+    #[test]
+    fn netns_can_be_disabled_in_file() {
+        let toml = format!("{}\nnetns = false", base());
+        assert!(!Settings::from_toml_str(&toml).unwrap().netns);
+    }
+
+    #[test]
+    fn cli_netns_flag_parses() {
+        use clap::Parser;
+        let default = Cli::try_parse_from(["mymitm"]).unwrap();
+        assert_eq!(default.netns, None, "omitted -> leave config value");
+        let off = Cli::try_parse_from(["mymitm", "--netns=false"]).unwrap();
+        assert_eq!(off.netns, Some(false), "explicit false overrides");
+        let on = Cli::try_parse_from(["mymitm", "--netns", "true"]).unwrap();
+        assert_eq!(on.netns, Some(true), "explicit true overrides");
+        // A bare flag with no value is rejected (explicit value required).
+        assert!(Cli::try_parse_from(["mymitm", "--netns"]).is_err());
+    }
+
+    #[test]
+    fn cli_box_ip_override_parses() {
+        use clap::Parser;
+        let c = Cli::try_parse_from(["mymitm", "--box-ip", "169.254.8.2"]).unwrap();
+        assert_eq!(c.box_ip, Some(Ipv4Addr::new(169, 254, 8, 2)));
+        assert_eq!(Cli::try_parse_from(["mymitm"]).unwrap().box_ip, None);
+    }
+
+    /// Namespace mode builds the child's argv by APPENDING overrides to its own,
+    /// which only works if clap lets a single-value argument repeat and takes the
+    /// last occurrence. Lock that assumption down here — if it ever changed, the
+    /// child would silently run on the host interfaces inside the namespace.
+    #[test]
+    fn cli_last_occurrence_wins_for_repeated_overrides() {
+        use clap::Parser;
+        let c = Cli::try_parse_from([
+            "mymitm",
+            "--tun", "left0", "--egress", "right0", "--netns", "true",
+            "--netns=false", "--tun", "mmc1", "--egress", "mmu1",
+        ])
+        .unwrap();
+        assert_eq!(c.tun.as_deref(), Some("mmc1"));
+        assert_eq!(c.egress.as_deref(), Some("mmu1"));
+        assert_eq!(c.netns, Some(false));
     }
 
     #[test]
