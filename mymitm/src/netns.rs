@@ -1078,7 +1078,11 @@ mod tests {
     }
 
     /// A ufw box: the FORWARD chain holds only jumps and the real permission
-    /// lives in `ufw-user-forward`. Modelled on a tester box running
+    /// lives in `ufw-user-forward`. The `ufw-user-*` lines below are ufw 0.36's
+    /// VERBATIM rendering, captured with `ufw --dry-run`, so the token order
+    /// (`-p` first, `-s` last) and the un-suffixed `-d 10.10.2.10` are ufw's and
+    /// not a guess — both are shapes the parser has to cope with.
+    /// Modelled on a tester box running
     ///   ufw allow in on eth1 to <if> port 22 proto tcp
     ///   ufw allow in on eth1 to <if> port 1194 proto udp
     ///   ufw deny from 10.8.0.0/24
@@ -1102,8 +1106,11 @@ mod tests {
 -A ufw-user-input -i eth1 -p tcp -d 192.168.7.4 --dport 22 -j ACCEPT
 -A ufw-user-input -i eth1 -p udp -d 192.168.7.4 --dport 1194 -j ACCEPT
 -A ufw-user-input -s 10.8.0.0/24 -j DROP
--A ufw-user-forward -s 10.8.0.0/24 -d 10.10.2.10/32 -p tcp --dport 443 -j ACCEPT
--A ufw-user-forward -s 10.8.0.0/24 -d 10.10.2.10/32 -p udp --dport 3391 -j ACCEPT
+-A ufw-user-forward -p tcp -d 10.10.2.10 --dport 443 -s 10.8.0.0/24 -j ACCEPT
+-A ufw-user-forward -p udp -d 10.10.2.10 --dport 3391 -s 10.8.0.0/24 -j ACCEPT
+-A ufw-user-limit -m limit --limit 3/minute -j LOG --log-prefix \"[UFW LIMIT BLOCK] \"
+-A ufw-user-limit -j REJECT
+-A ufw-user-limit-accept -j ACCEPT
 -A ufw-reject-forward -j REJECT --reject-with icmp-port-unreachable
 ";
 
@@ -1177,11 +1184,13 @@ mod tests {
 
     #[test]
     fn preflight_rejects_a_pinned_ufw_route_rule() {
-        // `ufw route allow in on tun0 out on eth0 to <server> port 443 proto tcp`
+        // Also ufw 0.36 verbatim, for
+        // `ufw route allow in on tun0 out on eth0 from <vpn> to <server> port 443 proto tcp`.
         let rules = UFW.replace(
-            "-A ufw-user-forward -s 10.8.0.0/24 -d 10.10.2.10/32 -p tcp --dport 443 -j ACCEPT",
-            "-A ufw-user-forward -i tun0 -o eth0 -s 10.8.0.0/24 -d 10.10.2.10/32 -p tcp --dport 443 -j ACCEPT",
+            "-A ufw-user-forward -p tcp -d 10.10.2.10 --dport 443 -s 10.8.0.0/24 -j ACCEPT",
+            "-A ufw-user-forward -i tun0 -o eth0 -p tcp -d 10.10.2.10 --dport 443 -s 10.8.0.0/24 -j ACCEPT",
         );
+        assert!(rules != UFW, "the fixture line to pin must exist verbatim");
         match dx(true, &rules).blocker {
             Some(Blocker::ForwardPinnedToIfaces(r)) => assert!(r.contains("-i tun0 -o eth0"), "{r}"),
             other => panic!("expected an interface-pinning blocker, got {other:?}"),
@@ -1250,6 +1259,19 @@ mod tests {
             let rules = format!("-P FORWARD DROP\n{rule}\n");
             assert!(dx(true, &rules).confirmed_by.is_some(), "should confirm: {rule}");
         }
+    }
+
+    #[test]
+    fn preflight_matches_addresses_with_and_without_a_prefix_length() {
+        // ufw writes `-d 10.10.2.10`; a live `iptables -S` prints the same rule
+        // back as `-d 10.10.2.10/32`. Both must be recognised, and a /24 that
+        // merely CONTAINS the server must not be (it is not a rule for this host).
+        for spelling in ["-d 10.10.2.10", "-d 10.10.2.10/32"] {
+            let rules = format!("-P FORWARD DROP\n-A FORWARD {spelling} -p tcp --dport 443 -j ACCEPT\n");
+            assert!(dx(true, &rules).confirmed_by.is_some(), "should confirm: {spelling}");
+        }
+        let wide = "-P FORWARD DROP\n-A FORWARD -d 10.10.2.0/24 -p tcp --dport 443 -j ACCEPT\n";
+        assert_eq!(dx(true, wide).confirmed_by, None, "a /24 is not a rule for this host");
     }
 
     #[test]
