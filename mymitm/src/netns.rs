@@ -1040,8 +1040,22 @@ pub fn cleanup(cfg: &Settings) {
 /// the operator passed (`--data-plane`, `--alpn`, `--config`, …) without this
 /// module having to know about any of them. clap takes the LAST occurrence of a
 /// single-value argument, so the appended values win over anything earlier.
+///
+/// `--cleanup` is the one flag that must NOT be inherited. It is a host-namespace
+/// maintenance action owned by the supervisor: run inside the namespace it would
+/// have the child call `netns::cleanup`, i.e. `ip netns del mitm` from *within*
+/// `mitm`, and point `bpf::cleanup_tc` / `iproute::cleanup` at the namespace's own
+/// veths — reversing the plumbing the parent is actively using. The parent has
+/// already done the real cleanup before it ever gets here (`main.rs`).
 pub fn child_argv(argv: &[String], inner: &InnerCfg) -> Vec<String> {
-    let mut out = argv.to_vec();
+    let mut out: Vec<String> = argv
+        .iter()
+        .filter(|a| {
+            let a = a.as_str();
+            !(a == "--cleanup" || a.starts_with("--cleanup="))
+        })
+        .cloned()
+        .collect();
     out.push("--netns=false".into());
     out.push("--tun".into());
     out.push(inner.tun_iface.clone());
@@ -1256,6 +1270,26 @@ mod tests {
         assert_eq!(out[eg_at + 1], "mmu1");
         let box_at = out.iter().position(|a| a == "--box-ip").unwrap();
         assert_eq!(out[box_at + 1], "169.254.8.2");
+    }
+
+    #[test]
+    fn child_argv_does_not_inherit_cleanup() {
+        // Inside the namespace, --cleanup makes the child run `ip netns del mitm`
+        // from within `mitm` and detach the classifiers off its own veths -- i.e.
+        // tear down the plumbing the parent is holding. Observed live: two
+        // processes wedged for hours. The parent has already cleaned up by then.
+        let inner = InnerCfg { tun_iface: "mmc1".into(), egress_iface: "mmu1".into(), box_ip: UN_ADDR };
+        for spelling in ["--cleanup", "--cleanup=true"] {
+            let argv = vec!["mymitm".to_string(), spelling.to_string(), "--config".into(), "x.toml".into()];
+            let out = child_argv(&argv, &inner);
+            assert!(
+                !out.iter().any(|a| a.starts_with("--cleanup")),
+                "child must not inherit {spelling}: {out:?}"
+            );
+            // ...while everything else the operator passed survives.
+            assert!(out.contains(&"--config".to_string()) && out.contains(&"x.toml".to_string()));
+            assert!(out.contains(&"--netns=false".to_string()));
+        }
     }
 
     #[test]
