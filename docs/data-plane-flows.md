@@ -335,8 +335,8 @@ exact same code path as `netns = false` — only the interface names differ.
 | Namespace | `mitm` |
 | Client leg (→ child's `tun_iface`) | `mmc0` (host, 169.254.7.1/30) ↔ `mmc1` (ns, 169.254.7.2/30) |
 | Upstream leg (→ child's `egress_iface`, `box_ip`) | `mmu0` (host, 169.254.8.1/30) ↔ `mmu1` (ns, **169.254.8.2**) |
-| Steer in | `ip rule prio 31000+mask iif <tun_iface> to <server> lookup 300+mask` |
-| Steer back | `ip rule prio 32000+mask iif <egress_iface> from <server> lookup 400+mask` |
+| Steer in | `ip rule prio 31000+mask iif <tun_iface> to <server> ipproto tcp dport <port> lookup 300+mask` |
+| Steer back | `ip rule prio 32000+mask iif <egress_iface> from <server> ipproto tcp sport <port> lookup 400+mask` |
 | Host sysctls | `conf.{mmc0,mmu0}.rp_filter=2` — our own veths only |
 
 Two details worth knowing:
@@ -358,21 +358,53 @@ Two details worth knowing:
 - `rp_filter=2` (loose), not `0`: the kernel takes `MAX(conf.all, conf.<iface>)`,
   so **2 loosens even when a hardened box has `conf.all.rp_filter=1`** — no
   box-wide change required.
+- **The steer is scoped to TCP `<server_port>`**, which the `ip_forward=0` above
+  makes mandatory rather than tidy: anything steered in that the classifiers do
+  not rewrite is dropped. An RD Gateway is the motivating case — it serves the
+  tunnel on TCP 443 *and* an optional UDP transport on 3391, and an unscoped
+  `to <server>` steer would pull the UDP into the namespace and blackhole it.
+  With the selectors, UDP 3391 (and ICMP) stay on the main table and are
+  forwarded normally, un-intercepted. FIB-rule L4 selectors need **kernel ≥
+  4.17**; `probe_l4_rule_support` adds and deletes a throwaway rule at startup to
+  find out (iproute2 has to speak the syntax too, and both failures look the
+  same), and on an older kernel falls back to the unscoped form with a WARN
+  naming the consequence. Not steering the server's ICMP costs nothing: the
+  classifiers only rewrite TCP, so ICMP steered in was dropped anyway.
 
 ### Requirements, and the preflight
 
 Namespace mode needs, all of which a forwarding box already has:
 
 - `net.ipv4.ip_forward=1` on the host;
-- `FORWARD` accepting NEW to `<server>:<port>` **without** an `-i`/`-o` match;
-- `FORWARD` accepting `ESTABLISHED,RELATED` (both return paths).
+- the forward path accepting NEW to `<server>:<port>` **without** an `-i`/`-o` match;
+- if that accept is scoped to a **source subnet**, `preserve_src_ip` left on;
+- the forward path accepting `ESTABLISHED,RELATED` (both return paths).
 
-The middle one is the trap: a rule like
-`-A FORWARD -i tun0 -o eth0 -d <server> -j ACCEPT` permits the flow **today** but
-cannot match once the legs become `-o mmc0` / `-i mmu0`. A startup **preflight**
-(`netns::diagnose`) checks both conditions against `iptables -S FORWARD` and
-**fails fast** with the offending rule and three remedies, rather than starting
-into a silent blackhole. Check yours with `iptables -S FORWARD`.
+Two traps, and the startup **preflight** (`netns::diagnose`) **fails fast** on
+each with the offending rule and its remedies rather than starting into a silent
+blackhole:
+
+- **Interface pinning.** `-A FORWARD -i tun0 -o eth0 -d <server> -j ACCEPT`
+  permits the flow **today** but cannot match once the legs become `-o mmc0` /
+  `-i mmu0`. Under ufw that is the difference between `ufw route allow to
+  <server> port 443 proto tcp` (fine) and `ufw route allow in on tun0 out on eth0
+  …` (fatal).
+- **Source scoping without preservation.** `ufw route allow from <vpn_subnet> to
+  <server> …` renders `-s <vpn_subnet> …`, which the client leg matches either
+  way — but the upstream leg only carries a source in that subnet while
+  `preserve_src_ip` is on. With it off the upstream leg dials from `169.254.8.2`
+  and is dropped, so the proxy accepts the connection and then hangs. This is why
+  `--preserve-src-ip=false` is not a safe debugging control on such a box.
+
+The preflight reads the **whole filter table** (`iptables -S`) and follows
+`-j`/`-g` jumps out of `FORWARD` transitively, because on any box with a firewall
+frontend the permission is not in `FORWARD` at all: ufw leaves that chain holding
+only jumps and keeps the real rules in **`ufw-user-forward`**. It also matches the
+rule's protocol and port, so a permission for a *different* service on the same
+address (again: UDP 3391 next to TCP 443) is not miscredited. When it identifies
+the rule both legs will match it logs it; when it finds nothing and the forward
+path looks restrictive it warns. Check yours with `iptables -S`, not
+`iptables -S FORWARD`.
 
 With `netns = false` you run directly on `tun_iface`/`egress_iface` as before,
 and must permit the two locally-terminated legs yourself:

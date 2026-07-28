@@ -45,11 +45,17 @@
 # not get this guarantee -- it does not need forwarding here either.)
 #
 # REQUIREMENTS ON THE HOST FIREWALL (all of which a forwarding box already has)
-#   - FORWARD accepts NEW to <server>:<port> WITHOUT an -i/-o interface match
-#     (a rule pinned to `-i <left> -o <egress>` will NOT match -o mmc0 / -i mmu0).
-#   - FORWARD accepts ESTABLISHED,RELATED (for both return paths).
+#   - the forward path accepts NEW to <server>:<port> WITHOUT an -i/-o interface
+#     match (a rule pinned to `-i <left> -o <egress>` will NOT match -o mmc0 /
+#     -i mmu0). Under ufw: `ufw route allow to <server> port <port> proto tcp` is
+#     fine; `ufw route allow in on X out on Y ...` is not.
+#   - if that accept is scoped to a SOURCE subnet (`ufw route allow from <vpn>
+#     to <server> ...`), source-IP preservation must stay ON -- otherwise the
+#     upstream leg dials from 169.254.8.2 and will not match it.
+#   - the forward path accepts ESTABLISHED,RELATED (for both return paths).
 #   - net.ipv4.ip_forward=1 on the host.
-# Verify with: iptables -S FORWARD
+# Verify with: iptables -S     <-- the WHOLE filter table, not just FORWARD: ufw
+# leaves FORWARD holding only jumps and keeps the real rules in ufw-user-forward.
 #
 # USAGE
 #   netns-recipe.sh up   <server_ip> <server_port> <client_iface> <egress_iface>
@@ -105,6 +111,30 @@ SERVER="${2:-}"; PORT="${3:-}"; CIF="${4:-}"; EIF="${5:-}"
 [ -n "$SERVER" ] && [ -n "$PORT" ] && [ -n "$CIF" ] && [ -n "$EIF" ] || usage
 [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
 
+# Narrow the steer to TCP <PORT> so that anything else addressed to the server
+# stays on the main table and is forwarded normally. It matters because the
+# namespace runs with ip_forward=0: whatever is steered in but not rewritten is
+# dropped. An RD Gateway is the case in point -- TCP 443 tunnel plus an optional
+# UDP 3391 transport, and an unscoped steer blackholes the latter.
+#
+# L4 selectors in routing rules need kernel >= 4.17 AND an iproute2 that speaks
+# the syntax. Probe with a throwaway rule instead of parsing `uname -r`, because
+# both failures look identical from here. Must run for `down` too: `ip rule del`
+# only matches a rule spelled exactly the same way it was added.
+L4_PROBE="priority 30999 iif lo to 127.0.0.1 ipproto tcp dport 1 lookup 253"
+# shellcheck disable=SC2086
+if ip rule add $L4_PROBE 2>/dev/null; then
+  ip rule del $L4_PROBE 2>/dev/null
+  L4_IN="ipproto tcp dport $PORT"
+  L4_BACK="ipproto tcp sport $PORT"
+else
+  [ "$cmd" = up ] && echo "warning: routing rules lack L4 selectors (kernel < 4.17);" \
+    "ALL traffic to $SERVER enters the namespace and anything that is not TCP/$PORT" \
+    "is dropped there rather than forwarded" >&2
+  L4_IN=""
+  L4_BACK=""
+fi
+
 if [ "$cmd" = up ]; then
   [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] \
     || { echo "net.ipv4.ip_forward is 0 -- the box is not forwarding; refusing" >&2; exit 1; }
@@ -143,7 +173,8 @@ if [ "$cmd" = up ]; then
   # leaves the MAIN route to the server untouched, so the egress iface's
   # reverse path stays symmetric and needs no sysctl change at all.
   ip route add "$SERVER/32" via "$CN_ADDR" dev "$VC_H" table "$T_IN"
-  ip rule add priority "$P_IN" iif "$CIF" to "$SERVER" lookup "$T_IN"
+  # shellcheck disable=SC2086  # $L4_IN must word-split into separate arguments
+  ip rule add priority "$P_IN" iif "$CIF" to "$SERVER" $L4_IN lookup "$T_IN"
 
   # --- steer the server's replies into the namespace ----------------------
   # With source-IP preservation the reply's destination is the CLIENT's IP, so
@@ -151,7 +182,9 @@ if [ "$cmd" = up ]; then
   # (arrived on the egress iface, came from the server) and hand it to the
   # namespace's UPSTREAM leg, where cls_eth_ingress un-SNATs it.
   ip route add default via "$UN_ADDR" dev "$VU_H" table "$T_BACK"
-  ip rule add priority "$P_BACK" iif "$EIF" from "$SERVER" lookup "$T_BACK"
+  # The reply direction of the same flow, so the port selector is the SOURCE port.
+  # shellcheck disable=SC2086
+  ip rule add priority "$P_BACK" iif "$EIF" from "$SERVER" $L4_BACK lookup "$T_BACK"
 
   # --- reverse-path filtering on OUR veths only ---------------------------
   # Each host-side veth receives traffic whose source the main table associates
@@ -166,12 +199,18 @@ if [ "$cmd" = up ]; then
   echo "netns '$NS' up:"
   echo "  client leg  : $VC_H($CH_ADDR) <-> $VC_N($CN_ADDR)   -> tun_iface=$VC_N"
   echo "  upstream leg: $VU_H($UH_ADDR) <-> $VU_N($UN_ADDR)   -> egress_iface=$VU_N, box_ip=$UN_ADDR"
-  echo "  steer  in   : iif $CIF to $SERVER -> table $T_IN (prio $P_IN)"
-  echo "  steer back  : iif $EIF from $SERVER -> table $T_BACK (prio $P_BACK)"
+  echo "  steer  in   : iif $CIF to $SERVER $L4_IN -> table $T_IN (prio $P_IN)"
+  echo "  steer back  : iif $EIF from $SERVER $L4_BACK -> table $T_BACK (prio $P_BACK)"
   echo "  run: ip netns exec $NS mymitm --config <cfg>"
 else
   # Teardown is the exact inverse, in reverse order, and idempotent: every step
   # tolerates already-absent state so it doubles as crash recovery.
+  # shellcheck disable=SC2086
+  ip rule del priority "$P_BACK" iif "$EIF" from "$SERVER" $L4_BACK lookup "$T_BACK" 2>/dev/null
+  # shellcheck disable=SC2086
+  ip rule del priority "$P_IN"   iif "$CIF" to   "$SERVER" $L4_IN   lookup "$T_IN"   2>/dev/null
+  # A rule added before a kernel upgrade (or by the pre-4.17 path) is spelled
+  # without the selectors, so try that form too -- del must match exactly.
   ip rule del priority "$P_BACK" iif "$EIF" from "$SERVER" lookup "$T_BACK" 2>/dev/null
   ip rule del priority "$P_IN"   iif "$CIF" to   "$SERVER" lookup "$T_IN"   2>/dev/null
   ip route flush table "$T_BACK" 2>/dev/null

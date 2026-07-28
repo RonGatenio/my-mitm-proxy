@@ -67,10 +67,20 @@ dump_path = "/var/tmp/mitm-dumps"
 # plane inside as a supervised child, and reverses all of it on exit.
 #
 # Requires (a startup preflight checks these and fails fast otherwise):
-#   - net.ipv4.ip_forward=1 on the host, and
-#   - the FORWARD permission for the server NOT pinned to -i/-o interfaces
+#   - net.ipv4.ip_forward=1 on the host,
+#   - the forward permission for the server NOT pinned to -i/-o interfaces
 #     (a rule like "-i tun0 -o eth0 -d <server> -j ACCEPT" cannot match the
 #     namespace's veths; make it destination-only, or set netns = false).
+#     Under ufw: "ufw route allow to <server> port <port> proto tcp" is fine,
+#     "ufw route allow in on tun0 out on eth0 ..." is not.
+#   - preserve_src_ip left true IF that permission is scoped to a source subnet
+#     ("ufw route allow from <vpn_subnet> to <server> ..."), since the upstream
+#     leg only carries a source in that subnet while preservation is on.
+#
+# The steer into the namespace is narrowed to TCP target_server_port, so other
+# traffic to the same address (e.g. an RD Gateway's UDP 3391 transport) keeps
+# being forwarded normally instead of dying inside the namespace. That narrowing
+# needs kernel >= 4.17; on an older kernel mymitm warns and steers everything.
 #
 # Set false — or pass --netns=false — to run directly on tun_iface/egress_iface.
 # You then have to permit the two locally-terminated legs yourself.
