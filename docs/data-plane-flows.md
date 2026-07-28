@@ -425,6 +425,29 @@ with the ruleset **byte-for-byte unchanged**, the client's source IP still
 preserved, decrypted bytes still dumped, and every trace of the plumbing removed
 on exit.
 
+`FW_PROFILE=ufw` expresses the same box through **real, enabled ufw** instead of a
+hand-written ruleset — validated on **Debian 11 (kernel 5.10)**, both planes,
+with the five commands a reporting box actually runs (`allow in on <mgmt> …
+port 22/1194`, `deny from <vpn_subnet>`, `route allow from <vpn_subnet> to
+<server> port 443 proto tcp` and `… port 3391 proto udp`, default deny). It adds
+three checks the hand-written profile cannot make, each covering something that
+was previously assumed rather than observed:
+
+- the permission really is **two jumps below `FORWARD`**
+  (`FORWARD → ufw-before-forward → ufw-user-forward`), and the preflight's own log
+  line names that chain — so the jump-following is verified against a live table,
+  not a fixture;
+- `ufw deny from <vpn_subnet>` really is an explicit **`DROP` in
+  `ufw-user-input`**, which is what breaks `netns = false` on such a box (not a
+  missing allow);
+- **UDP 3391 still reaches the server** with `netns = true`, i.e. the L4-scoped
+  steer took only TCP `<server_port>`. Gated on the same runtime probe the product
+  uses: on a pre-4.17 kernel the steer is unscoped and that UDP is *expected* to
+  be blackholed, so the check reports the fallback instead of asserting a bug.
+
+The `UFW` fixture in `netns.rs`'s tests is this run's verbatim `iptables -S`
+output, so the unit tests and the live box parse the same bytes.
+
 ## How to select
 
 Both knobs are settable via the TOML config, a CLI flag, or an environment

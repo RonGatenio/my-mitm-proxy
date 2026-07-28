@@ -1070,7 +1070,8 @@ mod tests {
     // --- preflight ------------------------------------------------------
 
     const SERVER: Ipv4Addr = Ipv4Addr::new(10, 10, 2, 10);
-    const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 8, 0, 5);
+    /// Inside the `UFW` fixture's `-s 10.10.1.0/24` scope, as the real client was.
+    const CLIENT: Ipv4Addr = Ipv4Addr::new(10, 10, 1, 10);
 
     /// `diagnose` with the defaults that matter: client known, preservation on.
     fn dx(ip_forward: bool, rules: &str) -> Diagnosis {
@@ -1078,41 +1079,146 @@ mod tests {
     }
 
     /// A ufw box: the FORWARD chain holds only jumps and the real permission
-    /// lives in `ufw-user-forward`. The `ufw-user-*` lines below are ufw 0.36's
-    /// VERBATIM rendering, captured with `ufw --dry-run`, so the token order
-    /// (`-p` first, `-s` last) and the un-suffixed `-d 10.10.2.10` are ufw's and
-    /// not a guess — both are shapes the parser has to cope with.
-    /// Modelled on a tester box running
-    ///   ufw allow in on eth1 to <if> port 22 proto tcp
-    ///   ufw allow in on eth1 to <if> port 1194 proto udp
-    ///   ufw deny from 10.8.0.0/24
-    ///   ufw route allow from 10.8.0.0/24 to 10.10.2.10 port 443 proto tcp
-    ///   ufw route allow from 10.8.0.0/24 to 10.10.2.10 port 3391 proto udp
+    /// lives in `ufw-user-forward`.
+    ///
+    /// This is the **entire `iptables -S` output of a live, enabled ufw 0.36**,
+    /// verbatim, captured by `tests/vm/validate-netns.sh` with `FW_PROFILE=ufw`
+    /// on Debian 11 (kernel 5.10) after applying the tester box's rules:
+    ///   ufw allow in on <mgmt> to <mgmt_ip> port 22 proto tcp
+    ///   ufw allow in on <mgmt> to <mgmt_ip> port 1194 proto udp
+    ///   ufw deny from 10.10.1.0/24
+    ///   ufw route allow from 10.10.1.0/24 to 10.10.2.10 port 443 proto tcp
+    ///   ufw route allow from 10.10.1.0/24 to 10.10.2.10 port 3391 proto udp
+    /// plus the harness's own unpinned `ufw allow 22/tcp`, which keeps the ssh
+    /// session that applies the profile alive — hence two port-22 rules here.
+    ///
+    /// It is deliberately the *live table* and not `ufw --dry-run`: `preflight`
+    /// reads `iptables -S`, whose canonical token order (`-s -d -i -o -p -m`)
+    /// differs from what ufw writes into its own rules files. Two other shapes
+    /// only the live table shows: the `-N` declarations, and `ufw-track-forward`
+    /// — a chain FORWARD jumps to that has no rules at all, so the jump closure
+    /// must not assume every `-j` target has appends.
+    ///
+    /// Keeping it whole matters: a trimmed fixture is a fixture whose author
+    /// chose what the parser would see.
     const UFW: &str = "\
 -P INPUT DROP
 -P FORWARD DROP
 -P OUTPUT ACCEPT
+-N ufw-after-forward
+-N ufw-after-input
+-N ufw-after-logging-forward
+-N ufw-after-logging-input
+-N ufw-after-logging-output
+-N ufw-after-output
+-N ufw-before-forward
+-N ufw-before-input
+-N ufw-before-logging-forward
+-N ufw-before-logging-input
+-N ufw-before-logging-output
+-N ufw-before-output
+-N ufw-logging-allow
+-N ufw-logging-deny
+-N ufw-not-local
+-N ufw-reject-forward
+-N ufw-reject-input
+-N ufw-reject-output
+-N ufw-skip-to-policy-forward
+-N ufw-skip-to-policy-input
+-N ufw-skip-to-policy-output
+-N ufw-track-forward
+-N ufw-track-input
+-N ufw-track-output
+-N ufw-user-forward
+-N ufw-user-input
+-N ufw-user-limit
+-N ufw-user-limit-accept
+-N ufw-user-logging-forward
+-N ufw-user-logging-input
+-N ufw-user-logging-output
+-N ufw-user-output
 -A INPUT -j ufw-before-logging-input
 -A INPUT -j ufw-before-input
 -A INPUT -j ufw-after-input
+-A INPUT -j ufw-after-logging-input
+-A INPUT -j ufw-reject-input
+-A INPUT -j ufw-track-input
 -A FORWARD -j ufw-before-logging-forward
 -A FORWARD -j ufw-before-forward
 -A FORWARD -j ufw-after-forward
+-A FORWARD -j ufw-after-logging-forward
 -A FORWARD -j ufw-reject-forward
+-A FORWARD -j ufw-track-forward
+-A OUTPUT -j ufw-before-logging-output
+-A OUTPUT -j ufw-before-output
+-A OUTPUT -j ufw-after-output
+-A OUTPUT -j ufw-after-logging-output
+-A OUTPUT -j ufw-reject-output
+-A OUTPUT -j ufw-track-output
+-A ufw-after-input -p udp -m udp --dport 137 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp -m udp --dport 138 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp -m tcp --dport 139 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp -m tcp --dport 445 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp -m udp --dport 67 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp -m udp --dport 68 -j ufw-skip-to-policy-input
+-A ufw-after-input -m addrtype --dst-type BROADCAST -j ufw-skip-to-policy-input
+-A ufw-after-logging-forward -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix \"[UFW BLOCK] \"
+-A ufw-after-logging-input -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix \"[UFW BLOCK] \"
 -A ufw-before-forward -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A ufw-before-forward -p icmp -m icmp --icmp-type 3 -j ACCEPT
+-A ufw-before-forward -p icmp -m icmp --icmp-type 11 -j ACCEPT
+-A ufw-before-forward -p icmp -m icmp --icmp-type 12 -j ACCEPT
+-A ufw-before-forward -p icmp -m icmp --icmp-type 8 -j ACCEPT
 -A ufw-before-forward -j ufw-user-forward
 -A ufw-before-input -i lo -j ACCEPT
+-A ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A ufw-before-input -m conntrack --ctstate INVALID -j ufw-logging-deny
+-A ufw-before-input -m conntrack --ctstate INVALID -j DROP
+-A ufw-before-input -p icmp -m icmp --icmp-type 3 -j ACCEPT
+-A ufw-before-input -p icmp -m icmp --icmp-type 11 -j ACCEPT
+-A ufw-before-input -p icmp -m icmp --icmp-type 12 -j ACCEPT
+-A ufw-before-input -p icmp -m icmp --icmp-type 8 -j ACCEPT
+-A ufw-before-input -p udp -m udp --sport 67 --dport 68 -j ACCEPT
+-A ufw-before-input -j ufw-not-local
+-A ufw-before-input -d 224.0.0.251/32 -p udp -m udp --dport 5353 -j ACCEPT
+-A ufw-before-input -d 239.255.255.250/32 -p udp -m udp --dport 1900 -j ACCEPT
 -A ufw-before-input -j ufw-user-input
--A ufw-user-input -i eth1 -p tcp -d 192.168.7.4 --dport 22 -j ACCEPT
--A ufw-user-input -i eth1 -p udp -d 192.168.7.4 --dport 1194 -j ACCEPT
--A ufw-user-input -s 10.8.0.0/24 -j DROP
--A ufw-user-forward -p tcp -d 10.10.2.10 --dport 443 -s 10.8.0.0/24 -j ACCEPT
--A ufw-user-forward -p udp -d 10.10.2.10 --dport 3391 -s 10.8.0.0/24 -j ACCEPT
--A ufw-user-limit -m limit --limit 3/minute -j LOG --log-prefix \"[UFW LIMIT BLOCK] \"
--A ufw-user-limit -j REJECT
+-A ufw-before-output -o lo -j ACCEPT
+-A ufw-before-output -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A ufw-before-output -j ufw-user-output
+-A ufw-logging-allow -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix \"[UFW ALLOW] \"
+-A ufw-logging-deny -m conntrack --ctstate INVALID -m limit --limit 3/min --limit-burst 10 -j RETURN
+-A ufw-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix \"[UFW BLOCK] \"
+-A ufw-not-local -m addrtype --dst-type LOCAL -j RETURN
+-A ufw-not-local -m addrtype --dst-type MULTICAST -j RETURN
+-A ufw-not-local -m addrtype --dst-type BROADCAST -j RETURN
+-A ufw-not-local -m limit --limit 3/min --limit-burst 10 -j ufw-logging-deny
+-A ufw-not-local -j DROP
+-A ufw-skip-to-policy-forward -j DROP
+-A ufw-skip-to-policy-input -j DROP
+-A ufw-skip-to-policy-output -j ACCEPT
+-A ufw-track-output -p tcp -m conntrack --ctstate NEW -j ACCEPT
+-A ufw-track-output -p udp -m conntrack --ctstate NEW -j ACCEPT
+-A ufw-user-forward -s 10.10.1.0/24 -d 10.10.2.10/32 -p tcp -m tcp --dport 443 -j ACCEPT
+-A ufw-user-forward -s 10.10.1.0/24 -d 10.10.2.10/32 -p udp -m udp --dport 3391 -j ACCEPT
+-A ufw-user-input -p tcp -m tcp --dport 22 -j ACCEPT
+-A ufw-user-input -d 10.0.2.15/32 -i ctrl0 -p tcp -m tcp --dport 22 -j ACCEPT
+-A ufw-user-input -d 10.0.2.15/32 -i ctrl0 -p udp -m udp --dport 1194 -j ACCEPT
+-A ufw-user-input -s 10.10.1.0/24 -j DROP
+-A ufw-user-limit -m limit --limit 3/min -j LOG --log-prefix \"[UFW LIMIT BLOCK] \"
+-A ufw-user-limit -j REJECT --reject-with icmp-port-unreachable
 -A ufw-user-limit-accept -j ACCEPT
--A ufw-reject-forward -j REJECT --reject-with icmp-port-unreachable
 ";
+
+    /// The same box with the forward permission pinned to interfaces, i.e.
+    /// `ufw route allow in on left0 out on right0 from ... port 443 proto tcp`.
+    /// Also a verbatim live capture (`iptables -S ufw-user-forward`), because the
+    /// pin's token position is exactly what the rejection test turns on.
+    const UFW_PINNED_443: &str =
+        "-A ufw-user-forward -s 10.10.1.0/24 -d 10.10.2.10/32 -i left0 -o right0 -p tcp -m tcp --dport 443 -j ACCEPT";
+    /// The unpinned line it replaces.
+    const UFW_OPEN_443: &str =
+        "-A ufw-user-forward -s 10.10.1.0/24 -d 10.10.2.10/32 -p tcp -m tcp --dport 443 -j ACCEPT";
 
     #[test]
     fn preflight_requires_host_forwarding() {
@@ -1184,15 +1290,12 @@ mod tests {
 
     #[test]
     fn preflight_rejects_a_pinned_ufw_route_rule() {
-        // Also ufw 0.36 verbatim, for
-        // `ufw route allow in on tun0 out on eth0 from <vpn> to <server> port 443 proto tcp`.
-        let rules = UFW.replace(
-            "-A ufw-user-forward -p tcp -d 10.10.2.10 --dport 443 -s 10.8.0.0/24 -j ACCEPT",
-            "-A ufw-user-forward -i tun0 -o eth0 -p tcp -d 10.10.2.10 --dport 443 -s 10.8.0.0/24 -j ACCEPT",
-        );
+        let rules = UFW.replace(UFW_OPEN_443, UFW_PINNED_443);
         assert!(rules != UFW, "the fixture line to pin must exist verbatim");
         match dx(true, &rules).blocker {
-            Some(Blocker::ForwardPinnedToIfaces(r)) => assert!(r.contains("-i tun0 -o eth0"), "{r}"),
+            Some(Blocker::ForwardPinnedToIfaces(r)) => {
+                assert!(r.contains("-i left0 -o right0"), "{r}")
+            }
             other => panic!("expected an interface-pinning blocker, got {other:?}"),
         }
     }
@@ -1204,7 +1307,7 @@ mod tests {
         // The client leg still matches (real client source), but the upstream leg
         // leaves as 169.254.8.2 and does not — a half-open failure.
         match diagnose(true, UFW, SERVER, 443, Some(CLIENT),false).blocker {
-            Some(Blocker::SourceScopedNeedsPreservation(r)) => assert!(r.contains("-s 10.8.0.0/24")),
+            Some(Blocker::SourceScopedNeedsPreservation(r)) => assert!(r.contains("-s 10.10.1.0/24")),
             other => panic!("expected a preservation blocker, got {other:?}"),
         }
         // ...and is fine with preservation on, which is the default.
@@ -1296,10 +1399,10 @@ mod tests {
     #[test]
     fn cidr_containment_handles_the_edges() {
         assert!(cidr_contains(Ipv4Addr::new(0, 0, 0, 0), 0, CLIENT), "/0 covers everything");
-        assert!(cidr_contains(Ipv4Addr::new(10, 8, 0, 0), 24, CLIENT));
-        assert!(!cidr_contains(Ipv4Addr::new(10, 8, 1, 0), 24, CLIENT));
+        assert!(cidr_contains(Ipv4Addr::new(10, 10, 1, 0), 24, CLIENT));
+        assert!(!cidr_contains(Ipv4Addr::new(10, 10, 2, 0), 24, CLIENT));
         assert!(cidr_contains(CLIENT, 32, CLIENT));
-        assert!(!cidr_contains(Ipv4Addr::new(10, 8, 0, 0), 24, UN_ADDR));
+        assert!(!cidr_contains(Ipv4Addr::new(10, 10, 1, 0), 24, UN_ADDR));
     }
 
     #[test]

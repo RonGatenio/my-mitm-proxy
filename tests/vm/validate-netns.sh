@@ -20,10 +20,28 @@
 #   - the HOST's conf.all.rp_filter / <left>.route_localnet are untouched
 #     (mymitm's sysctl changes landed inside the namespace).
 #
+# FW_PROFILE selects HOW that firewall is expressed on B:
+#   iptables (default) -- a hand-written default-DROP ruleset (fw-up).
+#   ufw                -- the SAME box through real, enabled ufw (fw-up-ufw),
+#                         which is what the testers actually run. Adds three
+#                         things the hand-written profile cannot check:
+#                           * the permission lives two jumps deep in
+#                             ufw-user-forward, so `iptables -S FORWARD` is blind
+#                             to it -- the defect the preflight fix addressed;
+#                           * `ufw deny from <subnet>` is an explicit INPUT DROP,
+#                             which is what kills netns=false on that box;
+#                           * a UDP 3391 forward permission exists, so the steer
+#                             can be checked for blackholing non-TCP traffic.
+#
 # Assumes the VMs are already up, e.g.:
 #     sudo bash tests/vm/run.sh up --kernel 4.15
 #     sudo bash tests/vm/validate-netns.sh
 #     sudo bash tests/vm/run.sh down --kernel 4.15
+#
+# The tester box itself (ufw, kernel 5.10, both planes):
+#     sudo bash tests/vm/run.sh up --kernel debian11
+#     sudo FW_PROFILE=ufw bash tests/vm/validate-netns.sh
+#     sudo bash tests/vm/run.sh down --kernel debian11
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib.sh"
@@ -43,9 +61,17 @@ NS_EGRESS=mmu1
 NS_BOX=169.254.8.2
 PORT=443
 PLANES="${PLANES:-ebpf iproute}"
+FW_PROFILE="${FW_PROFILE:-iptables}"
+case "$FW_PROFILE" in iptables|ufw) ;; *) fail "FW_PROFILE must be 'iptables' or 'ufw', got '$FW_PROFILE'";; esac
+# The client subnet, as the tester box's rules are written (`from <vpn_subnet>`).
+CLIENT_SUBNET="${B_LEFT_IP%.*}.0/24"
+# The RD Gateway's UDP transport port, which must NOT be pulled into the namespace.
+UDP_PORT=3391
+UDP_PROBE=/tmp/udp-probe.py
+UDP_SINK=/tmp/udp-$UDP_PORT.log
 [ -x "$BIN" ] || fail "missing binary $BIN (run 'run.sh up' or 'cargo build -p mymitm --release' first)"
 
-info "netns firewall validation: kernel=$B_KERNEL left=$LEFT right=$RIGHT planes='$PLANES'"
+info "netns firewall validation: kernel=$B_KERNEL left=$LEFT right=$RIGHT planes='$PLANES' fw_profile=$FW_PROFILE"
 
 TK="/opt/mymitm/b-testkit.sh"
 RECIPE="/opt/mymitm/netns-recipe.sh"
@@ -75,6 +101,16 @@ trap cleanup_b EXIT
 
 # --- one-time setup on B ---------------------------------------------------
 setup_b() {
+  # Debian genericcloud is minimal and defaults to nftables, so it may ship with
+  # no iptables at all -- and this whole validator speaks iptables (fw-hash,
+  # fw-dump, and the product's own preflight). `run.sh up` only installs it for
+  # the iproute plane, so do it here too.
+  if ! vm_ssh B "command -v iptables >/dev/null 2>&1"; then
+    info "installing iptables on B (Debian ships without it)"
+    vm_ssh B "sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables" \
+      || fail "B: apt-get install iptables failed (guest needs outbound network)"
+  fi
   vm_ssh B "sudo mkdir -p /opt/mymitm/dumps && sudo chown -R ubuntu /opt/mymitm"
   vm_scp B "$BIN"                      /opt/mymitm/mymitm
   vm_scp B "$CERT_DIR/leaf.pem"        /opt/mymitm/leaf.pem
@@ -84,6 +120,100 @@ setup_b() {
   # Files authored on a Windows checkout can arrive CRLF; /bin/sh then dies on
   # `set: pipefail: invalid option name`-style errors. Normalize in place.
   vm_ssh B "sudo sed -i 's/\r\$//' $TK $RECIPE && chmod +x /opt/mymitm/mymitm"
+  # The UDP steer check needs a sender on A and a sink on C. Python because it is
+  # the only interpreter both are guaranteed to have.
+  if [ "$FW_PROFILE" = ufw ]; then
+    vm_scp A "$HERE/netns/udp-probe.py" "$UDP_PROBE"
+    vm_scp C "$HERE/netns/udp-probe.py" "$UDP_PROBE"
+    vm_ssh A "sed -i 's/\r\$//' $UDP_PROBE"
+    vm_ssh C "sed -i 's/\r\$//' $UDP_PROBE"
+  fi
+}
+
+# --- firewall profile ------------------------------------------------------
+fw_up() {
+  case "$FW_PROFILE" in
+    iptables)
+      tk fw-up "$C_IP" "$PORT" || fail "fw-up failed"
+      ;;
+    ufw)
+      tk fw-ufw-install || fail "could not install ufw on B"
+      # Their eth1: the NIC carrying ssh + openvpn management, which the
+      # interface-pinned `allow in on eth1 ...` rules name. Here that is the
+      # user-mode control NIC, resolved by MAC because its kernel name varies
+      # by distro (ens3 on Ubuntu, enp0s* on Debian).
+      local ctrl
+      ctrl="$(vm_iface_by_mac B "$MAC_B_CTRL")"
+      [ -n "$ctrl" ] || fail "could not resolve B's management NIC by MAC $MAC_B_CTRL"
+      info "B management NIC (stands in for their eth1) = $ctrl"
+      vm_ssh B "sudo CTRL=$ctrl sh $TK fw-up-ufw $C_IP $PORT $CLIENT_SUBNET" \
+        || fail "fw-up-ufw failed"
+      ufw_ruleset_checks
+      ;;
+  esac
+}
+
+# Step 2 of the ufw validation: check the preflight's assumptions against a LIVE,
+# enabled ufw rather than against a fixture. `ufw --dry-run` renders the user
+# rules but never showed the real FORWARD jump skeleton, so the chain-reachability
+# logic -- the whole reason the preflight fix works on ufw -- was unverified.
+ufw_ruleset_checks() {
+  local dump out="$WORK/ufw-live-iptables-S.txt"
+  dump="$(tk fw-dump)"
+  printf '%s\n' "$dump" > "$out"
+  info "live ufw ruleset ($(printf '%s\n' "$dump" | wc -l) lines) saved to $out"
+  printf '%s\n' "$dump" | grep -E '^-A (FORWARD|ufw-before-forward|ufw-user-forward|ufw-user-input) ' \
+    | sed 's/^/    /'
+
+  printf '%s\n' "$dump" | grep -E '^-A FORWARD ' | grep -q "$C_IP" \
+    && die "the forward permission sits directly in FORWARD; that is not how ufw renders it, so this profile no longer models the tester box" || true
+  printf '%s\n' "$dump" | grep -qE '^-A FORWARD -j ufw-before-forward$' \
+    || die "no 'FORWARD -j ufw-before-forward' jump in the live ruleset"
+  printf '%s\n' "$dump" | grep -qE '^-A ufw-before-forward .*-j ufw-user-forward' \
+    || die "ufw-user-forward is not reachable from ufw-before-forward in the live ruleset"
+  printf '%s\n' "$dump" | grep -qE -- "^-A ufw-user-forward .*-d $C_IP(/32)? .*--dport $PORT .*-j ACCEPT" \
+    || die "no ufw-user-forward ACCEPT for $C_IP:$PORT in the live ruleset"
+  pass "(ufw) the permission for $C_IP:$PORT is TWO jumps below FORWARD (FORWARD -> ufw-before-forward -> ufw-user-forward): an 'iptables -S FORWARD' scan cannot see it"
+
+  printf '%s\n' "$dump" | grep -qE -- "^-A ufw-user-input -s ${CLIENT_SUBNET%/*}/[0-9]+ -j DROP" \
+    || die "no 'ufw deny from $CLIENT_SUBNET' DROP in ufw-user-input"
+  pass "(ufw) 'deny from $CLIENT_SUBNET' is an explicit DROP in ufw-user-input -- the rule that kills netns=false"
+
+  printf '%s\n' "$dump" | grep -qE -- "^-A ufw-user-forward .*--dport $UDP_PORT .*-j ACCEPT" \
+    || die "no ufw-user-forward ACCEPT for the UDP $UDP_PORT transport"
+  pass "(ufw) UDP $UDP_PORT to $C_IP is permitted too, so the steer can be checked for swallowing it"
+}
+
+# --- UDP steer check -------------------------------------------------------
+# udp_flows <marker> -> 0 if a datagram sent A -> C:$UDP_PORT arrives.
+udp_flows() {
+  local i
+  vm_ssh C "rm -f $UDP_SINK; nohup setsid python3 $UDP_PROBE listen $UDP_PORT $UDP_SINK >/dev/null 2>&1 </dev/null & sleep 0.5" \
+    || return 1
+  vm_ssh A "python3 $UDP_PROBE send $C_IP $UDP_PORT '$1'" || return 1
+  for i in $(seq 1 10); do
+    vm_ssh C "grep -q '$1' $UDP_SINK 2>/dev/null" && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# The steer must be narrowed to TCP $PORT. Anything else addressed to the server
+# that enters the namespace dies there (ip_forward=0 inside, and the classifiers
+# only rewrite TCP) -- which is exactly what happened to an RD Gateway's UDP 3391
+# transport before the steer was scoped. Only checkable under FW_PROFILE=ufw: the
+# hand-written profile permits no forwarded UDP at all, so a failure there would
+# be the firewall, not the steer.
+# check_udp <label> <marker>
+check_udp() {
+  [ "$FW_PROFILE" = ufw ] || return 0
+  if [ "$L4_OK" != yes ]; then
+    info "($1) skipping the UDP $UDP_PORT check: this kernel's routing rules take no L4 selectors, so the steer is unscoped and UDP to $C_IP is EXPECTED to be blackholed in the namespace"
+    return 0
+  fi
+  udp_flows "$2" \
+    || die "($1) UDP $UDP_PORT to $C_IP did not reach C -- the steer is swallowing non-TCP traffic (regression of the L4-scoped ip rule)"
+  pass "($1) UDP $UDP_PORT still reaches C: the steer took only TCP $PORT"
 }
 
 # write_toml <host|nsrecipe|product> <plane>
@@ -136,6 +266,13 @@ host_sysctl() { vm_ssh B "cat /proc/sys/net/ipv4/$1 2>/dev/null || echo NA"; }
 
 setup_b
 
+# Gate the UDP expectation on what the PRODUCT will decide, probed the same way
+# netns::probe_l4_rule_support does. On a pre-4.17 kernel the steer falls back to
+# the unscoped form and UDP 3391 is legitimately blackholed; asserting otherwise
+# there would be asserting a bug.
+L4_OK="$(tk l4-probe)"
+info "B routing rules take L4 selectors (ipproto/dport, needs >= 4.17): $L4_OK"
+
 # ===========================================================================
 # Per-plane run
 # ===========================================================================
@@ -157,13 +294,23 @@ for PLANE in $PLANES; do
   tk mm-stop >/dev/null
 
   # --- firewall ON ----------------------------------------------------------
-  info "=== ($PLANE) applying the testers' default-DROP firewall on B ==="
-  tk fw-up "$C_IP" "$PORT" || fail "fw-up failed"
+  info "=== ($PLANE) applying the testers' default-DROP firewall on B (profile: $FW_PROFILE) ==="
+  fw_up
   FW_REF="$(tk fw-hash)"
   info "firewall digest: $FW_REF"
   ALL_RPF_REF="$(host_sysctl conf/all/rp_filter)"
   LEFT_RLN_REF="$(host_sysctl "conf/$LEFT/route_localnet")"
   info "host sysctl refs: all.rp_filter=$ALL_RPF_REF $LEFT.route_localnet=$LEFT_RLN_REF"
+
+  # Control for the UDP checks in (P) and (X): with the firewall up but nothing
+  # else in play, UDP $UDP_PORT must already reach C by plain forwarding. Without
+  # this, a later UDP failure could be the profile or the probe rather than the
+  # steer -- and it would be read as the steer.
+  if [ "$FW_PROFILE" = ufw ] && [ "$L4_OK" = yes ]; then
+    udp_flows "$MARK-udp-control" \
+      || { diag; tk fw-down >/dev/null; fail "($PLANE) UDP $UDP_PORT does not reach C with plain forwarding under ufw -- the profile or the UDP probe is broken, not the steer"; }
+    pass "($PLANE) control: UDP $UDP_PORT reaches C by plain forwarding under ufw"
+  fi
 
   # --- (R) reproduce: firewall ON, host legs -------------------------------
   info "=== ($PLANE/R) firewall ON, proxy on the host legs: expect traffic BLOCKED ==="
@@ -232,6 +379,8 @@ for PLANE in $PLANES; do
   vm_ssh B "sudo grep -rl '$MARK-netns' /opt/mymitm/dumps/" >/dev/null 2>&1 \
     || { vm_ssh B "sudo ls -la /opt/mymitm/dumps/"; die "($PLANE/P) decrypted marker not found in any B dump"; }
   pass "($PLANE/P) C saw preserved src=$A_IP; decrypted bytes in B's dump"
+
+  check_udp "$PLANE/P" "$MARK-udp-netns"
 
   # --- invariants ----------------------------------------------------------
   FW_NOW="$(tk fw-hash)"
@@ -303,6 +452,23 @@ for PLANE in $PLANES; do
     || { vm_ssh B "sudo ls -la /opt/mymitm/dumps/"; die "($PLANE/X) decrypted marker not found in any B dump"; }
   pass "($PLANE/X) --netns=true: intercepted end to end, src=$A_IP preserved, bytes dumped"
 
+  check_udp "$PLANE/X" "$MARK-udp-product"
+
+  # (X) is the only phase that runs the product's own preflight -- it lives in the
+  # netns supervisor. Under ufw this is the decisive check on the fix: the
+  # permission is two jumps below FORWARD, so a preflight that scanned
+  # `iptables -S FORWARD` saw nothing and stayed silent. Demand that it names the
+  # ufw chain it found the permission in.
+  # NB: match the value, not "rule=<value>" -- tracing writes ANSI escapes between
+  # a field name and its value, so the joined form never matches.
+  if [ "$FW_PROFILE" = ufw ]; then
+    echo "$jX" | grep -q "both legs will match this forward permission" \
+      || { echo "$jX"; die "($PLANE/X) the preflight did not confirm a forward permission, though ufw has one for $C_IP:$PORT"; }
+    echo "$jX" | grep "both legs will match this forward permission" | grep -q "ufw-user-forward" \
+      || { echo "$jX" | grep "forward permission"; die "($PLANE/X) the preflight confirmed a permission but not the ufw-user-forward one"; }
+    pass "($PLANE/X) the preflight found the permission inside ufw-user-forward on a LIVE ufw box (two jumps below FORWARD)"
+  fi
+
   FW_NOW="$(tk fw-hash)"
   [ "$FW_NOW" = "$FW_REF" ] \
     || { vm_ssh B "sudo sh $TK fw-show"; die "($PLANE/X) the firewall CHANGED under --netns=true ($FW_REF -> $FW_NOW)"; }
@@ -326,11 +492,16 @@ for PLANE in $PLANES; do
 done
 
 green "================================================================"
-green " NETNS FIREWALL VALIDATION PASS (kernel=$B_KERNEL, planes: $PLANES)"
+green " NETNS FIREWALL VALIDATION PASS (kernel=$B_KERNEL, fw=$FW_PROFILE, planes: $PLANES)"
 green "   (S) baseline flows with no firewall"
 green "   (R) default-DROP firewall blocks the proxy on the host legs (report reproduced)"
 green "   (P) same firewall, UNCHANGED: proxy in netns 'mitm' flows, src preserved,"
 green "       host sysctls untouched, sysctl fix applied inside the namespace"
 green "   (X) same firewall, UNCHANGED: mymitm --netns=true does its own plumbing,"
 green "       intercepts end to end, and reverses everything on exit"
+if [ "$FW_PROFILE" = ufw ]; then
+green "   ufw: the permission lives two jumps below FORWARD and the preflight found"
+green "        it there; 'deny from $CLIENT_SUBNET' is a real INPUT DROP; and UDP"
+green "        $UDP_PORT still reaches C (L4 steer selectors: $L4_OK)"
+fi
 green "================================================================"

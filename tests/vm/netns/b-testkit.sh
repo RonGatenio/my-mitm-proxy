@@ -5,6 +5,7 @@
 #   fw-up-ufw <srv> <port> <subnet>   the same box via REAL ufw (CTRL=<iface> opt)
 #   fw-ufw-install                    apt-get install ufw (ships disabled)
 #   fw-dump                           `iptables -S`, as the preflight reads it
+#   l4-probe                          yes/no: do FIB rules take L4 selectors?
 #   fw-down                           restore the ruleset saved by either fw-up
 #   fw-hash                           stable digest of the live ruleset (no counters)
 #   fw-show                           print the live ruleset
@@ -194,6 +195,22 @@ fw-ufw-install)
 # fixture in mymitm/src/netns.rs. `iptables -S` == exactly what preflight() reads.
 fw-dump) iptables -S ;;
 
+# Does this kernel + iproute2 accept L4 selectors on a routing rule (>= 4.17)?
+# The same throwaway add/delete the product does in netns::probe_l4_rule_support,
+# so the harness gates its UDP expectation on exactly what the proxy will decide.
+# Both failure modes -- old kernel, old iproute2 -- look identical from here.
+l4-probe)
+  P="priority 30998 iif lo to 127.0.0.1 ipproto tcp dport 1 lookup 253"
+  # shellcheck disable=SC2086
+  if ip rule add $P 2>/dev/null; then
+    # shellcheck disable=SC2086
+    ip rule del $P 2>/dev/null
+    echo yes
+  else
+    echo no
+  fi
+  ;;
+
 fw-down)
   [ -f "$FWSAVE" ] || { echo "no saved ruleset at $FWSAVE" >&2; exit 1; }
   rm -f "$FWGUARD"                     # cancel the watchdog
@@ -234,5 +251,5 @@ mm-stop)
 mm-log) cat "$LOG" 2>/dev/null ;;
 mm-alive) pgrep -f '/opt/mymitm/mymitm --config' >/dev/null 2>&1 && echo yes || echo no ;;
 
-*) echo "usage: $0 {fw-up|fw-up-ufw|fw-ufw-install|fw-down|fw-hash|fw-show|fw-dump|mm-start|mm-stop|mm-log|mm-alive} ..." >&2; exit 2;;
+*) echo "usage: $0 {fw-up|fw-up-ufw|fw-ufw-install|fw-down|fw-hash|fw-show|fw-dump|l4-probe|mm-start|mm-stop|mm-log|mm-alive} ..." >&2; exit 2;;
 esac
