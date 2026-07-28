@@ -270,6 +270,214 @@ iproute there (a limitation of that test kernel, not the proxy — a real distro
 
 ---
 
+## Namespace mode (`netns`, default true) — orthogonal to the data plane
+
+`netns` is a **third, independent** knob: it applies to *both* data planes and
+changes **where** the plane runs, not what it does.
+
+### The problem it solves
+
+Interception turns **one FORWARDed flow into two locally-terminated ones**:
+
+| | Without the proxy | With the proxy (either plane) |
+|---|---|---|
+| client → server | routing: *not local* → **FORWARD** | dst rewritten to `local_addr:local_port` → routing: *local* → **INPUT** |
+| box → server | — | new socket, locally generated → **OUTPUT** |
+| replies | FORWARD | INPUT/OUTPUT as `ESTABLISHED` |
+
+So on a box whose firewall permits only `FORWARD -d <server> --dport <port>`,
+**FORWARD is never traversed for the intercepted port** and both legs are dropped
+by the INPUT/OUTPUT policies. This is chain traversal, not anything
+plane-specific — which is why it breaks `ebpf` and `iproute` identically.
+
+### The mechanism
+
+Both legs become *forwarded* traffic again from the host's point of view:
+
+```mermaid
+flowchart LR
+  A["client<br/>client_ip"]
+  C["server<br/>server_ip:port"]
+  subgraph HOST["host netns (firewall lives here)"]
+    F1["FORWARD<br/>-i tun_iface -o mmc0"]
+    F2["FORWARD<br/>-i mmu0 -o egress_iface"]
+  end
+  subgraph NS["netns 'mitm' (empty chains, ip_forward=0)"]
+    L["data plane + listener<br/>tun=mmc1, egress=mmu1<br/>box_ip=169.254.8.2"]
+  end
+  A -- "dst=server_ip:port" --> F1 --> L
+  L -- "dst=server_ip:port" --> F2 --> C
+```
+
+The destination is **still the real server** for the whole time the packet is in
+the host's stack — the rewrite to `local_addr:local_port` happens *inside* the
+namespace, where the chains are empty. So the box's existing forward permission
+matches **both** legs and **no firewall rule has to change**. Measured on kernel
+4.15: the `FORWARD -d <server> --dport 443 -j ACCEPT` counter shows exactly **two
+accepted SYNs per session**, one per leg.
+
+Because `net.ipv4.conf.*` is namespaced, the `route_localnet` / `rp_filter`
+changes from `manage_sysctls` land **inside** the namespace and never touch the
+box — which also retires the box-wide `conf.all.rp_filter=0` caveat noted above.
+
+### What mymitm does
+
+The parent process plumbs the host side, then re-execs itself
+(`ip netns exec <ns> <self> … --netns=false --tun mmc1 --egress mmu1 --box-ip …`)
+and supervises that child. The parent deliberately **stays in the host
+namespace**: only a process still there can delete the veths, policy rules and
+routing tables at teardown, and `setns` moves a single *thread*, which is not
+safe underneath a multi-threaded tokio runtime. The child therefore runs the
+exact same code path as `netns = false` — only the interface names differ.
+
+| | Value |
+|---|---|
+| Namespace | `mitm` |
+| Client leg (→ child's `tun_iface`) | `mmc0` (host, 169.254.7.1/30) ↔ `mmc1` (ns, 169.254.7.2/30) |
+| Upstream leg (→ child's `egress_iface`, `box_ip`) | `mmu0` (host, 169.254.8.1/30) ↔ `mmu1` (ns, **169.254.8.2**) |
+| Steer in | `ip rule prio 31000+mask iif <tun_iface> to <server> ipproto tcp dport <port> lookup 300+mask` |
+| Steer back | `ip rule prio 32000+mask iif <egress_iface> from <server> ipproto tcp sport <port> lookup 400+mask` |
+| Host sysctls | `conf.{mmc0,mmu0}.rp_filter=2` — our own veths only |
+
+Two details worth knowing:
+
+- **Why two veth pairs, not one.** With a single pair (`tun_iface ==
+  egress_iface`) all four classifiers share two hooks, and tc runs them in `pref`
+  order under `direct-action`, where the **first program to return `TC_ACT_OK`
+  ends the chain**. On ingress `cls_eth_ingress` takes the lower pref, accepts
+  every client packet (it only matches replies *from* the server), and
+  `cls_tun_ingress` never runs — nothing is rewritten. Measured on 4.15: the flow
+  was routed straight through the namespace to the server **un-intercepted**,
+  while the client still saw a healthy HTTP 200. Two pairs give each hook exactly
+  one program — the arrangement the product already validates on real interfaces.
+- **`ip_forward=0` inside the namespace.** If interception ever misses, the packet
+  is **dropped** rather than quietly forwarded to the server in the clear. Fail
+  closed, not fail open. (The `iproute` plane sets `ip_forward=1` itself during
+  setup and restores it on exit, so it does not get this guarantee; it does not
+  need forwarding here either.)
+- `rp_filter=2` (loose), not `0`: the kernel takes `MAX(conf.all, conf.<iface>)`,
+  so **2 loosens even when a hardened box has `conf.all.rp_filter=1`** — no
+  box-wide change required.
+- **The steer is scoped to TCP `<server_port>`**, which the `ip_forward=0` above
+  makes mandatory rather than tidy: anything steered in that the classifiers do
+  not rewrite is dropped. An RD Gateway is the motivating case — it serves the
+  tunnel on TCP 443 *and* an optional UDP transport on 3391, and an unscoped
+  `to <server>` steer would pull the UDP into the namespace and blackhole it.
+  With the selectors, UDP 3391 (and ICMP) stay on the main table and are
+  forwarded normally, un-intercepted. FIB-rule L4 selectors need **kernel ≥ 4.17**
+  and an iproute2 that speaks the syntax. There is **no probe** for that:
+  `build_plumbing` emits the scoped rule with the unscoped one as its fallback
+  (`Step::alt`), and if `ip rule add` rejects the selectors the fallback is used
+  and a WARN names the consequence. Attempting the real rule is the point —
+  mymitm must not add and delete a throwaway rule on the host just to interrogate
+  the kernel, and the failure that matters is the failure of the rule we actually
+  want, not of a stand-in. Each spelling carries its own inverse, because
+  `ip rule del` matches exactly. Not steering the server's ICMP costs nothing: the
+  classifiers only rewrite TCP, so ICMP steered in was dropped anyway.
+
+### Requirements, and the preflight
+
+Namespace mode needs, all of which a forwarding box already has:
+
+- `net.ipv4.ip_forward=1` on the host;
+- the forward path accepting NEW to `<server>:<port>` **without** an `-i`/`-o` match;
+- if that accept is scoped to a **source subnet**, `preserve_src_ip` left on;
+- the forward path accepting `ESTABLISHED,RELATED` (both return paths).
+
+Two traps, and the startup **preflight** (`netns::diagnose`) **fails fast** on
+each with the offending rule and its remedies rather than starting into a silent
+blackhole:
+
+- **Interface pinning.** `-A FORWARD -i tun0 -o eth0 -d <server> -j ACCEPT`
+  permits the flow **today** but cannot match once the legs become `-o mmc0` /
+  `-i mmu0`. Under ufw that is the difference between `ufw route allow to
+  <server> port 443 proto tcp` (fine) and `ufw route allow in on tun0 out on eth0
+  …` (fatal). The pin can also be **inherited from the path**: if the only way
+  into the chain holding the permission is `-A FORWARD -i tun0 -o eth0 -j <chain>`,
+  then the accept inside it is equally unusable even though its own text carries no
+  interface match. Zone-based frontends (firewalld, shorewall) are built exactly
+  that way, so reachability is computed as "which chains can a packet on *our*
+  veths get to", not "which chains are jumped to at all" — otherwise the accept
+  reads as destination-only and gets confirmed, and the box blackholes with the
+  preflight having said it was fine.
+- **Source scoping without preservation.** `ufw route allow from <vpn_subnet> to
+  <server> …` renders `-s <vpn_subnet> …`, which the client leg matches either
+  way — but the upstream leg only carries a source in that subnet while
+  `preserve_src_ip` is on. With it off the upstream leg dials from `169.254.8.2`
+  and is dropped, so the proxy accepts the connection and then hangs. This is why
+  `--preserve-src-ip=false` is not a safe debugging control on such a box.
+
+The preflight reads the **whole filter table** (`iptables -S`) and follows
+`-j`/`-g` jumps out of `FORWARD` transitively, because on any box with a firewall
+frontend the permission is not in `FORWARD` at all: ufw leaves that chain holding
+only jumps and keeps the real rules in **`ufw-user-forward`**. It also matches the
+rule's protocol and port, so a permission for a *different* service on the same
+address (again: UDP 3391 next to TCP 443) is not miscredited. When it identifies
+the rule both legs will match it logs it; when it finds nothing and the forward
+path looks restrictive it warns. Check yours with `iptables -S`, not
+`iptables -S FORWARD`.
+
+With `netns = false` you run directly on `tun_iface`/`egress_iface` as before,
+and must permit the two locally-terminated legs yourself:
+
+```bash
+# client leg (both planes)
+iptables -I INPUT  -i $TUN -p tcp -m tcp -d $LOCAL_ADDR --dport $LOCAL_PORT -j ACCEPT
+# upstream leg — eBPF carries SO_MARK=fwmark; iproute does NOT, and its source is
+# the SPOOFED client IP, so do not match on -s <box_ip> there.
+iptables -I OUTPUT -o $EGRESS -p tcp -m tcp -m mark --mark $FWMARK -d $SERVER --dport $PORT -j ACCEPT  # ebpf
+iptables -I OUTPUT -o $EGRESS -p tcp -m tcp -d $SERVER --dport $PORT -j ACCEPT                          # iproute
+```
+
+Validated end to end by `tests/vm/validate-netns.sh` on kernel 4.15, both planes:
+a default-DROP firewall (forward → server only, ssh/openvpn in, ntp/logs out)
+**blocks** the proxy on the host legs, and with `netns = true` traffic flows again
+with the ruleset **byte-for-byte unchanged**, the client's source IP still
+preserved, decrypted bytes still dumped, and every trace of the plumbing removed
+on exit.
+
+`FW_PROFILE=ufw` expresses the same box through **real, enabled ufw** instead of a
+hand-written ruleset — validated on **Debian 11 (kernel 5.10)**, both planes,
+with the five commands a reporting box actually runs (`allow in on <mgmt> …
+port 22/1194`, `deny from <vpn_subnet>`, `route allow from <vpn_subnet> to
+<server> port 443 proto tcp` and `… port 3391 proto udp`, default deny). It adds
+three checks the hand-written profile cannot make, each covering something that
+was previously assumed rather than observed:
+
+- the permission really is **two jumps below `FORWARD`**
+  (`FORWARD → ufw-before-forward → ufw-user-forward`), and the preflight's own log
+  line names that chain — so the jump-following is verified against a live table,
+  not a fixture;
+- `ufw deny from <vpn_subnet>` really is an explicit **`DROP` in
+  `ufw-user-input`**, which is what breaks `netns = false` on such a box (not a
+  missing allow);
+- **UDP 3391 still reaches the server** with `netns = true`, i.e. the L4-scoped
+  steer took only TCP `<server_port>`. On a pre-4.17 kernel the steer is unscoped
+  and that UDP is *expected* to be blackholed, so the harness probes what the
+  product will do and reports the fallback instead of asserting a bug. A control
+  run — firewall up, nothing else in play — confirms the datagram forwards plainly
+  first, so a later failure cannot be misread as the steer when it is the profile
+  or the probe.
+
+Two things that check is only meaningful **because** they are asserted alongside
+it, both of which it silently depended on before:
+
+- **the namespace's `ip_forward`.** With forwarding *on* inside the namespace, an
+  unscoped steer would pull UDP 3391 in and forward it out to the server anyway —
+  so the datagram would arrive and the check would pass while claiming the steer
+  was scoped. The validator asserts `0` on the eBPF plane (fail closed) and `1` on
+  the iproute plane, which sets it for itself; on that plane it says outright that
+  the UDP result is not decisive about scoping.
+- **`rp_filter`.** The validator sets `conf.all.rp_filter=1` before any proxy runs.
+  mymitm only ever writes `0` there, and Debian's default is already `0`, so on the
+  exact target this was built for the "host sysctls untouched" assertion could not
+  have failed whatever the product did. With `all=1` it has teeth, and it
+  simultaneously exercises the design claim that a per-veth `2` loosens without any
+  box-wide change (the kernel takes `MAX(conf.all, conf.<iface>)`).
+
+The `UFW` fixture in `netns.rs`'s tests is this run's verbatim `iptables -S`
+output, so the unit tests and the live box parse the same bytes.
+
 ## How to select
 
 Both knobs are settable via the TOML config, a CLI flag, or an environment
@@ -280,6 +488,7 @@ variable. CLI overrides config.
 | Data plane | `data_plane` | `--data-plane` | `MYMITM_DATA_PLANE` | `ebpf`, `iproute` | `ebpf` |
 | Attach mode (eBPF only) | `attach_mode` | `--attach-mode` | `MYMITM_ATTACH_MODE` | `auto`, `tcx`, `tc` | `auto` |
 | Manage sysctls (eBPF only) | `manage_sysctls` | `--manage-sysctls` | `MYMITM_MANAGE_SYSCTLS` | `true`, `false` | `true` |
+| Namespace mode | `netns` | `--netns` | `MYMITM_NETNS` | `true`, `false` | `true` |
 
 ```toml
 # mymitm.toml
@@ -318,6 +527,9 @@ iproute rules) from a previous unclean exit, then continues startup.
 | `mymitm-ebpf/src/main.rs` | kernel classifiers `cls_tun_*` / `cls_eth_*` and the `EGRESS`/`UPSTREAM` map logic |
 | `mymitm-common/src/lib.rs` | `classify_tun` / `classify_eth`, `Config`, `Rewrite`, map key/value types & capacities |
 | `mymitm/src/iproute.rs` | iproute plane: `build_ruleset` (the 4 rules), `setup`, sysctls, `upstream_socket`, `Drop`, `cleanup` |
+| `mymitm/src/netns.rs` | namespace mode: `build_plumbing` (pure spec), `NetnsGuard` (RAII), `diagnose`/`preflight`, `child_argv`, `cleanup` |
+| `tests/vm/validate-netns.sh` | default-DROP-firewall validation: reproduces the block, then proves the recipe and `--netns=true` both fix it without touching the firewall |
+| `tests/vm/netns/netns-recipe.sh` | the same plumbing as a standalone operator recipe (what `netns.rs` automates) |
 | `mymitm/src/config.rs` | `DataPlaneKind` / `AttachMode` enums, defaults, config + CLI wiring |
 | `tests/vm/README.md` | 3-VM kernel-4.15 / 5.10 validation matrix (why iproute is skipped on the lvh 5.10 test kernel) |
 | `examples/mymitm.toml` | annotated sample config |
