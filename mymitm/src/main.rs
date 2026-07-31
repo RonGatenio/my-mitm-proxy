@@ -71,11 +71,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(version = mymitm_common::VERSION, "mymitm starting");
 
+    // `--cleanup` is terminal: it is a maintenance action, not a startup step.
     if settings.cleanup {
-        tracing::info!("--cleanup: reversing any leftover data-plane state");
-        bpf::cleanup_tc(&settings.tun_iface, &settings.egress_iface);
-        iproute::cleanup(&settings);
-        netns::cleanup(&settings);
+        return run_cleanup(&settings);
     }
 
     // Namespace mode: plumb the host side, then re-exec ourselves INSIDE the
@@ -135,6 +133,46 @@ async fn main() -> anyhow::Result<()> {
     // `plane` (and the clone inside proxy::run, which exits at select! end)
     // both drop here → concrete plane Drop tears down all kernel state.
     drop(plane);
+    Ok(())
+}
+
+/// `--cleanup`: reverse whatever a previous unclean exit left behind, report what
+/// was removed, and exit. Nothing else runs — no data plane, no proxy, no
+/// namespace.
+///
+/// Terminal on purpose. Continuing into startup made `--cleanup` unusable as the
+/// thing an operator actually reaches for: on a `netns = true` config the very
+/// next act is to rebuild the plumbing that was just removed and then run as a
+/// long-lived proxy, so someone cleaning up a box was left with one that is both
+/// dirty again and intercepting traffic. Self-healing before a real run is what
+/// `NetnsGuard::setup` already does internally, which is where it belongs.
+///
+/// Every subsystem is cleaned regardless of the configured `data_plane`: the
+/// leftovers being reversed were made by an earlier process whose flags we do not
+/// know, and each cleanup is a no-op when its state is absent.
+fn run_cleanup(settings: &config::Settings) -> anyhow::Result<()> {
+    tracing::info!("--cleanup: reversing any leftover data-plane state, then exiting");
+
+    // First, and fallible: refuses outright if the namespace still has processes
+    // in it, so we bail before touching anything rather than half-clean a box
+    // that turns out to be running an instance.
+    let netns_objects = netns::cleanup(settings)?;
+    let tc_ifaces = bpf::cleanup_tc(&settings.tun_iface, &settings.egress_iface);
+    let iproute_rules = iproute::cleanup(settings);
+
+    let total = netns_objects + tc_ifaces + iproute_rules;
+    if total == 0 {
+        tracing::info!("nothing to clean up: no leftover state found");
+    } else {
+        tracing::info!(
+            netns_objects,
+            tc_ifaces,
+            iproute_rules,
+            "leftover state removed"
+        );
+    }
+    // On-disk dumps are deliberately not touched: they hold the decrypted
+    // plaintext, and deleting evidence is never this flag's job.
     Ok(())
 }
 

@@ -152,10 +152,42 @@ sudo ./mymitm \
 ```
 
 - `--client <IP>` restricts interception to one client (omit for dynamic per-connection).
-- `--cleanup` reverses any leftover state (stale `clsact` qdisc / iproute rules) from a
-  previous unclean exit, then continues startup.
+- `--cleanup` reverses any leftover state from a previous unclean exit — the
+  namespace and its veths, the policy-routing rules and tables, a stale `clsact`
+  qdisc, the iproute plane's rules — reports what it removed, and **exits**. No
+  proxy is started. It refuses if the namespace still has processes in it, so it
+  cannot pull the plumbing out from under a running instance. A normal run
+  self-heals without this flag, so reach for it only to make a box clean.
 - Decrypted payloads are written under `dump_path` as a JSONL index plus per-connection
   `.c2s` / `.s2c` blobs.
+
+### What it touches, and how to check
+
+`tools/mymitm-forensics.sh` reports every trace mymitm leaves on a box — the
+namespace and its veths, the policy-routing rules and tables, the eBPF programs and
+their tc attachments (in both namespaces), the iproute plane's iptables rules, the
+managed sysctls, and the on-disk dumps. It is **strictly read-only**, so it is safe
+to run on a production box mid-incident.
+
+```bash
+sudo tools/mymitm-forensics.sh                 # full report
+sudo tools/mymitm-forensics.sh -q              # only what it found
+sudo tools/mymitm-forensics.sh --fwmark 0x99   # if you changed fwmark
+```
+
+Exit status is `0` when nothing of ours is present and `1` when something is, so
+`-q` doubles as a post-run cleanliness gate. It separates **runtime** state (whose
+presence with no process running means the last exit was unclean — almost always a
+SIGKILL, which skips the RAII teardown) from **on-disk** artifacts (which a clean
+exit also leaves, and which contain plaintext). When it finds leftovers it points
+at `mymitm --config <cfg> --cleanup`, and also prints the equivalent `ip`
+commands, derived from your `fwmark`, for when the binary is not at hand.
+
+It will not attribute what it cannot: a value like `conf.all.rp_filter=0` is both
+what the iproute plane writes and the kernel default, so it is reported as
+`UNKNOWN` rather than counted. Nothing in the kernel records which process created
+a veth or a routing rule; the names, the link-local `/30`s and the fwmark-derived
+priorities are the only attribution there is.
 
 ## Test
 

@@ -89,6 +89,30 @@ sudo bash tests/vm/run.sh down   --kernel 5.10   # tear everything down
 
 Use `--keep` with `all` to skip the final teardown for debugging.
 
+### Standalone validators
+
+Each runs against VMs that are already `up`, so bring them up first and tear
+them down after. They cover behaviour `run.sh`'s phases deliberately do not.
+
+```bash
+sudo bash tests/vm/run.sh up --kernel 4.15
+
+# namespace mode vs a default-DROP host firewall, both planes.
+# FW_PROFILE=ufw expresses the same box through real, enabled ufw.
+sudo bash tests/vm/validate-netns.sh
+sudo FW_PROFILE=ufw bash tests/vm/validate-netns.sh   # best on --kernel debian11
+
+# the eBPF sysctl preflight, with the crutches run.sh uses removed
+sudo bash tests/vm/validate-sysctls.sh
+
+# `--cleanup`: SIGKILL the proxy, then prove the flag reverses what was left,
+# says what it removed, EXITS (never becomes a proxy), is honest on a clean box,
+# and refuses while an instance is running. PLANE=iproute for the other plane.
+sudo bash tests/vm/validate-cleanup.sh
+
+sudo bash tests/vm/run.sh down --kernel 4.15
+```
+
 ## Current status
 
 All passing runs end with `ALL PHASES PASS` — source IP preserved at C in both

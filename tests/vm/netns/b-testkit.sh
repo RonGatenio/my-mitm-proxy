@@ -11,6 +11,7 @@
 #   fw-show                           print the live ruleset
 #   mm-start <plain|netns> <cfg>      launch mymitm (netns => inside 'mitm')
 #   mm-stop                           SIGTERM it and wait for RAII teardown
+#   mm-kill                           SIGKILL it: no teardown, state left behind
 #   mm-log                            print its log
 set -u
 
@@ -280,11 +281,28 @@ mm-stop)
   echo "mm-stop: done"
   ;;
 
+# The unclean exit, on purpose: SIGKILL cannot be caught, so no Drop impl runs and
+# every piece of host state stays installed. This is what a real crash / OOM kill /
+# `systemctl kill -s KILL` leaves behind, and it is the only honest way to give
+# `--cleanup` something real to reverse.
+mm-kill)
+  pkill -KILL -f '/opt/mymitm/mymitm --config' 2>/dev/null
+  i=0
+  while [ $i -lt 40 ]; do
+    pgrep -f '/opt/mymitm/mymitm --config' >/dev/null 2>&1 || break
+    i=$((i + 1)); sleep 0.25
+  done
+  pgrep -f '/opt/mymitm/mymitm --config' >/dev/null 2>&1 \
+    && { echo "mm-kill: a mymitm survived SIGKILL?" >&2; exit 1; }
+  rm -f "$PIDF"
+  echo "mm-kill: done (no teardown ran)"
+  ;;
+
 # "Print the log" must succeed when there is no log yet -- an absent log is an
 # answer (nothing has run), not an error, and callers use this command's status to
 # tell whether the testkit itself is working.
 mm-log) cat "$LOG" 2>/dev/null || true ;;
 mm-alive) pgrep -f '/opt/mymitm/mymitm --config' >/dev/null 2>&1 && echo yes || echo no ;;
 
-*) echo "usage: $0 {fw-up|fw-up-ufw|fw-ufw-install|fw-down|fw-hash|fw-show|fw-dump|l4-probe|mm-start|mm-stop|mm-log|mm-alive} ..." >&2; exit 2;;
+*) echo "usage: $0 {fw-up|fw-up-ufw|fw-ufw-install|fw-down|fw-hash|fw-show|fw-dump|l4-probe|mm-start|mm-stop|mm-kill|mm-log|mm-alive} ..." >&2; exit 2;;
 esac

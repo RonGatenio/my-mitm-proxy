@@ -224,13 +224,24 @@ pub fn build_ruleset(cfg: &Settings) -> RuleSet {
 // Execution helpers
 // ---------------------------------------------------------------------------
 
+/// Run one `ip`/`iptables` command, capturing its output rather than letting it
+/// through to our stderr. Capturing matters twice over: the failure message then
+/// carries the tool's own diagnostic instead of a bare exit code, and the
+/// EXPECTED failures — `cleanup` deleting rules that are not there — stop
+/// printing `iptables: No chain/target/match by that name.` over a `--cleanup`
+/// run that is reporting a clean box.
 fn run(prog: &str, args: &[String]) -> std::io::Result<()> {
     tracing::debug!("iproute: {prog} {}", args.join(" "));
-    let st = Command::new(prog).args(args).status()?;
-    if !st.success() {
+    let out = Command::new(prog).args(args).output()?;
+    if !out.status.success() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("{prog} {:?} exited {st}", args),
+            format!(
+                "{prog} {} exited {}: {}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
         ));
     }
     Ok(())
@@ -395,11 +406,20 @@ impl Drop for IpRoutePlane {
 
 /// Best-effort reverse of leftovers from an unclean exit (matches what `setup`
 /// adds). Safe to call when nothing is installed — failures are ignored.
-pub fn cleanup(s: &Settings) {
+///
+/// Returns how many rules were actually removed. Every delete here targets one
+/// exact object and fails when it is absent (`iptables -D`, `ip rule del`, `ip
+/// route del`), so a success means a real leftover was reversed rather than that
+/// the box was already clean.
+pub fn cleanup(s: &Settings) -> usize {
     let rules = build_ruleset(s);
+    let mut removed = 0usize;
     for (prog, _add, del) in rules.items.iter().rev() {
-        let _ = run(prog, del);
+        if run(prog, del).is_ok() {
+            removed += 1;
+        }
     }
+    removed
 }
 
 // ---------------------------------------------------------------------------

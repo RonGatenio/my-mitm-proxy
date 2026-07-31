@@ -145,8 +145,10 @@ struct Cli {
     /// the config file. Use "http/1.1" to force HTTP/1.1 downgrade.
     #[arg(long = "alpn", env = "MYMITM_ALPN", value_delimiter = ',')]
     alpn: Option<Vec<String>>,
-    /// Reverse any leftover state (stale clsact qdisc / iproute rules) from a
-    /// previous unclean exit, then continue startup.
+    /// Reverse any leftover state from a previous unclean exit — the namespace
+    /// and its veths, the policy-routing rules and tables, a stale clsact qdisc,
+    /// the iproute plane's rules — report what was removed, and exit. Terminal:
+    /// no proxy is started. Refuses if the namespace still has processes in it.
     #[arg(long, default_value_t = false)] cleanup: bool,
     /// WebSocket decoding (`--ws-decode=true|false`); raw dump is unaffected.
     /// When given, overrides `ws_decode` in the config file (default true); when
