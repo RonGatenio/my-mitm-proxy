@@ -505,8 +505,16 @@ fn attach_tc(prog: &mut SchedClassifier, iface: &str, dir: TcAttachType) -> anyh
 /// removes the clsact qdisc entirely. aya 0.13 has no clsact-removal helper, so
 /// the qdisc deletion shells out to `tc qdisc del dev <iface> clsact`. Errors are
 /// logged, not propagated: teardown is always best-effort (fail-open).
-fn teardown_tc(iface: &str) {
+///
+/// Returns true when something was actually removed — a filter detached or a
+/// clsact qdisc deleted. Both operations report absence distinctly (`NotFound`
+/// and a non-zero `tc` exit), so this is a real "was it there" answer, not a
+/// guess. An interface that was never attached, or was attached via TCX, is
+/// false.
+fn teardown_tc(iface: &str) -> bool {
     use std::process::Command;
+
+    let mut removed = false;
 
     // Safe to call even for an interface attached via TCX (no tc filters ever added):
     // all NotFound errors and the "No such file" tc qdisc del failure are swallowed silently.
@@ -515,7 +523,7 @@ fn teardown_tc(iface: &str) {
     for dir in [TcAttachType::Ingress, TcAttachType::Egress] {
         for (name, _, _) in PROGRAMS {
             match tc::qdisc_detach_program(iface, dir, name) {
-                Ok(()) => {}
+                Ok(()) => removed = true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => tracing::warn!("detach {name} on {iface} {dir:?} failed: {e}"),
             }
@@ -528,7 +536,7 @@ fn teardown_tc(iface: &str) {
         .args(["qdisc", "del", "dev", iface, "clsact"])
         .output()
     {
-        Ok(out) if out.status.success() => {}
+        Ok(out) if out.status.success() => removed = true,
         Ok(out) => {
             // "RTNETLINK answers: No such file or directory" => no clsact to
             // remove, which is the desired end state; log others at debug.
@@ -539,16 +547,18 @@ fn teardown_tc(iface: &str) {
         }
         Err(e) => tracing::warn!("failed to run `tc qdisc del dev {iface} clsact`: {e}"),
     }
+
+    removed
 }
 
 /// Best-effort removal of any clsact qdisc/filters this tool may have left on the
 /// given interfaces after an unclean exit. Safe to call when nothing is attached
 /// (used by the `--cleanup` flow). The TCX path leaves nothing behind, so this is
 /// a no-op there; it only matters on hosts that used the legacy tc path.
-pub fn cleanup_tc(tun: &str, egress: &str) {
-    for iface in [tun, egress] {
-        teardown_tc(iface);
-    }
+///
+/// Returns how many of the two interfaces had something to remove.
+pub fn cleanup_tc(tun: &str, egress: &str) -> usize {
+    [tun, egress].into_iter().filter(|i| teardown_tc(i)).count()
 }
 
 impl Drop for BpfPlane {

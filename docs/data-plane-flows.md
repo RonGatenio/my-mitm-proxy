@@ -515,8 +515,15 @@ the path actually used (`… attached via TCX` or `… attached via clsact+tc
 kernel are expected, not a fault. `used_tc` is set if *any* hook took the tc path,
 and it is what drives the tc teardown in `Drop`.
 
-`--cleanup` reverses leftover state (a stale `clsact` qdisc from the tc path, or
-iproute rules) from a previous unclean exit, then continues startup.
+`--cleanup` reverses leftover state (a stale `clsact` qdisc from the tc path, the
+iproute rules, the namespace and its plumbing) from a previous unclean exit,
+reports what it removed, and **exits** — it starts no proxy. It runs all three
+subsystems' cleanups regardless of the configured `data_plane`, since the process
+that left the leftovers may not have run with today's flags. It refuses outright
+when the namespace still has processes in it: that is a live instance, and
+reversing its plumbing would blackhole it without stopping it. A normal run
+self-heals on its own (`NetnsGuard::setup` clears leftovers before plumbing), so
+the flag exists only to make a box clean.
 
 ## Source
 

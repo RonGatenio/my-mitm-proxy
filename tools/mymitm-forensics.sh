@@ -379,7 +379,16 @@ elif [ "$RUNTIME" -gt 0 ]; then
   echo "be the longest-lived part: deleting an interface does not delete a rule that"
   echo "references its table."
   echo
-  echo "${B_}To remove it, run these (derived from fwmark=$FWMARK):${Z_}"
+  echo "${B_}To remove it:${Z_}"
+  echo "    mymitm --config <the config it ran with> --cleanup"
+  echo
+  echo "That is terminal: it reverses the leftovers, reports what it removed, and"
+  echo "exits without starting a proxy. It refuses if the namespace still has"
+  echo "processes in it, so it cannot pull the plumbing out from under a live run."
+  echo "Pass the same config, since the table ids and rule priorities come from"
+  echo "fwmark and the tc cleanup needs tun_iface/egress_iface."
+  echo
+  echo "${D_}Without the binary or its config, the equivalent by hand (fwmark=$FWMARK):${Z_}"
   echo "    ip rule del priority $P_IN"
   echo "    ip rule del priority $P_BACK"
   echo "    ip route flush table $T_IN"
@@ -387,10 +396,6 @@ elif [ "$RUNTIME" -gt 0 ]; then
   echo "    ip netns del $NS            # takes mmc1/mmu1, and with them mmc0/mmu0"
   echo "    ip link del mmc0 ; ip link del mmu0    # only if the netns was already gone"
   echo "    ip rule del priority $P_IPR ; ip route flush table $T_IPR   # iproute plane only"
-  echo
-  echo "${D_}NOT \`mymitm --cleanup\`: that flag reverses leftovers and then CONTINUES${Z_}"
-  echo "${D_}STARTUP (documented behaviour), so on a netns config it rebuilds everything${Z_}"
-  echo "${D_}it just removed and runs as a proxy. There is no clean-and-exit mode today.${Z_}"
 else
   echo "No runtime state: the last exit tore everything down correctly."
   echo "What remains is on disk only, which a clean exit also leaves. Note the dumps"

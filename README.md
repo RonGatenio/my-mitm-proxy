@@ -152,10 +152,12 @@ sudo ./mymitm \
 ```
 
 - `--client <IP>` restricts interception to one client (omit for dynamic per-connection).
-- `--cleanup` reverses any leftover state (stale `clsact` qdisc / iproute rules) from a
-  previous unclean exit, then continues startup. Note the "then continues startup":
-  it is not a maintenance command — on a `netns = true` config it rebuilds the
-  plumbing it just removed and runs as a proxy.
+- `--cleanup` reverses any leftover state from a previous unclean exit — the
+  namespace and its veths, the policy-routing rules and tables, a stale `clsact`
+  qdisc, the iproute plane's rules — reports what it removed, and **exits**. No
+  proxy is started. It refuses if the namespace still has processes in it, so it
+  cannot pull the plumbing out from under a running instance. A normal run
+  self-heals without this flag, so reach for it only to make a box clean.
 - Decrypted payloads are written under `dump_path` as a JSONL index plus per-connection
   `.c2s` / `.s2c` blobs.
 
@@ -177,8 +179,9 @@ Exit status is `0` when nothing of ours is present and `1` when something is, so
 `-q` doubles as a post-run cleanliness gate. It separates **runtime** state (whose
 presence with no process running means the last exit was unclean — almost always a
 SIGKILL, which skips the RAII teardown) from **on-disk** artifacts (which a clean
-exit also leaves, and which contain plaintext). When it finds leftovers it prints
-the exact `ip` commands to remove them, derived from your `fwmark`.
+exit also leaves, and which contain plaintext). When it finds leftovers it points
+at `mymitm --config <cfg> --cleanup`, and also prints the equivalent `ip`
+commands, derived from your `fwmark`, for when the binary is not at hand.
 
 It will not attribute what it cannot: a value like `conf.all.rp_filter=0` is both
 what the iproute plane writes and the kernel default, so it is reported as

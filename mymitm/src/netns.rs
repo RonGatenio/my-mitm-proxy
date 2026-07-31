@@ -896,13 +896,15 @@ impl NetnsGuard {
             anyhow::bail!(
                 "network namespace `{ns}` already has processes in it (pids: {pids}). Another mymitm \
                  is probably running — namespace mode uses fixed names, so two instances cannot \
-                 share a box. Stop that one first, or run with --cleanup if it is a leftover.",
+                 share a box. Stop that one first; once it is gone, `--cleanup` removes what it \
+                 left behind.",
                 ns = Names::default().ns,
             );
         }
         // A previous unclean exit leaves the namespace and veths behind, and
         // `ip netns add` would then fail on the very first step. Clear first.
-        cleanup(cfg);
+        // The in-use check above already passed, so this cannot refuse.
+        let _ = cleanup(cfg);
 
         let plumbing = build_plumbing(cfg);
         let inner = plumbing.inner.clone();
@@ -1016,21 +1018,70 @@ impl Drop for NetnsGuard {
 }
 
 /// Best-effort reverse of leftovers from an unclean exit. Safe to call when
-/// nothing is installed — every failure is ignored.
-pub fn cleanup(cfg: &Settings) {
+/// nothing is installed — every individual failure is ignored.
+///
+/// Returns how many undo commands actually removed something, so the caller can
+/// tell "the box was already clean" from "the box was dirty and now is not".
+///
+/// The one hard failure is a namespace that still has processes in it: that is a
+/// *running* instance, not a leftover, and reversing the plumbing underneath it
+/// would blackhole its traffic while leaving it alive. Refuse instead.
+pub fn cleanup(cfg: &Settings) -> anyhow::Result<usize> {
+    if let Some(pids) = namespace_in_use() {
+        anyhow::bail!(
+            "refusing to clean up: network namespace `{ns}` still has processes in it (pids: \
+             {pids}). That is a running instance, not a leftover — removing its plumbing would \
+             blackhole its traffic without stopping it. Stop that process first.",
+            ns = Names::default().ns,
+        );
+    }
     let p = build_plumbing(cfg);
+    let mut removed = 0usize;
     for s in p.steps.iter().rev() {
         // BOTH spellings of every step that has two: a leftover rule could have
         // been added in either shape (a kernel upgrade between runs, or a
         // `--cleanup` invoked on a different box than the one that plumbed it).
-        // `ip rule del` must match exactly, so try each rather than guess.
+        // `ip rule del` must match exactly, so try each rather than guess. Only
+        // one of the two can match, so this cannot double-count.
         if let Some(undo) = &s.undo {
-            let _ = run(s.prog, undo);
+            removed += usize::from(undo_removed_something(s.prog, undo));
         }
         if let Some(undo) = s.alt.as_ref().and_then(|a| a.undo.as_ref()) {
-            let _ = run(s.prog, undo);
+            removed += usize::from(undo_removed_something(s.prog, undo));
         }
     }
+    Ok(removed)
+}
+
+/// Run one undo command and report whether it actually removed something.
+///
+/// Most undos are self-discriminating: `ip rule del`, `ip link del` and `ip netns
+/// del` all fail when their object is absent, so success is proof it was there.
+/// `ip route flush` is the exception — it exits 0 on an empty table — so ask the
+/// table first rather than report an already-clean box as having been dirty.
+fn undo_removed_something(prog: &str, args: &[String]) -> bool {
+    if is_route_flush(args) && route_selector_is_empty(prog, &args[2..]) {
+        return false;
+    }
+    run(prog, args).is_ok()
+}
+
+/// `ip route flush <selector>` — the one undo shape whose exit status says
+/// nothing about whether anything was there.
+fn is_route_flush(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("route")
+        && args.get(1).map(String::as_str) == Some("flush")
+}
+
+/// True when `ip route show <selector>` lists nothing. Failing to ask answers
+/// "not empty", so an unreadable table is still flushed — never silently skipped.
+fn route_selector_is_empty(prog: &str, selector: &[String]) -> bool {
+    Command::new(prog)
+        .args(["route", "show"])
+        .args(selector)
+        .output()
+        .map(|o| o.status.success() && o.stdout.iter().all(u8::is_ascii_whitespace))
+        .unwrap_or(false)
 }
 
 /// The argv for the supervised child: our own argv with namespace mode turned
@@ -1277,7 +1328,12 @@ mod tests {
         // Inside the namespace, --cleanup makes the child run `ip netns del mitm`
         // from within `mitm` and detach the classifiers off its own veths -- i.e.
         // tear down the plumbing the parent is holding. Observed live: two
-        // processes wedged for hours. The parent has already cleaned up by then.
+        // processes wedged for hours.
+        //
+        // Belt and braces since --cleanup became terminal: main returns before it
+        // ever supervises a child, so this filter should now be unreachable. It
+        // stays because the cost is one predicate and the failure it prevents is
+        // a wedged pair of processes.
         let inner = InnerCfg { tun_iface: "mmc1".into(), egress_iface: "mmu1".into(), box_ip: UN_ADDR };
         for spelling in ["--cleanup", "--cleanup=true"] {
             let argv = vec!["mymitm".to_string(), spelling.to_string(), "--config".into(), "x.toml".into()];
@@ -1289,6 +1345,39 @@ mod tests {
             // ...while everything else the operator passed survives.
             assert!(out.contains(&"--config".to_string()) && out.contains(&"x.toml".to_string()));
             assert!(out.contains(&"--netns=false".to_string()));
+        }
+    }
+
+    #[test]
+    fn only_the_two_table_flushes_have_an_undo_that_cannot_report_absence() {
+        // `cleanup` counts an undo's success as proof its object was there, which
+        // is what lets `--cleanup` say "nothing to clean up" honestly. That holds
+        // only because every undo fails when its target is absent -- except
+        // `ip route flush`, which exits 0 on an empty table and is therefore
+        // special-cased. A new step whose undo is also idempotent would silently
+        // turn "nothing to clean up" into a lie, so pin the shape.
+        let p = build_plumbing(&Settings::test_default());
+        let undos: Vec<&Vec<String>> = p
+            .steps
+            .iter()
+            .filter_map(|s| s.undo.as_ref())
+            .chain(p.steps.iter().filter_map(|s| s.alt.as_ref().and_then(|a| a.undo.as_ref())))
+            .collect();
+
+        let flushes: Vec<&&Vec<String>> = undos.iter().filter(|u| is_route_flush(u)).collect();
+        assert_eq!(
+            flushes.len(),
+            2,
+            "expected exactly the two steer tables to be flushed, got {flushes:?}"
+        );
+
+        // Everything else must be a targeted delete, which errors when absent.
+        for u in undos.iter().filter(|u| !is_route_flush(u)) {
+            assert!(
+                u.iter().any(|a| a == "del"),
+                "undo {u:?} is neither a `route flush` nor a `del`; \
+                 cleanup's removal count assumes one or the other"
+            );
         }
     }
 
